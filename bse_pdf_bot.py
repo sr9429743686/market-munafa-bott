@@ -28,41 +28,39 @@ def get_ist_now():
     return datetime.utcnow() + timedelta(hours=5, minutes=30)
 
 def get_random_impersonate():
-    return random.choice(["chrome120", "chrome110", "edge101", "safari15_3"])
+    """ક્રૉમ, સફારી, એજ અને ફાયરફોક્સ જેવી બધી પ્રોફાઇલ રેન્ડમ પસંદ કરશે"""
+    profiles = ["chrome120", "chrome110", "edge101", "safari15_3", "safari14", "chrome104"]
+    return random.choice(profiles)
 
 def get_random_headers():
     ua = UserAgent()
     return {
         'User-Agent': ua.random,
         'Accept': 'application/json, text/plain, */*',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://www.bseindia.com/',
+        'Accept-Language': 'en-US,en;q=0.9,hi;q=0.8',
+        'Referer': 'https://www.bseindia.com/corporates/ann.aspx',
         'Origin': 'https://www.bseindia.com',
-        'Connection': 'keep-alive'
+        'Connection': 'keep-alive',
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-site'
     }
 
 def get_latest_bse_announcements():
-    """BSE પરથી આજ અને ગઈકાલની (થોડી જૂની પણ) માહિતી ખેંચશે"""
+    """બધા જ બ્રાઉઝર્સના એટેક સાથે BSE ની તમામ લેટેસ્ટ જાહેરાતો ખેંચશે"""
     
-    today = get_ist_now()
-    yesterday = today - timedelta(days=2) # છેલ્લા 2 દિવસની ફાઇલો ચેક કરશે
+    url = "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno=1&strCat=-1&strPrevDate=&strScrip=&strSearch=P&strToDate=&strType=C"
     
-    from_date = yesterday.strftime("%d/%m/%Y")
-    to_date = today.strftime("%d/%m/%Y")
-    
-    urls = {
-        "result": f"https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno=1&strCat=Result&strPrevDate={from_date}&strScrip=&strSearch=P&strToDate={to_date}&strType=C",
-        "order": f"https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno=1&strCat=Company%20Update&strPrevDate={from_date}&strScrip=&strSearch=P&strToDate={to_date}&strType=C"
-    }
-    
-    headers = get_random_headers()
-    browser_profile = get_random_impersonate()
     announcement_list = []
+    max_retries = 3
     
-    for req_type, url in urls.items():
+    for attempt in range(max_retries):
+        headers = get_random_headers()
+        browser_profile = get_random_impersonate()
+        
         try:
-            time.sleep(random.uniform(1.0, 3.0)) 
-            res = c_requests.get(url, headers=headers, impersonate=browser_profile, timeout=15)
+            time.sleep(random.uniform(2.0, 4.0)) 
+            res = c_requests.get(url, headers=headers, impersonate=browser_profile, timeout=25)
             
             if res.status_code == 200:
                 try:
@@ -71,22 +69,32 @@ def get_latest_bse_announcements():
                     continue
 
                 if 'Table' in data:
-                    for item in data['Table'][:3]: # ટોપ 3 ફાઈલો
+                    print(f"✅ સફળતાપૂર્વક કનેક્ટ થયું ({browser_profile} દ્વારા)")
+                    # ટોપ 25 લેટેસ્ટ એનાઉન્સમેન્ટ ચેક કરશે
+                    for item in data['Table'][:25]: 
                         comp_name = item.get('SLONGNAME', '')
                         heading = item.get('NEWSSUB', '')
                         pdf_link = item.get('ATTACHMENTNAME', '')
                         xbrl_link = item.get('XMLFILE', '')
-                            
-                        if comp_name:
+                        
+                        heading_lower = heading.lower()
+                        
+                        is_result = any(k in heading_lower for k in ['result', 'financial'])
+                        is_order = any(k in heading_lower for k in ['order', 'award', 'contract', 'receipt'])
+                        
+                        if comp_name and (is_result or is_order):
+                            doc_type = "result" if is_result else "order"
                             announcement_list.append({
                                 'company': comp_name,
                                 'heading': heading,
                                 'pdf_url': f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{pdf_link}" if pdf_link else "",
                                 'xbrl_url': f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{xbrl_link}" if xbrl_link else "",
-                                'type': req_type
+                                'type': doc_type
                             })
+                    break 
         except Exception as e:
-            print(f"BSE API Error ({req_type}): {e}")
+            print(f"⚠️ પ્રયાસ {attempt+1} નિષ્ફળ: {e}")
+            time.sleep(4)
             
     return announcement_list
 
@@ -125,18 +133,32 @@ def extract_text_from_pdf_url(pdf_url):
 def analyze_with_gemini(company_name, raw_text, doc_type):
     if not GEMINI_API_KEY: return ""
     
-    prompt = f"""
-    You are an expert Indian stock market analyst for 'MarketMunafa'.
-    Analyze this BSE corporate announcement data for {company_name}.
-    
-    Output EXACTLY in this Gujarati format:
-    **કંપની (Company):** {company_name}
-    **મુખ્ય આંકડા / વિગતો (Details):** [3 lines explaining financial results or order details in simple Gujarati]
-    **નિષ્કર્ષ (Summary):** [1 line about stock/market impact]
-    
-    Data Text:
-    {raw_text[:4000]}
-    """
+    if doc_type == "result":
+        prompt = f"""
+        You are an expert Indian stock market analyst for 'MarketMunafa'.
+        Analyze this BSE financial result data for {company_name}.
+        
+        Output EXACTLY in this Gujarati format:
+        **કંપની (Company):** {company_name}
+        **આવક અને નફો (Revenue & Profit):** [2 lines about revenue/profit numbers in Gujarati]
+        **નિષ્કર્ષ (Summary):** [1 line about stock/market impact]
+        
+        Data Text:
+        {raw_text[:4000]}
+        """
+    else:
+        prompt = f"""
+        You are an expert Indian stock market analyst for 'MarketMunafa'.
+        Analyze this BSE order win data for {company_name}.
+        
+        Output EXACTLY in this Gujarati format:
+        **કંપની (Company):** {company_name}
+        **ઓર્ડર વિગતો (Order Details):** [2 lines about the order value and client in Gujarati]
+        **નિષ્કર્ષ (Summary):** [1 line about stock/market impact]
+        
+        Data Text:
+        {raw_text[:4000]}
+        """
         
     try:
         response = model.generate_content(prompt)
@@ -170,11 +192,11 @@ def run_bot():
     items = get_latest_bse_announcements()
     
     if not items:
-        print(f"[{ist_now_str}] ⚪ કોઈ માહિતી મળી નથી.")
+        print(f"[{ist_now_str}] ⚪ કોઈ નવી રિઝલ્ટ કે ઓર્ડરની ફાઇલ મળી નથી.")
         return
         
     for item in items:
-        print(f"Processing: {item['company']}")
+        print(f"Processing: {item['company']} ({item['type'].upper()})")
         raw_text = ""
         source_url = ""
         
@@ -190,9 +212,10 @@ def run_bot():
             ai_summary_gu = analyze_with_gemini(item['company'], raw_text, item['type'])
             
             if ai_summary_gu:
-                post_title = f"{item['company']} Update ({ist_now_str}) | MarketMunafa"
+                tag = "New Order Win" if item['type'] == "order" else "Q2 Financial Results"
+                post_title = f"{item['company']} {tag} ({ist_now_str}) | MarketMunafa"
                 
-                t_msg = f"📊 *{item['company']} Update*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+                t_msg = f"📊 *{item['company']} {tag}*\n━━━━━━━━━━━━━━━━━━━━\n\n"
                 t_msg += ai_summary_gu
                 t_msg += "\n\n✅ *MarketMunafa Bot*"
                 send_telegram(t_msg)
@@ -201,7 +224,7 @@ def run_bot():
                 
                 b_html = f"""
                 <div class="market-update-post">
-                    <h3>{item['company']} - Update</h3>
+                    <h3>{item['company']} - {tag}</h3>
                     <p><i>Official BSE Update via MarketMunafa AI</i></p>
                     <div style="background-color: #f8f9fa; padding: 15px; border-left: 4px solid #10b981; margin-bottom: 20px;">
                         {formatted_summary}
