@@ -28,8 +28,8 @@ def get_ist_now():
     return datetime.utcnow() + timedelta(hours=5, minutes=30)
 
 def get_random_impersonate():
-    """ક્રૉમ, સફારી, એજ અને ફાયરફોક્સ જેવી બધી પ્રોફાઇલ રેન્ડમ પસંદ કરશે"""
-    profiles = ["chrome120", "chrome110", "edge101", "safari15_3", "safari14", "chrome104"]
+    """સપોર્ટેડ અને લેટેસ્ટ બ્રાઉઝર પ્રોફાઇલ્સ"""
+    profiles = ["chrome120", "chrome110", "edge101", "safari15_3", "chrome104"]
     return random.choice(profiles)
 
 def get_random_headers():
@@ -40,14 +40,11 @@ def get_random_headers():
         'Accept-Language': 'en-US,en;q=0.9,hi;q=0.8',
         'Referer': 'https://www.bseindia.com/corporates/ann.aspx',
         'Origin': 'https://www.bseindia.com',
-        'Connection': 'keep-alive',
-        'Sec-Fetch-Dest': 'empty',
-        'Sec-Fetch-Mode': 'cors',
-        'Sec-Fetch-Site': 'same-site'
+        'Connection': 'keep-alive'
     }
 
 def get_latest_bse_announcements():
-    """બધા જ બ્રાઉઝર્સના એટેક સાથે BSE ની તમામ લેટેસ્ટ જાહેરાતો ખેંચશે"""
+    """BSE ની તમામ લેટેસ્ટ જાહેરાતો ખેંચશે"""
     
     url = "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno=1&strCat=-1&strPrevDate=&strScrip=&strSearch=P&strToDate=&strType=C"
     
@@ -70,7 +67,6 @@ def get_latest_bse_announcements():
 
                 if 'Table' in data:
                     print(f"✅ સફળતાપૂર્વક કનેક્ટ થયું ({browser_profile} દ્વારા)")
-                    # ટોપ 25 લેટેસ્ટ એનાઉન્સમેન્ટ ચેક કરશે
                     for item in data['Table'][:25]: 
                         comp_name = item.get('SLONGNAME', '')
                         heading = item.get('NEWSSUB', '')
