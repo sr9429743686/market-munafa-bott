@@ -35,13 +35,14 @@ def get_random_impersonate():
     return random.choice(profiles)
 
 def get_random_headers():
-    """અસલી માણસ જેવો નવો User-Agent બનાવશે"""
+    """અસલી માણસ જેવો નવો User-Agent અને સાચા BSE હેડર્સ બનાવશે"""
     ua = UserAgent()
     return {
         'User-Agent': ua.random,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept': 'application/json, text/plain, */*',
         'Accept-Language': 'en-US,en;q=0.9',
-        'Referer': 'https://www.google.com/',
+        'Referer': 'https://www.bseindia.com/',
+        'Origin': 'https://www.bseindia.com',
         'Connection': 'keep-alive'
     }
 
@@ -60,7 +61,13 @@ def get_latest_bse_pdfs():
         res = c_requests.get(url, headers=headers, impersonate=browser_profile, timeout=15)
         
         if res.status_code == 200:
-            data = res.json()
+            # JSON એરરને અટકાવવા માટે સેફ્ટી કવર
+            try:
+                data = res.json()
+            except Exception as json_err:
+                print("❌ Server did not return JSON. It might be blocking the request.")
+                return pdf_list
+
             if 'Table' in data:
                 # શરૂઆતની ટોપ 3 નવી જાહેરાતો ચેક કરશે
                 for item in data['Table'][:3]: 
@@ -198,7 +205,7 @@ def run_pdf_bot():
                 t_msg += "\n\n✅ *MarketMunafa Analysis*"
                 send_telegram(t_msg)
                 
-                # અહીં f-string એરર સોલ્વ કરવા ફોર્મેટિંગ અલગ લીધું છે
+                # f-string એરર સોલ્વ કરવા ફોર્મેટિંગ અલગ લીધું છે
                 formatted_summary = ai_summary_gu.replace('**', '<b>').replace('\n', '<br>')
                 
                 # --- Blogger HTML ---
