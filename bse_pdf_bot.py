@@ -42,11 +42,17 @@ def get_random_headers():
     }
 
 def get_latest_bse_announcements():
-    """BSE પરથી રિઝલ્ટ અને ઓર્ડરની માહિતી ખેંચશે (XBRL અને PDF બંને સાથે)"""
+    """BSE પરથી આજ અને ગઈકાલની (થોડી જૂની પણ) માહિતી ખેંચશે"""
+    
+    today = get_ist_now()
+    yesterday = today - timedelta(days=2) # છેલ્લા 2 દિવસની ફાઇલો ચેક કરશે
+    
+    from_date = yesterday.strftime("%d/%m/%Y")
+    to_date = today.strftime("%d/%m/%Y")
     
     urls = {
-        "result": "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno=1&strCat=Result&strPrevDate=&strScrip=&strSearch=P&strToDate=&strType=C",
-        "order": "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno=1&strCat=Company%20Update&strPrevDate=&strScrip=&strSearch=P&strToDate=&strType=C"
+        "result": f"https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno=1&strCat=Result&strPrevDate={from_date}&strScrip=&strSearch=P&strToDate={to_date}&strType=C",
+        "order": f"https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno=1&strCat=Company%20Update&strPrevDate={from_date}&strScrip=&strSearch=P&strToDate={to_date}&strType=C"
     }
     
     headers = get_random_headers()
@@ -65,11 +71,11 @@ def get_latest_bse_announcements():
                     continue
 
                 if 'Table' in data:
-                    for item in data['Table'][:2]: 
+                    for item in data['Table'][:3]: # ટોપ 3 ફાઈલો
                         comp_name = item.get('SLONGNAME', '')
                         heading = item.get('NEWSSUB', '')
                         pdf_link = item.get('ATTACHMENTNAME', '')
-                        xbrl_link = item.get('XMLFILE', '') # XBRL / XML ફાઈલ માટેની કી
+                        xbrl_link = item.get('XMLFILE', '')
                             
                         if comp_name:
                             announcement_list.append({
@@ -85,24 +91,21 @@ def get_latest_bse_announcements():
     return announcement_list
 
 def extract_text_from_xbrl(xbrl_url):
-    """XBRL (XML) ફાઈલ ડાઉનલોડ કરીને સાચો ડેટા કાઢશે"""
     headers = get_random_headers()
     try:
         response = requests.get(xbrl_url, headers=headers, timeout=20)
         if response.status_code == 200:
             root = ET.fromstring(response.content)
             extracted_text = ""
-            # XML ટેગ્સમાંથી મહત્વની માહિતી ભેગી કરશે
             for elem in root.iter():
                 if elem.text and len(elem.text.strip()) > 2:
                     extracted_text += elem.text.strip() + " "
             return extracted_text[:5000]
-    except Exception as e:
-        print(f"XBRL Parsing Error: {e}")
+    except:
+        pass
     return ""
 
 def extract_text_from_pdf_url(pdf_url):
-    """જો XBRL ન હોય તો PDF માંથી ડેટા વાંચશે"""
     headers = get_random_headers()
     try:
         response = requests.get(pdf_url, headers=headers, timeout=20)
@@ -167,24 +170,19 @@ def run_bot():
     items = get_latest_bse_announcements()
     
     if not items:
-        print(f"[{ist_now_str}] ⚪ કોઈ નવી માહિતી મળી નથી.")
+        print(f"[{ist_now_str}] ⚪ કોઈ માહિતી મળી નથી.")
         return
         
     for item in items:
         print(f"Processing: {item['company']}")
-        
         raw_text = ""
         source_url = ""
         
-        # પહેલા XBRL (XML) ચેક કરો, જો હોય તો ઉત્તમ ડેટા મળશે
         if item['xbrl_url']:
-            print(f"Reading XBRL data for {item['company']}...")
             raw_text = extract_text_from_xbrl(item['xbrl_url'])
             source_url = item['xbrl_url']
             
-        # જો XBRL ન મળે તો PDF વાપરો
         if not raw_text and item['pdf_url']:
-            print(f"Reading PDF data for {item['company']}...")
             raw_text = extract_text_from_pdf_url(item['pdf_url'])
             source_url = item['pdf_url']
             
@@ -194,7 +192,6 @@ def run_bot():
             if ai_summary_gu:
                 post_title = f"{item['company']} Update ({ist_now_str}) | MarketMunafa"
                 
-                # --- Telegram Message ---
                 t_msg = f"📊 *{item['company']} Update*\n━━━━━━━━━━━━━━━━━━━━\n\n"
                 t_msg += ai_summary_gu
                 t_msg += "\n\n✅ *MarketMunafa Bot*"
@@ -202,7 +199,6 @@ def run_bot():
                 
                 formatted_summary = ai_summary_gu.replace('**', '<b>').replace('\n', '<br>')
                 
-                # --- Blogger HTML ---
                 b_html = f"""
                 <div class="market-update-post">
                     <h3>{item['company']} - Update</h3>
@@ -210,7 +206,7 @@ def run_bot():
                     <div style="background-color: #f8f9fa; padding: 15px; border-left: 4px solid #10b981; margin-bottom: 20px;">
                         {formatted_summary}
                     </div>
-                    <p><a href="{source_url}" target="_blank" rel="nofollow noopener">View Original BSE Filing (XBRL/PDF) Here</a></p>
+                    <p><a href="{source_url}" target="_blank" rel="nofollow noopener">View Original BSE Filing Here</a></p>
                     <hr>
                 </div>
                 """
