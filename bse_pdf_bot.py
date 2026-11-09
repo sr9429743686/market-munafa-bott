@@ -13,7 +13,7 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 import xml.etree.ElementTree as ET
-from pypdf import PdfReader
+import PyPDF2
 from google import genai
 
 # ---------------- CONFIG ----------------
@@ -190,9 +190,10 @@ def extract_pdf_text(url):
     with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
         tmp.write(data)
         tmp.flush()
-        reader = PdfReader(tmp.name)
-        for page in reader.pages[:MAX_PDF_PAGES]:
-            text_parts.append(page.extract_text() or "")
+        with open(tmp.name, "rb") as f:
+            reader = PyPDF2.PdfReader(f)
+            for page in reader.pages[:MAX_PDF_PAGES]:
+                text_parts.append(page.extract_text() or "")
     return clean_text("\n".join(text_parts))[:MAX_TEXT_CHARS]
 
 
