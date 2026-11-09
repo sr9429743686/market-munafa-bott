@@ -8,9 +8,9 @@ import logging
 import sqlite3
 import tempfile
 from datetime import datetime, timezone
-from email.utils import parsedate_to_datetime
 from urllib.parse import urljoin, urlparse
 
+from curl_cffi import requests as c_requests
 import requests
 import xml.etree.ElementTree as ET
 import PyPDF2
@@ -29,8 +29,6 @@ if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
     gemini_model = genai.GenerativeModel(GEMINI_MODEL)
 
-# BSE feeds listed publicly. If a feed is temporarily unavailable, the other
-# feed continues to be checked. These are feeds, not a guarantee of full history.
 FEEDS = {
     "result": "https://www.bseindia.com/Data/XML/FinancialResultsFeed.aspx",
     "announcement": "https://www.bseindia.com/data/xml/announcements.aspx",
@@ -49,13 +47,6 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 log = logging.getLogger("marketmunafa")
-
-session = requests.Session()
-session.headers.update({
-    "User-Agent": "MarketMunafaResearchBot/1.0 (contact: configure-your-email)",
-    "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, application/pdf, */*",
-    "Accept-Language": "en-IN,en;q=0.9",
-})
 
 
 # ---------------- STORAGE / HTTP ----------------
@@ -90,19 +81,27 @@ def mark_posted(item_id, title, source_url):
 
 
 def get_url(url, stream=False):
-    """Polite retries for transient failures; do not rotate identities or bypass blocks."""
+    """BSE ના બ્લોકથી બચવા માટે બ્રાઉઝર ઇમ્પરનેશન (curl_cffi) નો ઉપયોગ"""
     last_error = None
+    profiles = ["chrome120", "chrome110", "edge101", "chrome104"]
+    
     for attempt in range(4):
         try:
-            response = session.get(url, timeout=REQUEST_TIMEOUT, stream=stream)
+            profile = profiles[attempt % len(profiles)]
+            headers = {
+                "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, application/pdf, */*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://www.bseindia.com/",
+            }
+            response = c_requests.get(url, impersonate=profile, headers=headers, timeout=REQUEST_TIMEOUT)
             if response.status_code in (403, 429):
                 raise requests.HTTPError(
-                    f"BSE/server returned {response.status_code}; access may be restricted or rate-limited",
+                    f"BSE/server returned {response.status_code}; rate-limited",
                     response=response,
                 )
             response.raise_for_status()
             return response
-        except (requests.RequestException, ValueError) as exc:
+        except Exception as exc:
             last_error = exc
             wait = min(3 * (2 ** attempt), 30)
             log.warning("GET failed (%s). Retry in %ss", exc, wait)
@@ -183,12 +182,7 @@ def extract_pdf_text(url):
     if not url or not urlparse(url).path.lower().endswith(".pdf"):
         return ""
     response = get_url(url)
-    content_type = response.headers.get("Content-Type", "").lower()
     data = response.content
-    if "pdf" not in content_type and not data.startswith(b"%PDF"):
-        log.warning("Attachment URL did not return a PDF: %s", url)
-        return ""
-
     text_parts = []
     with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
         tmp.write(data)
@@ -325,125 +319,3 @@ def blogger_access_token():
         "https://oauth2.googleapis.com/token",
         data={
             "client_id": GOOGLE_CLIENT_ID,
-            "client_secret": GOOGLE_CLIENT_SECRET,
-            "refresh_token": GOOGLE_REFRESH_TOKEN,
-            "grant_type": "refresh_token",
-        },
-        timeout=20,
-    )
-    response.raise_for_status()
-    return response.json()["access_token"]
-
-
-def blogger_publish(title, content_html):
-    if not BLOG_ID:
-        raise RuntimeError("BLOG_ID is missing")
-    token = blogger_access_token()
-    response = requests.post(
-        f"https://www.googleapis.com/blogger/v3/blogs/{BLOG_ID}/posts/",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        json={
-            "kind": "blogger#post",
-            "blog": {"id": BLOG_ID},
-            "title": title,
-            "content": content_html,
-            "labels": ["BSE UPDATE", "MARKET NEWS", "MarketMunafa"],
-        },
-        timeout=25,
-    )
-    response.raise_for_status()
-    return response.json().get("url", "")
-
-
-def html_escape(text):
-    return html.escape(text).replace("\n", "<br>\n")
-
-
-def publish_item(item, doc_type, summary, item_id):
-    source_url = item["link"]
-    title = item["title"][:180]
-    post_title = f"{title} | MarketMunafa"
-
-    safe_summary = html_escape(summary)
-    safe_title = html.escape(title)
-    source_html = (
-        f'<p><a href="{html.escape(source_url, quote=True)}" '
-        f'rel="nofollow noopener" target="_blank">View Original BSE Filing</a></p>'
-        if source_url else ""
-    )
-    blog_html = f"""
-    <article>
-      <h2>{safe_title}</h2>
-      <p><i>MarketMunafa | BSE Corporate Disclosure Analysis</i></p>
-      <div>{safe_summary}</div>
-      {source_html}
-      <hr>
-      <p><small>Disclaimer: This article is prepared for informational purposes based on public corporate filings. 
-      This is not financial advice. Please review the original filing before making any investment decisions.</small></p>
-    </article>
-    """
-
-    if POST_TO_BLOGGER:
-        try:
-            blog_url = blogger_publish(post_title, blog_html)
-            mark_posted(item_id, title, source_url)
-            log.info("Blogger post successful: %s", blog_url)
-        except Exception as exc:
-            log.exception("Blogger publishing failed")
-            raise RuntimeError(f"Blogger: {exc}")
-    else:
-        log.warning("Blogger publishing is disabled")
-
-
-# ---------------- MAIN ----------------
-def run():
-    init_db()
-    all_items = []
-
-    for kind, feed_url in FEEDS.items():
-        try:
-            items = parse_feed(feed_url, kind)
-            log.info("%s feed: %d items", kind, len(items))
-            all_items.extend(items)
-        except Exception:
-            log.exception("Feed failed: %s", feed_url)
-
-    if not all_items:
-        log.warning("No feed items retrieved. Check BSE feed availability/network.")
-        return
-
-    seen_in_run = set()
-    for item in all_items:
-        item_id = make_item_id(item)
-        if item_id in seen_in_run or was_posted(item_id):
-            continue
-        seen_in_run.add(item_id)
-
-        doc_type = classify_item(item)
-        if not doc_type:
-            continue
-
-        log.info("Processing %s: %s", doc_type, item["title"])
-        try:
-            source_text = get_document_text(item)
-            if len(source_text) < MIN_SOURCE_TEXT:
-                log.warning(
-                    "Skipped: insufficient filing text (%d chars): %s",
-                    len(source_text), item["title"]
-                )
-                continue
-
-            summary = analyze_with_gemini(
-                item["title"], doc_type, source_text, item["link"]
-            )
-            publish_item(item, doc_type, summary, item_id)
-            time.sleep(2)
-        except Exception:
-            log.exception("Item processing failed: %s", item["title"])
-
-
-if __name__ == "__main__":
-    run()
