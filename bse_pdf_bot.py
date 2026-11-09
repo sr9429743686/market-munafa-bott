@@ -231,7 +231,7 @@ def get_document_text(item):
     return clean_text("\n\n".join(parts))[:MAX_TEXT_CHARS]
 
 
-# ---------------- CLASSIFICATION / AI ----------------
+# ---------------- CLASSIFICATION / AI (ENGLISH) ----------------
 RESULT_WORDS = (
     "financial result", "unaudited financial", "audited financial",
     "quarterly result", "half year result", "annual result", "financial results",
@@ -263,46 +263,46 @@ def analyze_with_gemini(company_title, doc_type, source_text, source_url):
 
     if doc_type == "result":
         task = """
-આ BSE filing માંથી Gujarati માં પરિણામનું વિશ્લેષણ કરો:
-- ક્વાર્ટર/સમયગાળો અને standalone કે consolidated છે તે જણાવો.
-- Revenue from Operations, Total Income, Net Profit/PAT, EPS અને અગાઉના સમાન સમયગાળાની સરખામણી — ફક્ત દસ્તાવેજમાં ઉપલબ્ધ હોય તો.
-- આંકડા અને એકમો (₹ લાખ/કરોડ) બરાબર લખો.
-- આવક અને નફામાં વધારો/ઘટાડો હોય તો દસ્તાવેજના આંકડાથી ગણતરી કરો; આધાર ન હોય તો ગણતરી ન કરો.
-- એકંદર પરિણામની ગુણવત્તા અને મુખ્ય જોખમો 2-3 વાક્યમાં સમજાવો.
+Analyze this BSE filing in English:
+- Mention the quarter/period and whether it is standalone or consolidated.
+- Provide Revenue from Operations, Total Income, Net Profit/PAT, EPS, and comparison with previous periods — strictly if available in the document.
+- Write numbers and units (₹ Lakhs/Crores) accurately.
+- If there is an increase/decrease in revenue and profit, calculate it based on document figures; do not calculate if data is missing.
+- Summarize the overall result quality and key risks in 2-3 sentences.
 """
     else:
         task = """
-આ BSE filing માંથી Gujarati માં નવા ઓર્ડર/કોન્ટ્રાક્ટનું વિશ્લેષણ કરો:
-- ઓર્ડર આપનાર ક્લાયન્ટ, ઓર્ડરનું મૂલ્ય, કામનું સ્વરૂપ અને સમયમર્યાદા — ફક્ત દસ્તાવેજમાં હોય તો.
-- ઓર્ડર કંપનીના જાહેર કરેલા કદ/આવકની સરખામણીમાં કેટલો મહત્વનો છે તે માત્ર જરૂરી આંકડા ઉપલબ્ધ હોય ત્યારે જ કહો.
-- જૂના ઓર્ડર/અનુમાનિત આવક સાથે ગૂંચવણ ન કરો.
-- મુખ્ય શરતો, અમલીકરણનો સમય અને જોખમો જણાવો.
+Analyze this new order/contract BSE filing in English:
+- Mention the client name, order value, scope of work, and timeline — strictly if available in the document.
+- State how significant the order is compared to the company's disclosed size/revenue only when necessary figures are available.
+- Avoid confusion with past orders or estimated future revenues.
+- Mention key terms, execution timeline, and potential risks.
 """
     prompt = f"""
-તમે MarketMunafa માટે નાણાકીય દસ્તાવેજ સમજાવતા ગુજરાતી સંપાદક છો.
-નીચેની filing નો નિષ્પક્ષ, તથ્ય આધારિત સારાંશ લખો.
+You are a financial document analyst and editor for 'MarketMunafa'.
+Write an objective, fact-based summary of the following filing in English.
 
-કંપની/ફીડ હેડલાઇન: {company_title}
-દસ્તાવેજ પ્રકાર: {doc_type}
-મૂળ ફાઇલ: {source_url}
+Company/Feed Headline: {company_title}
+Document Type: {doc_type}
+Source File: {source_url}
 
-કઠોર નિયમો:
-1. નીચેના સ્રોત લખાણમાં ન હોય એવો કોઈ આંકડો, તારીખ, ક્લાયન્ટ કે દાવો બનાવશો નહીં.
-2. માહિતી ઉપલબ્ધ ન હોય તો "ફાઇલમાં સ્પષ્ટ માહિતી ઉપલબ્ધ નથી" લખો.
-3. શેર ખરીદો/વેચો, target price કે ખાતરીવાળો ભાવ-અસરનો દાવો ન કરો.
-4. પરિણામ/ઓર્ડર સકારાત્મક છે કે નકારાત્મક તે સમજાવો, પણ નિશ્ચિત શેર ભાવની આગાહી ન કરો.
-5. ભાષા સરળ અને વ્યાવસાયિક ગુજરાતી રાખો.
+Strict Rules:
+1. Do not invent any numbers, dates, clients, or claims not present in the source text below.
+2. If information is not available, write "Explicit information is not available in the filing."
+3. Do not make buy/sell recommendations, target price claims, or guaranteed stock price impact claims.
+4. Explain whether the result/order is positive or negative, but do not predict specific stock prices.
+5. Keep the language simple, professional, and clear in English.
 
 {task}
 
-આઉટપુટ આ ફોર્મેટમાં આપો:
-<b>કંપની:</b> ...
-<b>મુખ્ય વિગતો:</b> ...
-<b>આંકડાકીય વિશ્લેષણ:</b> ...
-<b>નિષ્કર્ષ:</b> ...
-<b>ધ્યાનમાં રાખવા જેવી બાબતો:</b> ...
+Output format must be strictly as follows:
+<b>Company:</b> ...
+<b>Key Details:</b> ...
+<b>Financial/Order Analysis:</b> ...
+<b>Conclusion:</b> ...
+<b>Key Watchpoints:</b> ...
 
-સ્રોત લખાણ:
+Source Text:
 {source_text[:MAX_TEXT_CHARS]}
 """
     response = gemini_client.models.generate_content(
@@ -315,7 +315,7 @@ def analyze_with_gemini(company_title, doc_type, source_text, source_url):
     return result
 
 
-# ---------------- PUBLISHING (BLOGGER ONLY) ----------------
+# ---------------- PUBLISHING (BLOGGER ONLY - ENGLISH) ----------------
 def blogger_access_token():
     required = (GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN)
     if not all(required):
@@ -370,7 +370,7 @@ def publish_item(item, doc_type, summary, item_id):
     safe_title = html.escape(title)
     source_html = (
         f'<p><a href="{html.escape(source_url, quote=True)}" '
-        f'rel="nofollow noopener" target="_blank">મૂળ BSE Filing જુઓ</a></p>'
+        f'rel="nofollow noopener" target="_blank">View Original BSE Filing</a></p>'
         if source_url else ""
     )
     blog_html = f"""
@@ -380,8 +380,8 @@ def publish_item(item, doc_type, summary, item_id):
       <div>{safe_summary}</div>
       {source_html}
       <hr>
-      <p><small>નોંધ: આ લેખ જાહેર કંપની ફાઇલિંગના આધારે માહિતી માટે તૈયાર કરાયો છે.
-      આ રોકાણ સલાહ નથી. નિર્ણય લેતા પહેલાં મૂળ filing તપાસો.</small></p>
+      <p><small>Disclaimer: This article is prepared for informational purposes based on public corporate filings. 
+      This is not financial advice. Please review the original filing before making any investment decisions.</small></p>
     </article>
     """
 
