@@ -3,6 +3,7 @@ import time
 import random
 import requests
 import PyPDF2
+import xml.etree.ElementTree as ET
 import google.generativeai as genai
 from datetime import datetime, timedelta
 from curl_cffi import requests as c_requests
@@ -40,10 +41,9 @@ def get_random_headers():
         'Connection': 'keep-alive'
     }
 
-def get_latest_bse_pdfs():
-    """BSE પરથી સીધી લેટેસ્ટ રિઝલ્ટ અને ઓર્ડરની PDF ખેંચશે"""
+def get_latest_bse_announcements():
+    """BSE પરથી રિઝલ્ટ અને ઓર્ડરની માહિતી ખેંચશે (XBRL અને PDF બંને સાથે)"""
     
-    # તારીખ વગરની લિંક્સ જેથી હંમેશાં લેટેસ્ટ ટોપ ડેટા જ મળે
     urls = {
         "result": "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno=1&strCat=Result&strPrevDate=&strScrip=&strSearch=P&strToDate=&strType=C",
         "order": "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno=1&strCat=Company%20Update&strPrevDate=&strScrip=&strSearch=P&strToDate=&strType=C"
@@ -51,7 +51,7 @@ def get_latest_bse_pdfs():
     
     headers = get_random_headers()
     browser_profile = get_random_impersonate()
-    pdf_list = []
+    announcement_list = []
     
     for req_type, url in urls.items():
         try:
@@ -65,25 +65,44 @@ def get_latest_bse_pdfs():
                     continue
 
                 if 'Table' in data:
-                    for item in data['Table'][:2]: # ટોપ 2 ફાઈલો
+                    for item in data['Table'][:2]: 
                         comp_name = item.get('SLONGNAME', '')
                         heading = item.get('NEWSSUB', '')
                         pdf_link = item.get('ATTACHMENTNAME', '')
+                        xbrl_link = item.get('XMLFILE', '') # XBRL / XML ફાઈલ માટેની કી
                             
-                        if comp_name and pdf_link:
-                            full_pdf_url = f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{pdf_link}"
-                            pdf_list.append({
+                        if comp_name:
+                            announcement_list.append({
                                 'company': comp_name,
                                 'heading': heading,
-                                'pdf_url': full_pdf_url,
+                                'pdf_url': f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{pdf_link}" if pdf_link else "",
+                                'xbrl_url': f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{xbrl_link}" if xbrl_link else "",
                                 'type': req_type
                             })
         except Exception as e:
             print(f"BSE API Error ({req_type}): {e}")
             
-    return pdf_list
+    return announcement_list
+
+def extract_text_from_xbrl(xbrl_url):
+    """XBRL (XML) ફાઈલ ડાઉનલોડ કરીને સાચો ડેટા કાઢશે"""
+    headers = get_random_headers()
+    try:
+        response = requests.get(xbrl_url, headers=headers, timeout=20)
+        if response.status_code == 200:
+            root = ET.fromstring(response.content)
+            extracted_text = ""
+            # XML ટેગ્સમાંથી મહત્વની માહિતી ભેગી કરશે
+            for elem in root.iter():
+                if elem.text and len(elem.text.strip()) > 2:
+                    extracted_text += elem.text.strip() + " "
+            return extracted_text[:5000]
+    except Exception as e:
+        print(f"XBRL Parsing Error: {e}")
+    return ""
 
 def extract_text_from_pdf_url(pdf_url):
+    """જો XBRL ન હોય તો PDF માંથી ડેટા વાંચશે"""
     headers = get_random_headers()
     try:
         response = requests.get(pdf_url, headers=headers, timeout=20)
@@ -100,20 +119,20 @@ def extract_text_from_pdf_url(pdf_url):
         pass
     return ""
 
-def analyze_with_gemini(company_name, pdf_text, doc_type):
+def analyze_with_gemini(company_name, raw_text, doc_type):
     if not GEMINI_API_KEY: return ""
     
     prompt = f"""
     You are an expert Indian stock market analyst for 'MarketMunafa'.
-    Analyze this BSE corporate announcement PDF for {company_name}.
+    Analyze this BSE corporate announcement data for {company_name}.
     
     Output EXACTLY in this Gujarati format:
     **કંપની (Company):** {company_name}
-    **વિગતો (Details):** [2 lines explaining the announcement in simple Gujarati]
-    **નિષ્કર્ષ (Summary):** [1 line about market impact]
+    **મુખ્ય આંકડા / વિગતો (Details):** [3 lines explaining financial results or order details in simple Gujarati]
+    **નિષ્કર્ષ (Summary):** [1 line about stock/market impact]
     
-    PDF Text:
-    {pdf_text[:4000]}
+    Data Text:
+    {raw_text[:4000]}
     """
         
     try:
@@ -143,20 +162,34 @@ def send_telegram(text_msg):
     try: requests.post(url, data=payload, timeout=15)
     except: pass
 
-def run_pdf_bot():
+def run_bot():
     ist_now_str = get_ist_now().strftime("%d %b %Y")
-    pdfs = get_latest_bse_pdfs()
+    items = get_latest_bse_announcements()
     
-    if not pdfs:
-        print(f"[{ist_now_str}] ⚪ કોઈ PDF મળી નથી.")
+    if not items:
+        print(f"[{ist_now_str}] ⚪ કોઈ નવી માહિતી મળી નથી.")
         return
         
-    for item in pdfs:
+    for item in items:
         print(f"Processing: {item['company']}")
-        pdf_text = extract_text_from_pdf_url(item['pdf_url'])
         
-        if pdf_text and len(pdf_text) > 100:
-            ai_summary_gu = analyze_with_gemini(item['company'], pdf_text, item['type'])
+        raw_text = ""
+        source_url = ""
+        
+        # પહેલા XBRL (XML) ચેક કરો, જો હોય તો ઉત્તમ ડેટા મળશે
+        if item['xbrl_url']:
+            print(f"Reading XBRL data for {item['company']}...")
+            raw_text = extract_text_from_xbrl(item['xbrl_url'])
+            source_url = item['xbrl_url']
+            
+        # જો XBRL ન મળે તો PDF વાપરો
+        if not raw_text and item['pdf_url']:
+            print(f"Reading PDF data for {item['company']}...")
+            raw_text = extract_text_from_pdf_url(item['pdf_url'])
+            source_url = item['pdf_url']
+            
+        if raw_text and len(raw_text) > 100:
+            ai_summary_gu = analyze_with_gemini(item['company'], raw_text, item['type'])
             
             if ai_summary_gu:
                 post_title = f"{item['company']} Update ({ist_now_str}) | MarketMunafa"
@@ -177,7 +210,7 @@ def run_pdf_bot():
                     <div style="background-color: #f8f9fa; padding: 15px; border-left: 4px solid #10b981; margin-bottom: 20px;">
                         {formatted_summary}
                     </div>
-                    <p><a href="{item['pdf_url']}" target="_blank" rel="nofollow noopener">Download Original BSE PDF Here</a></p>
+                    <p><a href="{source_url}" target="_blank" rel="nofollow noopener">View Original BSE Filing (XBRL/PDF) Here</a></p>
                     <hr>
                 </div>
                 """
@@ -185,4 +218,4 @@ def run_pdf_bot():
                 time.sleep(5)
 
 if __name__ == "__main__":
-    run_pdf_bot()
+    run_bot()
