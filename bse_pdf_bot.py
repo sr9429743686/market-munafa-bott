@@ -81,7 +81,7 @@ def get_latest_bse_pdfs():
                             is_valid = True
                             
                         # અત્યારે લાઈવ ટેસ્ટિંગ માટે બધું જ એલાઉ કરવું હોય તો નીચેની લાઈન ચાલુ કરી દો
-                        is_valid = True 
+                        is_valid = False 
                             
                         if comp_name and pdf_link and is_valid:
                             full_pdf_url = f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{pdf_link}"
