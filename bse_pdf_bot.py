@@ -23,7 +23,7 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
 GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "").strip()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -333,18 +333,21 @@ def blogger_publish(title, content_html):
     if not BLOG_ID:
         raise RuntimeError("BLOG_ID is missing")
     token = blogger_access_token()
+    
+    payload = {
+        "kind": "blogger#post",
+        "title": title,
+        "content": content_html,
+        "labels": ["BSE UPDATE", "MARKET NEWS", "MarketMunafa"]
+    }
+    
     response = requests.post(
         f"https://www.googleapis.com/blogger/v3/blogs/{BLOG_ID}/posts/",
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
         },
-        json={
-            "kind": "blogger#post",
-            "title": title,
-            "content": content_html,
-            "labels": ["BSE UPDATE", "MARKET NEWS", "MarketMunafa"]
-        },
+        json=payload,
         timeout=25,
     )
     response.raise_for_status()
