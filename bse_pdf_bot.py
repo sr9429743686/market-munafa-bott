@@ -43,7 +43,7 @@ def get_random_headers():
 def get_latest_bse_pdfs():
     """BSE પરથી રિઝલ્ટ અને ઓર્ડરની કેટેગરી મુજબ ડેટા ખેંચશે"""
     
-    # તમે ફોટામાં બતાવેલી કેટેગરી મુજબની બે અલગ લિંક્સ
+    # રિઝલ્ટ અને ઓર્ડર માટે અલગ લિંક્સ
     urls = {
         "result": "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno=1&strCat=Result&strPrevDate=&strScrip=&strSearch=P&strToDate=&strType=C",
         "order": "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno=1&strCat=Company%20Update&strPrevDate=&strScrip=&strSearch=P&strToDate=&strType=C"
@@ -65,7 +65,7 @@ def get_latest_bse_pdfs():
                     continue
 
                 if 'Table' in data:
-                    for item in data['Table'][:3]: # દરેક કેટેગરીની ટોપ 3 જાહેરાતો
+                    for item in data['Table'][:3]: 
                         comp_name = item.get('SLONGNAME', '')
                         heading = item.get('NEWSSUB', '')
                         pdf_link = item.get('ATTACHMENTNAME', '')
@@ -76,9 +76,12 @@ def get_latest_bse_pdfs():
                         # જો રિઝલ્ટ વાળી લિંક હોય
                         if req_type == "result" and ('result' in heading_lower or 'financial' in heading_lower):
                             is_valid = True
-                        # જો ઓર્ડર વાળી લિંક હોય (Company Update માંથી)
+                        # જો ઓર્ડર વાળી લિંક હોય
                         elif req_type == "order" and any(k in heading_lower for k in ['order', 'award', 'contract', 'receipt']):
                             is_valid = True
+                            
+                        # અત્યારે લાઈવ ટેસ્ટિંગ માટે બધું જ એલાઉ કરવું હોય તો નીચેની લાઈન ચાલુ કરી દો
+                        is_valid = True 
                             
                         if comp_name and pdf_link and is_valid:
                             full_pdf_url = f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{pdf_link}"
@@ -86,7 +89,7 @@ def get_latest_bse_pdfs():
                                 'company': comp_name,
                                 'heading': heading,
                                 'pdf_url': full_pdf_url,
-                                'type': req_type # ઓળખ માટે કે આ રિઝલ્ટ છે કે ઓર્ડર
+                                'type': req_type
                             })
         except Exception as e:
             print(f"BSE API Error ({req_type}): {e}")
