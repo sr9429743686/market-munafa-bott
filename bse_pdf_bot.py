@@ -28,7 +28,6 @@ def get_ist_now():
     return datetime.utcnow() + timedelta(hours=5, minutes=30)
 
 def get_random_impersonate():
-    """સપોર્ટેડ અને લેટેસ્ટ બ્રાઉઝર પ્રોફાઇલ્સ"""
     profiles = ["chrome120", "chrome110", "edge101", "safari15_3", "chrome104"]
     return random.choice(profiles)
 
@@ -44,8 +43,6 @@ def get_random_headers():
     }
 
 def get_latest_bse_announcements():
-    """BSE ની તમામ લેટેસ્ટ જાહેરાતો ખેંચશે"""
-    
     url = "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno=1&strCat=-1&strPrevDate=&strScrip=&strSearch=P&strToDate=&strType=C"
     
     announcement_list = []
@@ -67,6 +64,12 @@ def get_latest_bse_announcements():
 
                 if 'Table' in data:
                     print(f"✅ સફળતાપૂર્વક કનેક્ટ થયું ({browser_profile} દ્વારા)")
+                    print(f" કુલ ફાઇલો મળી: {len(data['Table'])})")
+                    
+                    # ચકાસણી માટે શરૂઆતની 5 ફાઇલોના નામ પ્રિન્ટ કરો
+                    for i, item in enumerate(data['Table'][:5]):
+                        print(f"[{i+1}] કંપની: {item.get('SLONGNAME')} | હેડિંગ: {item.get('NEWSSUB')}")
+                    
                     for item in data['Table'][:25]: 
                         comp_name = item.get('SLONGNAME', '')
                         heading = item.get('NEWSSUB', '')
@@ -75,7 +78,7 @@ def get_latest_bse_announcements():
                         
                         heading_lower = heading.lower()
                         
-                        is_result = any(k in heading_lower for k in ['result', 'financial'])
+                        is_result = any(k in heading_lower for k in ['result', 'financial', 'unaudited', 'audited'])
                         is_order = any(k in heading_lower for k in ['order', 'award', 'contract', 'receipt'])
                         
                         if comp_name and (is_result or is_order):
