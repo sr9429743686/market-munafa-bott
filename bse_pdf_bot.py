@@ -14,13 +14,14 @@ from curl_cffi import requests as c_requests
 import requests
 import xml.etree.ElementTree as ET
 import PyPDF2
+from bs4 import BeautifulSoup
 import google.generativeai as genai
 
 # ---------------- CONFIG ----------------
-BLOG_ID = os.getenv("BLOG_ID", "").strip()
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "").strip()
-GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
-GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "").strip()
+BLOG_ID = os.getenv("BLOG_ID", "6996150531679127159").strip()
+GOOGLE_CLIENT_ID = (os.getenv("GOOGLE_CLIENT_ID") or os.getenv("CLIENT_ID") or "").strip()
+GOOGLE_CLIENT_SECRET = (os.getenv("GOOGLE_CLIENT_SECRET") or os.getenv("CLIENT_SECRET") or "").strip()
+GOOGLE_REFRESH_TOKEN = (os.getenv("GOOGLE_REFRESH_TOKEN") or os.getenv("REFRESH_TOKEN") or "").strip()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
@@ -89,7 +90,7 @@ def get_url(url, stream=False):
         try:
             profile = profiles[attempt % len(profiles)]
             headers = {
-                "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, application/pdf, */*",
+                "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, application/pdf, text/html, */*",
                 "Accept-Language": "en-US,en;q=0.9",
                 "Referer": "https://www.bseindia.com/",
             }
@@ -150,7 +151,7 @@ def parse_feed(feed_url, feed_kind):
         links = extract_links_from_xml_item(node)
 
         link = ""
-        direct = [u for u in links if urlparse(u).path.lower().endswith((".pdf", ".xml", ".xbrl"))]
+        direct = [u for u in links if urlparse(u).path.lower().endswith((".pdf", ".xml", ".xbrl", ".html", ".htm"))]
         if direct:
             link = direct[0]
         elif links:
@@ -206,6 +207,16 @@ def extract_xml_text(url):
     return clean_text(" ".join(values))[:MAX_TEXT_CHARS]
 
 
+def extract_html_text(url):
+    if not url or not urlparse(url).path.lower().endswith((".html", ".htm")):
+        return ""
+    response = get_url(url)
+    soup = BeautifulSoup(response.text, "html.parser")
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    return clean_text(soup.get_text(separator=" "))[:MAX_TEXT_CHARS]
+
+
 def get_document_text(item):
     parts = []
     if item["description"]:
@@ -217,6 +228,8 @@ def get_document_text(item):
         try:
             if path.endswith((".xml", ".xbrl")):
                 extracted = extract_xml_text(url)
+            elif path.endswith((".html", ".htm")):
+                extracted = extract_html_text(url)
             elif path.endswith(".pdf"):
                 extracted = extract_pdf_text(url)
             else:
@@ -314,7 +327,7 @@ Source Text:
 def blogger_access_token():
     required = (GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN)
     if not all(required):
-        raise RuntimeError("Google Blogger OAuth secrets are missing")
+        raise RuntimeError("Google Blogger OAuth secrets (CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN) are missing")
     response = requests.post(
         "https://oauth2.googleapis.com/token",
         data={
@@ -354,8 +367,10 @@ def blogger_publish(title, content_html):
     return response.json().get("url", "")
 
 
-def html_escape(text):
-    return html.escape(text).replace("\n", "<br>\n")
+def format_summary_html(text):
+    escaped = html.escape(text)
+    escaped = escaped.replace("&lt;b&gt;", "<b>").replace("&lt;/b&gt;", "</b>")
+    return escaped.replace("\n", "<br>\n")
 
 
 def publish_item(item, doc_type, summary, item_id):
@@ -363,7 +378,7 @@ def publish_item(item, doc_type, summary, item_id):
     title = item["title"][:180]
     post_title = f"{title} | MarketMunafa"
 
-    safe_summary = html_escape(summary)
+    safe_summary = format_summary_html(summary)
     safe_title = html.escape(title)
     source_html = (
         f'<p><a href="{html.escape(source_url, quote=True)}" '
@@ -436,7 +451,7 @@ def run():
                 item["title"], doc_type, source_text, item["link"]
             )
             publish_item(item, doc_type, summary, item_id)
-            time.sleep(2)
+            time.sleep(5)
         except Exception:
             log.exception("Item processing failed: %s", item["title"])
 
