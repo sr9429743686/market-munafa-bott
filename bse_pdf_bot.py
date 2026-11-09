@@ -41,13 +41,12 @@ def get_random_headers():
     }
 
 def get_latest_bse_pdfs():
-    """BSE પરથી આજની તારીખ મુજબ રિઝલ્ટ અને ઓર્ડરની PDF ખેંચશે"""
+    """BSE પરથી સીધી લેટેસ્ટ રિઝલ્ટ અને ઓર્ડરની PDF ખેંચશે"""
     
-    today_str = get_ist_now().strftime("%d/%m/%Y") # આજની તારીખ (દા.ત. 09/11/2026)
-    
+    # તારીખ વગરની લિંક્સ જેથી હંમેશાં લેટેસ્ટ ટોપ ડેટા જ મળે
     urls = {
-        "result": f"https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno=1&strCat=Result&strPrevDate={today_str}&strScrip=&strSearch=P&strToDate={today_str}&strType=C",
-        "order": f"https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno=1&strCat=Company%20Update&strPrevDate={today_str}&strScrip=&strSearch=P&strToDate={today_str}&strType=C"
+        "result": "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno=1&strCat=Result&strPrevDate=&strScrip=&strSearch=P&strToDate=&strType=C",
+        "order": "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno=1&strCat=Company%20Update&strPrevDate=&strScrip=&strSearch=P&strToDate=&strType=C"
     }
     
     headers = get_random_headers()
@@ -66,7 +65,7 @@ def get_latest_bse_pdfs():
                     continue
 
                 if 'Table' in data:
-                    for item in data['Table'][:2]: # આજની ટોપ 2 ફાઈલો
+                    for item in data['Table'][:2]: # ટોપ 2 ફાઈલો
                         comp_name = item.get('SLONGNAME', '')
                         heading = item.get('NEWSSUB', '')
                         pdf_link = item.get('ATTACHMENTNAME', '')
@@ -149,7 +148,7 @@ def run_pdf_bot():
     pdfs = get_latest_bse_pdfs()
     
     if not pdfs:
-        print(f"[{ist_now_str}] ⚪ આજની કોઈ PDF મળી નથી.")
+        print(f"[{ist_now_str}] ⚪ કોઈ PDF મળી નથી.")
         return
         
     for item in pdfs:
