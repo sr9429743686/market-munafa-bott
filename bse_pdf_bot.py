@@ -23,7 +23,7 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
 GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "").strip()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -341,103 +341,4 @@ def blogger_publish(title, content_html):
         },
         json={
             "kind": "blogger#post",
-            "blog": {"id": BLOG_ID},
-            "title": title,
-            "content": content_html,
-            "labels": ["BSE UPDATE", "MARKET NEWS", "MarketMunafa"],
-        },
-        timeout=25,
-    )
-    response.raise_for_status()
-    return response.json().get("url", "")
-
-
-def html_escape(text):
-    return html.escape(text).replace("\n", "<br>\n")
-
-
-def publish_item(item, doc_type, summary, item_id):
-    source_url = item["link"]
-    title = item["title"][:180]
-    post_title = f"{title} | MarketMunafa"
-
-    safe_summary = html_escape(summary)
-    safe_title = html.escape(title)
-    source_html = (
-        f'<p><a href="{html.escape(source_url, quote=True)}" '
-        f'rel="nofollow noopener" target="_blank">View Original BSE Filing</a></p>'
-        if source_url else ""
-    )
-    blog_html = f"""
-    <article>
-      <h2>{safe_title}</h2>
-      <p><i>MarketMunafa | BSE Corporate Disclosure Analysis</i></p>
-      <div>{safe_summary}</div>
-      {source_html}
-      <hr>
-      <p><small>Disclaimer: This article is prepared for informational purposes based on public corporate filings. 
-      This is not financial advice. Please review the original filing before making any investment decisions.</small></p>
-    </article>
-    """
-
-    if POST_TO_BLOGGER:
-        try:
-            blog_url = blogger_publish(post_title, blog_html)
-            mark_posted(item_id, title, source_url)
-            log.info("Blogger post successful: %s", blog_url)
-        except Exception as exc:
-            log.exception("Blogger publishing failed")
-            raise RuntimeError(f"Blogger: {exc}")
-    else:
-        log.warning("Blogger publishing is disabled")
-
-
-# ---------------- MAIN ----------------
-def run():
-    init_db()
-    all_items = []
-
-    for kind, feed_url in FEEDS.items():
-        try:
-            items = parse_feed(feed_url, kind)
-            log.info("%s feed: %d items", kind, len(items))
-            all_items.extend(items)
-        except Exception:
-            log.exception("Feed failed: %s", feed_url)
-
-    if not all_items:
-        log.warning("No feed items retrieved. Check BSE feed availability/network.")
-        return
-
-    seen_in_run = set()
-    for item in all_items:
-        item_id = make_item_id(item)
-        if item_id in seen_in_run or was_posted(item_id):
-            continue
-        seen_in_run.add(item_id)
-
-        doc_type = classify_item(item)
-        if not doc_type:
-            continue
-
-        log.info("Processing %s: %s", doc_type, item["title"])
-        try:
-            source_text = get_document_text(item)
-            if len(source_text) < MIN_SOURCE_TEXT:
-                log.warning(
-                    "Skipped: insufficient filing text (%d chars): %s",
-                    len(source_text), item["title"]
-                )
-                continue
-
-            summary = analyze_with_gemini(
-                item["title"], doc_type, source_text, item["link"]
-            )
-            publish_item(item, doc_type, summary, item_id)
-            time.sleep(2)
-        except Exception:
-            log.exception("Item processing failed: %s", item["title"])
-
-
-if __name__ == "__main__":
-    run()
+            "blog": {"id": BLOG
