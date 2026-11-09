@@ -41,9 +41,8 @@ def get_random_headers():
     }
 
 def get_latest_bse_pdfs():
-    """BSE પરથી રિઝલ્ટ અને ઓર્ડરની કેટેગરી મુજબ ડેટા ખેંચશે"""
+    """BSE પરથી ડેટા ખેંચશે (ટેસ્ટિંગ માટે અત્યારે બધી જ PDF એલાઉ કરી છે)"""
     
-    # રિઝલ્ટ અને ઓર્ડર માટે અલગ લિંક્સ
     urls = {
         "result": "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno=1&strCat=Result&strPrevDate=&strScrip=&strSearch=P&strToDate=&strType=C",
         "order": "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno=1&strCat=Company%20Update&strPrevDate=&strScrip=&strSearch=P&strToDate=&strType=C"
@@ -65,23 +64,13 @@ def get_latest_bse_pdfs():
                     continue
 
                 if 'Table' in data:
-                    for item in data['Table'][:3]: 
+                    for item in data['Table'][:1]: # ટેસ્ટ માટે પહેલી જ ફાઈલ
                         comp_name = item.get('SLONGNAME', '')
                         heading = item.get('NEWSSUB', '')
                         pdf_link = item.get('ATTACHMENTNAME', '')
                         
-                        heading_lower = heading.lower()
-                        is_valid = False
-                        
-                        # જો રિઝલ્ટ વાળી લિંક હોય
-                        if req_type == "result" and ('result' in heading_lower or 'financial' in heading_lower):
-                            is_valid = True
-                        # જો ઓર્ડર વાળી લિંક હોય
-                        elif req_type == "order" and any(k in heading_lower for k in ['order', 'award', 'contract', 'receipt']):
-                            is_valid = True
-                            
-                        # અત્યારે લાઈવ ટેસ્ટિંગ માટે બધું જ એલાઉ કરવું હોય તો નીચેની લાઈન ચાલુ કરી દો
-                        is_valid = False 
+                        # --- લાઈવ ટેસ્ટિંગ માટે ફિલ્ટર બાયપાસ (બધી જ PDF લેશે) ---
+                        is_valid = True 
                             
                         if comp_name and pdf_link and is_valid:
                             full_pdf_url = f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{pdf_link}"
@@ -116,36 +105,18 @@ def extract_text_from_pdf_url(pdf_url):
 def analyze_with_gemini(company_name, pdf_text, doc_type):
     if not GEMINI_API_KEY: return ""
     
-    if doc_type == "result":
-        prompt = f"""
-        You are an expert Indian stock market analyst for 'MarketMunafa'.
-        Analyze this BSE corporate announcement PDF for {company_name}.
-        
-        This is a FINANCIAL RESULT. Output EXACTLY in this Gujarati format:
-        **આવક (Revenue):** [amount] ([growth % YoY])
-        **ચોખ્ખો નફો (Net Profit):** [amount] ([growth % YoY])
-        **EBITDA:** [amount] ([growth % YoY])
-        
-        **નિષ્કર્ષ (Summary):** [2 lines in Gujarati about market impact]
-        
-        PDF Text:
-        {pdf_text[:4000]}
-        """
-    else:
-        prompt = f"""
-        You are an expert Indian stock market analyst for 'MarketMunafa'.
-        Analyze this BSE corporate announcement PDF for {company_name}.
-        
-        This is a NEW ORDER / CONTRACT. Output EXACTLY in this Gujarati format:
-        **ક્લાયન્ટ (Client):** [Name of the client giving the order]
-        **ઓર્ડરની કિંમત (Order Value):** [Amount in Rs/Crores]
-        **વિગતો (Details):** [1-2 lines explaining the order/work in Gujarati]
-        
-        **નિષ્કર્ષ (Summary):** [1 line in Gujarati about how good this is for the company]
-        
-        PDF Text:
-        {pdf_text[:4000]}
-        """
+    prompt = f"""
+    You are an expert Indian stock market analyst for 'MarketMunafa'.
+    Analyze this BSE corporate announcement PDF for {company_name}.
+    
+    Output EXACTLY in this Gujarati format:
+    **કંપની (Company):** {company_name}
+    **વિગતો (Details):** [2 lines explaining the announcement in simple Gujarati]
+    **નિષ્કર્ષ (Summary):** [1 line about market impact]
+    
+    PDF Text:
+    {pdf_text[:4000]}
+    """
         
     try:
         response = model.generate_content(prompt)
@@ -164,7 +135,7 @@ def post_to_blogger(title, html_content):
             access_token = res.json().get("access_token")
             api_url = f"https://www.googleapis.com/blogger/v3/blogs/{BLOG_ID}/posts/"
             headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-            post_data = {"title": title, "content": html_content, "labels": ["BSE UPDATE", "MARKET NEWS"]}
+            post_data = {"title": title, "content": html_content, "labels": ["BSE TEST", "MARKET NEWS"]}
             requests.post(api_url, json=post_data, headers=headers, timeout=15)
     except: pass
 
@@ -179,24 +150,23 @@ def run_pdf_bot():
     pdfs = get_latest_bse_pdfs()
     
     if not pdfs:
-        print(f"[{ist_now_str}] ⚪ કોઈ નવી રિઝલ્ટ કે ઓર્ડરની PDF મળી નથી.")
+        print(f"[{ist_now_str}] ⚪ કોઈ PDF મળી નથી.")
         return
         
     for item in pdfs:
-        print(f"Processing: {item['company']} - {item['type'].upper()}")
+        print(f"Processing Test: {item['company']}")
         pdf_text = extract_text_from_pdf_url(item['pdf_url'])
         
-        if pdf_text and len(pdf_text) > 200:
+        if pdf_text and len(pdf_text) > 100:
             ai_summary_gu = analyze_with_gemini(item['company'], pdf_text, item['type'])
             
             if ai_summary_gu:
-                tag = "New Order Win" if item['type'] == "order" else "Q2 Financial Results"
-                post_title = f"{item['company']} {tag} ({ist_now_str}) | MarketMunafa"
+                post_title = f"{item['company']} Live Test Update ({ist_now_str}) | MarketMunafa"
                 
                 # --- Telegram Message ---
-                t_msg = f"📊 *{item['company']} {tag} (BSE Update)*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+                t_msg = f"🧪 *{item['company']} Live Test Update*\n━━━━━━━━━━━━━━━━━━━━\n\n"
                 t_msg += ai_summary_gu
-                t_msg += "\n\n✅ *MarketMunafa Analysis*"
+                t_msg += "\n\n✅ *MarketMunafa Test Bot*"
                 send_telegram(t_msg)
                 
                 formatted_summary = ai_summary_gu.replace('**', '<b>').replace('\n', '<br>')
@@ -204,8 +174,8 @@ def run_pdf_bot():
                 # --- Blogger HTML ---
                 b_html = f"""
                 <div class="market-update-post">
-                    <h3>{item['company']} - {tag}</h3>
-                    <p><i>Official BSE Update via MarketMunafa AI</i></p>
+                    <h3>{item['company']} - Test Update</h3>
+                    <p><i>Official BSE Update via MarketMunafa AI Test</i></p>
                     <div style="background-color: #f8f9fa; padding: 15px; border-left: 4px solid #10b981; margin-bottom: 20px;">
                         {formatted_summary}
                     </div>
