@@ -198,13 +198,16 @@ def run_pdf_bot():
                 t_msg += "\n\n✅ *MarketMunafa Analysis*"
                 send_telegram(t_msg)
                 
+                # અહીં f-string એરર સોલ્વ કરવા ફોર્મેટિંગ અલગ લીધું છે
+                formatted_summary = ai_summary_gu.replace('**', '<b>').replace('\n', '<br>')
+                
                 # --- Blogger HTML ---
                 b_html = f"""
                 <div class="market-update-post">
                     <h3>{item['company']} Q2 Financial Results</h3>
                     <p><i>Official BSE PDF Analysis by MarketMunafa AI</i></p>
                     <div style="background-color: #f8f9fa; padding: 15px; border-left: 4px solid #10b981; margin-bottom: 20px;">
-                        {ai_summary_gu.replace('**', '<b>').replace('\n', '<br>')}
+                        {formatted_summary}
                     </div>
                     <p><a href="{item['pdf_url']}" target="_blank" rel="nofollow noopener">Download Original BSE PDF Here</a></p>
                     <hr>
