@@ -41,11 +41,13 @@ def get_random_headers():
     }
 
 def get_latest_bse_pdfs():
-    """BSE પરથી ડેટા ખેંચશે (ટેસ્ટિંગ માટે અત્યારે બધી જ PDF એલાઉ કરી છે)"""
+    """BSE પરથી આજની તારીખ મુજબ રિઝલ્ટ અને ઓર્ડરની PDF ખેંચશે"""
+    
+    today_str = get_ist_now().strftime("%d/%m/%Y") # આજની તારીખ (દા.ત. 09/11/2026)
     
     urls = {
-        "result": "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno=1&strCat=Result&strPrevDate=&strScrip=&strSearch=P&strToDate=&strType=C",
-        "order": "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno=1&strCat=Company%20Update&strPrevDate=&strScrip=&strSearch=P&strToDate=&strType=C"
+        "result": f"https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno=1&strCat=Result&strPrevDate={today_str}&strScrip=&strSearch=P&strToDate={today_str}&strType=C",
+        "order": f"https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w?pageno=1&strCat=Company%20Update&strPrevDate={today_str}&strScrip=&strSearch=P&strToDate={today_str}&strType=C"
     }
     
     headers = get_random_headers()
@@ -64,15 +66,12 @@ def get_latest_bse_pdfs():
                     continue
 
                 if 'Table' in data:
-                    for item in data['Table'][:1]: # ટેસ્ટ માટે પહેલી જ ફાઈલ
+                    for item in data['Table'][:2]: # આજની ટોપ 2 ફાઈલો
                         comp_name = item.get('SLONGNAME', '')
                         heading = item.get('NEWSSUB', '')
                         pdf_link = item.get('ATTACHMENTNAME', '')
-                        
-                        # --- લાઈવ ટેસ્ટિંગ માટે ફિલ્ટર બાયપાસ (બધી જ PDF લેશે) ---
-                        is_valid = True 
                             
-                        if comp_name and pdf_link and is_valid:
+                        if comp_name and pdf_link:
                             full_pdf_url = f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{pdf_link}"
                             pdf_list.append({
                                 'company': comp_name,
@@ -135,7 +134,7 @@ def post_to_blogger(title, html_content):
             access_token = res.json().get("access_token")
             api_url = f"https://www.googleapis.com/blogger/v3/blogs/{BLOG_ID}/posts/"
             headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-            post_data = {"title": title, "content": html_content, "labels": ["BSE TEST", "MARKET NEWS"]}
+            post_data = {"title": title, "content": html_content, "labels": ["BSE UPDATE", "MARKET NEWS"]}
             requests.post(api_url, json=post_data, headers=headers, timeout=15)
     except: pass
 
@@ -150,23 +149,23 @@ def run_pdf_bot():
     pdfs = get_latest_bse_pdfs()
     
     if not pdfs:
-        print(f"[{ist_now_str}] ⚪ કોઈ PDF મળી નથી.")
+        print(f"[{ist_now_str}] ⚪ આજની કોઈ PDF મળી નથી.")
         return
         
     for item in pdfs:
-        print(f"Processing Test: {item['company']}")
+        print(f"Processing: {item['company']}")
         pdf_text = extract_text_from_pdf_url(item['pdf_url'])
         
         if pdf_text and len(pdf_text) > 100:
             ai_summary_gu = analyze_with_gemini(item['company'], pdf_text, item['type'])
             
             if ai_summary_gu:
-                post_title = f"{item['company']} Live Test Update ({ist_now_str}) | MarketMunafa"
+                post_title = f"{item['company']} Update ({ist_now_str}) | MarketMunafa"
                 
                 # --- Telegram Message ---
-                t_msg = f"🧪 *{item['company']} Live Test Update*\n━━━━━━━━━━━━━━━━━━━━\n\n"
+                t_msg = f"📊 *{item['company']} Update*\n━━━━━━━━━━━━━━━━━━━━\n\n"
                 t_msg += ai_summary_gu
-                t_msg += "\n\n✅ *MarketMunafa Test Bot*"
+                t_msg += "\n\n✅ *MarketMunafa Bot*"
                 send_telegram(t_msg)
                 
                 formatted_summary = ai_summary_gu.replace('**', '<b>').replace('\n', '<br>')
@@ -174,8 +173,8 @@ def run_pdf_bot():
                 # --- Blogger HTML ---
                 b_html = f"""
                 <div class="market-update-post">
-                    <h3>{item['company']} - Test Update</h3>
-                    <p><i>Official BSE Update via MarketMunafa AI Test</i></p>
+                    <h3>{item['company']} - Update</h3>
+                    <p><i>Official BSE Update via MarketMunafa AI</i></p>
                     <div style="background-color: #f8f9fa; padding: 15px; border-left: 4px solid #10b981; margin-bottom: 20px;">
                         {formatted_summary}
                     </div>
