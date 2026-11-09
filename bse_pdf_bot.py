@@ -14,7 +14,7 @@ from urllib.parse import urljoin, urlparse
 import requests
 import xml.etree.ElementTree as ET
 import PyPDF2
-from google import genai
+import google.generativeai as genai
 
 # ---------------- CONFIG ----------------
 BLOG_ID = os.getenv("BLOG_ID", "").strip()
@@ -23,7 +23,11 @@ GOOGLE_CLIENT_SECRET = os.getenv("GOOGLE_CLIENT_SECRET", "").strip()
 GOOGLE_REFRESH_TOKEN = os.getenv("GOOGLE_REFRESH_TOKEN", "").strip()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+    gemini_model = genai.GenerativeModel(GEMINI_MODEL)
 
 # BSE feeds listed publicly. If a feed is temporarily unavailable, the other
 # feed continues to be checked. These are feeds, not a guarantee of full history.
@@ -52,7 +56,6 @@ session.headers.update({
     "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, application/pdf, */*",
     "Accept-Language": "en-IN,en;q=0.9",
 })
-gemini_client = genai.Client(api_key=GEMINI_API_KEY) if GEMINI_API_KEY else None
 
 
 # ---------------- STORAGE / HTTP ----------------
@@ -259,7 +262,7 @@ def make_item_id(item):
 
 
 def analyze_with_gemini(company_title, doc_type, source_text, source_url):
-    if not gemini_client:
+    if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not configured")
 
     if doc_type == "result":
@@ -306,10 +309,7 @@ Output format must be strictly as follows:
 Source Text:
 {source_text[:MAX_TEXT_CHARS]}
 """
-    response = gemini_client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-    )
+    response = gemini_model.generate_content(prompt)
     result = (response.text or "").strip()
     if not result:
         raise RuntimeError("Gemini returned an empty response")
