@@ -163,7 +163,7 @@ def to_float(val):
         return 0.0
 
 
-# ---------------- SCREENER FUNDAMENTALS ----------------
+# ---------------- SCREENER FUNDAMENTALS (ALL 10 INDICATORS) ----------------
 def get_screener_fundamentals(comp_title):
     clean_name = re.sub(r"\(\d+\)", "", comp_title)
     clean_name = re.sub(r"\b(ltd|limited|india|industries|corp|corporation|pvt)\b", "", clean_name, flags=re.I).strip()
@@ -177,16 +177,17 @@ def get_screener_fundamentals(comp_title):
 
     info = {
         "price_str": "₹1,000.00",
-        "market_cap": "₹18,836 Cr",
-        "pe_ratio": "20.69",
-        "pb_ratio": "2.91",
-        "industry_pe": "37.13",
-        "roe": "11.73%",
-        "eps": "59.53",
-        "div_yield": "0.73%",
-        "book_value": "₹423.96",
-        "total_debt": "₹0 Cr",
-        "debt_to_equity": "0.00",
+        "market_cap": "N/A",
+        "pe_ratio": "N/A",
+        "pb_ratio": "N/A",
+        "industry_pe": "N/A",
+        "roe": "N/A",
+        "eps": "N/A",
+        "div_yield": "N/A",
+        "book_value": "N/A",
+        "total_debt": "N/A",
+        "debt_to_equity": "N/A",
+        "face_value": "2",
         "quarters_text": "",
         "annual_text": "",
         "q_labels": [],
@@ -231,7 +232,9 @@ def get_screener_fundamentals(comp_title):
                             info["div_yield"] = f"{num_txt}%"
                         elif "ROE" in t:
                             info["roe"] = f"{num_txt}%"
-                        elif "Debt to equity" in t or "Debt to Equity" in t:
+                        elif "Face Value" in t:
+                            info["face_value"] = num_txt
+                        elif "Debt to equity" in t or t.startswith("Debt to"):
                             info["debt_to_equity"] = num_txt
                         elif "Industry P/E" in t:
                             info["industry_pe"] = num_txt
@@ -486,6 +489,7 @@ Screener Fundamentals Provided:
 - Book Value: {screener_info['book_value']}
 - Total Debt: {screener_info['total_debt']}
 - Debt-to-Equity: {screener_info['debt_to_equity']}
+- Face Value: {screener_info['face_value']}
 
 Screener Historical Quarters:
 {screener_info['quarters_text']}
@@ -509,13 +513,17 @@ Return ONLY a valid JSON object (no markdown formatting outside JSON) with this 
   "revenue": {{"curr": "3,676", "prev": "2,715", "growth": "+35.0%", "difference": "+961 Cr"}},
   "gross_profit": {{"curr": "1,424", "prev": "775", "growth": "+83.7%", "difference": "+649 Cr"}},
   "net_profit": {{"curr": "1,127", "prev": "689", "growth": "+63.6%", "difference": "+438 Cr"}},
-  "total_debt": "{screener_info['total_debt']}",
-  "debt_to_equity": "{screener_info['debt_to_equity']}",
   "market_cap": "{screener_info['market_cap']}",
   "pe_ratio": "{screener_info['pe_ratio']}",
+  "pb_ratio": "{screener_info['pb_ratio']}",
   "industry_pe": "{screener_info['industry_pe']}",
   "roe": "{screener_info['roe']}",
   "eps": "{screener_info['eps']}",
+  "div_yield": "{screener_info['div_yield']}",
+  "book_value": "{screener_info['book_value']}",
+  "total_debt": "{screener_info['total_debt']}",
+  "debt_to_equity": "{screener_info['debt_to_equity']}",
+  "face_value": "{screener_info['face_value']}",
   "estimated_stock_return": "Estimated % return/reaction (e.g. +12.0% to +16.5% Target Upside)",
   "intraday_signal": "1-2 sentences in English explaining intraday/positional sentiment based on P/E, Debt-to-Equity, and earnings difference.",
   "quarter_chart_labels": ["Jun 25", "Sep 25", "Dec 25", "Mar 26", "Jun 26", "Sep 26"],
@@ -526,7 +534,7 @@ Return ONLY a valid JSON object (no markdown formatting outside JSON) with this 
   "yearly_chart_net_profit": [2568, 3363],
   "seo_article_paragraphs": [
     "Paragraph 1: Objective English summary detailing quarterly revenue, gross profit, and net profit differences and percentage growths.",
-    "Paragraph 2: Comprehensive breakdown of valuation metrics (P/E 20.69 vs Industry P/E 37.13), zero debt status (0.00 D/E), and estimated stock return percentage."
+    "Paragraph 2: Comprehensive breakdown of valuation metrics, all 10 Screener fundamentals, zero debt status, and estimated stock return percentage."
   ],
   "gujarati_summary": "2-3 sentences in natural Gujarati summarizing the result difference and overall growth.",
   "gujarati_intraday_view": "1-2 sentences in natural Gujarati explaining debt status, valuation advantage, and expected percentage return/boost for traders."
@@ -643,11 +651,15 @@ def build_post_html(data, screener_info, source_url):
 
     mkt_cap = html.escape(str(data.get("market_cap") or screener_info["market_cap"]))
     pe_ratio = html.escape(str(data.get("pe_ratio") or screener_info["pe_ratio"]))
+    pb_ratio = html.escape(str(data.get("pb_ratio") or screener_info["pb_ratio"]))
     ind_pe = html.escape(str(data.get("industry_pe") or screener_info["industry_pe"]))
     roe = html.escape(str(data.get("roe") or screener_info["roe"]))
     eps = html.escape(str(data.get("eps") or screener_info["eps"]))
+    div_yield = html.escape(str(data.get("div_yield") or screener_info["div_yield"]))
+    book_value = html.escape(str(data.get("book_value") or screener_info["book_value"]))
     total_debt = html.escape(str(data.get("total_debt") or screener_info["total_debt"]))
     de_ratio = html.escape(str(data.get("debt_to_equity") or screener_info["debt_to_equity"]))
+    face_val = html.escape(str(data.get("face_value") or screener_info["face_value"]))
     est_return = html.escape(str(data.get("estimated_stock_return", "N/A")))
     intraday_sig = html.escape(str(data.get("intraday_signal", "")))
 
@@ -699,7 +711,7 @@ def build_post_html(data, screener_info, source_url):
               <th style="text-align: left; padding: 10px 4px;">{qtr_lbl}</th>
               <th style="text-align: right; padding: 10px 4px;">{curr_lbl}</th>
               <th style="text-align: right; padding: 10px 4px;">{prev_lbl}</th>
-              <th style="text-align: right; padding: 10px 4px;">Diff (ફરક)</th>
+              <th style="text-align: right; padding: 10px 4px;">Difference</th>
               <th style="text-align: right; padding: 10px 4px;">Growth</th>
             </tr>
           </thead>
@@ -729,19 +741,23 @@ def build_post_html(data, screener_info, source_url):
         </table>
       </div>
 
-      <!-- Screener Fundamentals & Estimated Return Box -->
+      <!-- All 10 Fundamentals & Estimated Stock Return Box -->
       <div style="background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 12px; padding: 18px; margin-bottom: 24px;">
-        <h3 style="margin: 0 0 12px 0; font-size: 18px; color: #0f172a;">📊 Screener Fundamentals & Estimated Stock Return</h3>
+        <h3 style="margin: 0 0 12px 0; font-size: 18px; color: #0f172a;">📊 Screener Fundamentals (All 10 Indicators) & Estimated Return</h3>
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; font-size: 15px; margin-bottom: 12px;">
           <div><strong>Market Cap:</strong> {mkt_cap}</div>
-          <div><strong>P/E Ratio:</strong> {pe_ratio} (Ind. P/E: {ind_pe})</div>
           <div><strong>ROE:</strong> {roe}</div>
+          <div><strong>P/E Ratio:</strong> {pe_ratio}</div>
           <div><strong>EPS (TTM):</strong> {eps}</div>
-          <div><strong>Total Debt:</strong> {total_debt}</div>
-          <div><strong>Debt-to-Equity:</strong> {de_ratio}</div>
+          <div><strong>P/B Ratio:</strong> {pb_ratio}</div>
+          <div><strong>Div Yield:</strong> {div_yield}</div>
+          <div><strong>Industry P/E:</strong> {ind_pe}</div>
+          <div><strong>Book Value:</strong> {book_value}</div>
+          <div><strong>Debt to Equity:</strong> {de_ratio}</div>
+          <div><strong>Face Value:</strong> {face_val}</div>
         </div>
         <div style="background: #d1fae5; border: 1px solid #10b981; padding: 12px 14px; border-radius: 8px; font-size: 16px; margin-top: 10px;">
-          🎯 <strong>અંદાજિત શેર રીટર્ન / ટાર્ગેટ બૂસ્ટ (Estimated Return):</strong> <span style="color: #065f46; font-weight: 700;">{est_return}</span>
+          🎯 <strong>Estimated Stock Return / Target Boost:</strong> <span style="color: #065f46; font-weight: 700;">{est_return}</span>
         </div>
         <p style="margin: 10px 0 0 0; font-size: 14px; color: #334155;"><strong>Intraday & Positional View:</strong> {intraday_sig}</p>
       </div>
