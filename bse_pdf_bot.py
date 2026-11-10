@@ -24,6 +24,10 @@ GOOGLE_CLIENT_ID = (os.getenv("GOOGLE_CLIENT_ID") or os.getenv("CLIENT_ID") or "
 GOOGLE_CLIENT_SECRET = (os.getenv("GOOGLE_CLIENT_SECRET") or os.getenv("CLIENT_SECRET") or "").strip()
 GOOGLE_REFRESH_TOKEN = (os.getenv("GOOGLE_REFRESH_TOKEN") or os.getenv("REFRESH_TOKEN") or "").strip()
 
+# Telegram Credentials
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9086072964:AAEUyn-GAyJLdsYR4YS5l6Xy6HJsOOoA8HM").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "430834857").strip()
+
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
@@ -43,6 +47,7 @@ MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "14000"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
 MIN_SOURCE_TEXT = int(os.getenv("MIN_SOURCE_TEXT", "200"))
 POST_TO_BLOGGER = os.getenv("POST_TO_BLOGGER", "true").lower() == "true"
+SEND_TO_TELEGRAM = os.getenv("SEND_TO_TELEGRAM", "true").lower() == "true"
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -53,7 +58,6 @@ log = logging.getLogger("marketmunafa")
 
 # ---------------- DUPLICATE PROTECTION & STORAGE ----------------
 def normalize_company_key(title):
-    """કંપનીના નામમાંથી સ્ક્રિપ કોડ અને વધારાના શબ્દો કાઢીને યુનિક કી બનાવશે"""
     clean = re.sub(r"\(\d+\)", "", str(title))
     clean = clean.split("|")[0].split(":")[0]
     clean = re.sub(
@@ -67,7 +71,6 @@ def normalize_company_key(title):
 
 
 def extract_file_key(url):
-    """PDF કે ફાઇલનું નામ અલગ તારવશે જેથી એક જ PDF બીજી વાર પ્રોસેસ ન થાય"""
     if not url:
         return ""
     path = urlparse(url).path.lower()
@@ -86,7 +89,6 @@ def init_db():
                 posted_at TEXT
             )
         """)
-        # જૂના ટેબલમાં નવા કોલમ ન હોય તો ઉમેરવા માટે
         try:
             conn.execute("ALTER TABLE posted ADD COLUMN company_key TEXT")
         except sqlite3.OperationalError:
@@ -153,6 +155,14 @@ def get_url(url, stream=False):
     raise RuntimeError(f"Could not fetch {url}: {last_error}")
 
 
+def to_float(val):
+    try:
+        cleaned = re.sub(r"[^\d.-]", "", str(val))
+        return float(cleaned) if cleaned else 0.0
+    except Exception:
+        return 0.0
+
+
 # ---------------- SCREENER FUNDAMENTALS (DEBT, D/E, QUARTERS & ANNUAL) ----------------
 def get_screener_fundamentals(comp_title):
     clean_name = re.sub(r"\(\d+\)", "", comp_title)
@@ -174,6 +184,9 @@ def get_screener_fundamentals(comp_title):
         "q_labels": [],
         "q_rev": [],
         "q_np": [],
+        "y_labels": [],
+        "y_rev": [],
+        "y_np": [],
     }
 
     seen_q = set()
@@ -242,12 +255,7 @@ def get_screener_fundamentals(comp_title):
                         r_title = cols[0].lower()
                         if any(k in r_title for k in ["sales", "revenue", "operating profit", "ebitda", "net profit"]):
                             q_lines.append(" | ".join(cols))
-                            nums = []
-                            for c_val in cols[1:][-6:]:
-                                try:
-                                    nums.append(float(c_val.replace(",", "").replace("%", "").strip()))
-                                except Exception:
-                                    nums.append(0.0)
+                            nums = [to_float(c_val) for c_val in cols[1:][-6:]]
                             if "sales" in r_title or "revenue" in r_title:
                                 info["q_rev"] = nums
                             elif "net profit" in r_title:
@@ -265,23 +273,17 @@ def get_screener_fundamentals(comp_title):
                             continue
                         if not pl_headers and len(cols) > 3:
                             pl_headers = cols[1:]
+                            info["y_labels"] = pl_headers[-4:]
                         r_title = cols[0].lower()
                         if any(k in r_title for k in ["sales", "revenue", "operating profit", "net profit"]):
-                            pl_lines.append(" | ".join(cols[-4:]))
-                            if len(pl_headers) >= 2 and len(cols) >= 3:
-                                try:
-                                    y1_lbl, y2_lbl = pl_headers[-2], pl_headers[-1]
-                                    v1 = float(cols[-2].replace(",", "").strip())
-                                    v2 = float(cols[-1].replace(",", "").strip())
-                                    if ("sales" in r_title or "revenue" in r_title) and y1_lbl not in info["q_labels"]:
-                                        info["q_labels"].extend([y1_lbl, y2_lbl])
-                                        info["q_rev"].extend([v1, v2])
-                                    elif "net profit" in r_title and len(info["q_np"]) < len(info["q_labels"]):
-                                        info["q_np"].extend([v1, v2])
-                                except Exception:
-                                    pass
+                            pl_lines.append(" | ".join(cols[-5:]))
+                            nums = [to_float(c_val) for c_val in cols[1:][-4:]]
+                            if "sales" in r_title or "revenue" in r_title:
+                                info["y_rev"] = nums
+                            elif "net profit" in r_title:
+                                info["y_np"] = nums
                     if pl_headers:
-                        info["annual_text"] = "Annual Header: " + " | ".join(pl_headers[-3:]) + "\n" + "\n".join(pl_lines)
+                        info["annual_text"] = "Annual Header: " + " | ".join(pl_headers[-4:]) + "\n" + "\n".join(pl_lines)
                 break
         except Exception as exc:
             log.warning("Screener lookup warning for %s: %s", q, exc)
@@ -473,13 +475,18 @@ Return ONLY a valid JSON object (no markdown formatting outside JSON) with this 
   "total_debt": "Total Debt in Rs. Cr. (from PDF Balance Sheet or Screener data)",
   "debt_to_equity": "Debt to Equity ratio (e.g. 0.00 or 0.45)",
   "intraday_signal": "1-2 sentences in English explaining intraday/positional trading sentiment based on Debt-to-Equity ratio and profit growth.",
-  "chart_labels": ["Q1", "Q2", "Q3", "Q4", "Prev Yr", "Curr Yr"],
-  "chart_revenue": [100, 120, 130, 150, 450, 520],
-  "chart_net_profit": [15, 20, 22, 28, 70, 85],
+  "quarter_chart_labels": ["Jun 25", "Sep 25", "Dec 25", "Mar 26", "Jun 26", "Sep 26"],
+  "quarter_chart_revenue": [2410, 2715, 2604, 2831, 3080, 3676],
+  "quarter_chart_net_profit": [545, 689, 583, 751, 902, 1127],
+  "yearly_chart_labels": ["FY25 (Prev Year)", "FY26/TTM (Curr Year)"],
+  "yearly_chart_revenue": [10560, 12230],
+  "yearly_chart_net_profit": [2568, 3363],
   "seo_article_paragraphs": [
     "Paragraph 1 (70-90 words): Objective English summary of quarterly revenue, gross/operating profit, and net profit growth for Google News and AdSense.",
     "Paragraph 2 (60-80 words): Balance sheet health covering Total Debt, Debt-to-Equity ratio, and key takeaways for market participants."
-  ]
+  ],
+  "gujarati_summary": "2-3 sentences in natural Gujarati summarizing the company's quarterly & yearly result growth.",
+  "gujarati_intraday_view": "1-2 sentences in natural Gujarati explaining the Debt-to-Equity ratio and whether the result is positive or negative for intraday/positional traders."
 }}
 
 BSE PDF Filing Text:
@@ -493,20 +500,20 @@ BSE PDF Filing Text:
     return json.loads(match.group(0))
 
 
-# ---------------- VISUAL CARD, THUMBNAIL & COLUMN CHART BUILDER ----------------
-def build_column_chart_url(comp_name, labels, rev_list, np_list):
+# ---------------- VISUAL CARD, THUMBNAIL & 2 COLUMN CHARTS BUILDER ----------------
+def build_quarterly_column_chart_url(comp_name, labels, rev_list, np_list):
     chart_config = {
         "type": "bar",
         "data": {
             "labels": labels,
             "datasets": [
                 {
-                    "label": "Revenue (Rs. Cr.)",
+                    "label": "Quarterly Revenue (Rs. Cr.)",
                     "backgroundColor": "#2563eb",
                     "data": rev_list
                 },
                 {
-                    "label": "Net Profit (Rs. Cr.)",
+                    "label": "Quarterly Net Profit (Rs. Cr.)",
                     "backgroundColor": "#16a34a",
                     "data": np_list
                 }
@@ -515,8 +522,8 @@ def build_column_chart_url(comp_name, labels, rev_list, np_list):
         "options": {
             "title": {
                 "display": True,
-                "text": f"{comp_name} - Quarterly & Yearly Performance (Rs. Cr.)",
-                "fontSize": 16
+                "text": f"{comp_name} - All Quarters Performance Trend (Rs. Cr.)",
+                "fontSize": 15
             },
             "legend": {"position": "bottom"},
             "plugins": {
@@ -525,6 +532,61 @@ def build_column_chart_url(comp_name, labels, rev_list, np_list):
                     "align": "top",
                     "color": "#1e293b",
                     "font": {"weight": "bold", "size": 10}
+                }
+            }
+        }
+    }
+    encoded = urllib.parse.quote(json.dumps(chart_config))
+    return f"https://quickchart.io/chart?w=720&h=380&bkg=white&c={encoded}"
+
+
+def build_yoy_comparison_chart_url(comp_name, prev_lbl, curr_lbl, rev, gp, np_d, y_labels, y_rev, y_np):
+    r_prev, r_curr = to_float(rev.get("prev", 0)), to_float(rev.get("curr", 0))
+    gp_prev, gp_curr = to_float(gp.get("prev", 0)), to_float(gp.get("curr", 0))
+    np_prev, np_curr = to_float(np_d.get("prev", 0)), to_float(np_d.get("curr", 0))
+
+    labels = ["Revenue", "Gross Profit", "Net Profit"]
+    prev_data = [r_prev, gp_prev, np_prev]
+    curr_data = [r_curr, gp_curr, np_curr]
+
+    if len(y_rev) >= 2 and len(y_np) >= 2:
+        y_prev_r, y_curr_r = to_float(y_rev[-2]), to_float(y_rev[-1])
+        y_prev_n, y_curr_n = to_float(y_np[-2]), to_float(y_np[-1])
+        if y_prev_r > 0 or y_curr_r > 0:
+            labels.extend(["Annual Revenue", "Annual Net Profit"])
+            prev_data.extend([y_prev_r, y_prev_n])
+            curr_data.extend([y_curr_r, y_curr_n])
+
+    chart_config = {
+        "type": "bar",
+        "data": {
+            "labels": labels,
+            "datasets": [
+                {
+                    "label": f"Previous Year ({prev_lbl})",
+                    "backgroundColor": "#94a3b8",
+                    "data": prev_data
+                },
+                {
+                    "label": f"Current Year ({curr_lbl})",
+                    "backgroundColor": "#059669",
+                    "data": curr_data
+                }
+            ]
+        },
+        "options": {
+            "title": {
+                "display": True,
+                "text": f"{comp_name} - Previous Year vs Current Year Result Comparison (Rs. Cr.)",
+                "fontSize": 15
+            },
+            "legend": {"position": "bottom"},
+            "plugins": {
+                "datalabels": {
+                    "anchor": "end",
+                    "align": "top",
+                    "color": "#0f172a",
+                    "font": {"weight": "bold", "size": 11}
                 }
             }
         }
@@ -559,10 +621,15 @@ def build_post_html(data, screener_info, source_url):
     thumb_prompt = f"{comp_name} quarterly financial results stock market chart growth corporate india"
     thumb_url = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(thumb_prompt)}?width=800&height=450&nologo=true"
 
-    c_labels = data.get("chart_labels") or screener_info["q_labels"] or [prev_lbl, curr_lbl]
-    c_rev = data.get("chart_revenue") or screener_info["q_rev"] or [0, 0]
-    c_np = data.get("chart_net_profit") or screener_info["q_np"] or [0, 0]
-    chart_img_url = build_column_chart_url(comp_name, c_labels, c_rev, c_np)
+    q_labels = data.get("quarter_chart_labels") or screener_info["q_labels"] or [prev_lbl, curr_lbl]
+    q_rev = data.get("quarter_chart_revenue") or screener_info["q_rev"] or [to_float(rev.get("prev")), to_float(rev.get("curr"))]
+    q_np = data.get("quarter_chart_net_profit") or screener_info["q_np"] or [to_float(np_d.get("prev")), to_float(np_d.get("curr"))]
+    quarter_chart_url = build_quarterly_column_chart_url(comp_name, q_labels, q_rev, q_np)
+
+    y_labels = data.get("yearly_chart_labels") or screener_info["y_labels"] or []
+    y_rev = data.get("yearly_chart_revenue") or screener_info["y_rev"] or []
+    y_np = data.get("yearly_chart_net_profit") or screener_info["y_np"] or []
+    yoy_chart_url = build_yoy_comparison_chart_url(comp_name, prev_lbl, curr_lbl, rev, gp, np_d, y_labels, y_rev, y_np)
 
     paragraphs = data.get("seo_article_paragraphs", [])
     para_html = "".join(f"<p style='color:#334155; font-size:16px; line-height:1.7; margin-bottom:14px;'>{html.escape(p)}</p>" for p in paragraphs)
@@ -574,7 +641,7 @@ def build_post_html(data, screener_info, source_url):
         if source_url else ""
     )
 
-    return f"""
+    html_body = f"""
     <article style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 680px; margin: 0 auto; color: #1e293b;">
       
       <figure style="margin: 0 0 22px 0; text-align: center;">
@@ -638,8 +705,13 @@ def build_post_html(data, screener_info, source_url):
       </div>
 
       <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 16px; margin-bottom: 24px; text-align: center;">
-        <h3 style="margin: 0 0 12px 0; font-size: 18px; color: #0f172a;">📊 Multi-Quarter & Annual Performance Column Chart</h3>
-        <img src="{chart_img_url}" alt="{comp_name} Quarterly and Yearly Column Chart" style="max-width: 100%; height: auto; border-radius: 8px;" />
+        <h3 style="margin: 0 0 12px 0; font-size: 18px; color: #0f172a;">📊 1. Multi-Quarter Performance Column Chart</h3>
+        <img src="{quarter_chart_url}" alt="{comp_name} Quarterly Column Chart" style="max-width: 100%; height: auto; border-radius: 8px;" />
+      </div>
+
+      <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 16px; margin-bottom: 24px; text-align: center;">
+        <h3 style="margin: 0 0 12px 0; font-size: 18px; color: #0f172a;">📈 2. Previous Year vs Current Year Result Chart</h3>
+        <img src="{yoy_chart_url}" alt="{comp_name} Previous vs Current Year Column Chart" style="max-width: 100%; height: auto; border-radius: 8px;" />
       </div>
 
       <h3 style="font-size: 19px; color: #0f172a; margin-bottom: 10px;">📝 {comp_name} {qtr_lbl} Result Highlights</h3>
@@ -652,6 +724,100 @@ def build_post_html(data, screener_info, source_url):
       </p>
     </article>
     """
+    return html_body, yoy_chart_url
+
+
+# ---------------- TELEGRAM GUJARATI ALERT ----------------
+def send_telegram_gujarati(data, screener_info, blog_url, source_url, chart_url):
+    if not SEND_TO_TELEGRAM or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+
+    comp_name = html.escape(str(data.get("company_short_name", "Company")))
+    res_date = html.escape(str(data.get("result_date", "")))
+    price_disp = html.escape(str(data.get("price_display", screener_info["price_str"])))
+    qtr_lbl = html.escape(str(data.get("quarter_label", "Q2 FY26-27")))
+    curr_lbl = html.escape(str(data.get("curr_period_label", "Current")))
+    prev_lbl = html.escape(str(data.get("prev_period_label", "Previous")))
+    res_type = html.escape(str(data.get("result_type", "Consolidated")))
+
+    rev = data.get("revenue", {"curr": "-", "prev": "-", "growth": "-"})
+    gp = data.get("gross_profit", {"curr": "-", "prev": "-", "growth": "-"})
+    np_d = data.get("net_profit", {"curr": "-", "prev": "-", "growth": "-"})
+
+    total_debt = html.escape(str(data.get("total_debt") or screener_info["total_debt"]))
+    de_ratio = html.escape(str(data.get("debt_to_equity") or screener_info["debt_to_equity"]))
+    guj_summary = html.escape(str(data.get("gujarati_summary", "")))
+    guj_intraday = html.escape(str(data.get("gujarati_intraday_view", "")))
+
+    msg_html = (
+        f"📊 <b>{comp_name} - {qtr_lbl} પરિણામ અપડેટ</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"📅 <b>તારીખ:</b> {res_date} | <b>પ્રકાર:</b> {res_type}\n"
+        f"💰 <b>શેર ભાવ:</b> {price_disp} | <b>એકમ:</b> રૂ. કરોડ (Rs. Cr.)\n\n"
+        f"📈 <b>નાણાકીય પરિણામ ({curr_lbl} vs {prev_lbl}):</b>\n"
+        f"• <b>આવક (Revenue):</b> ₹{html.escape(str(rev.get('curr', '-')))} Cr (ગયા વર્ષે: ₹{html.escape(str(rev.get('prev', '-')))} Cr) | ગ્રોથ: <b>{html.escape(str(rev.get('growth', '-')))}</b>\n"
+        f"• <b>કુલ નફો (Gross Profit):</b> ₹{html.escape(str(gp.get('curr', '-')))} Cr (ગયા વર્ષે: ₹{html.escape(str(gp.get('prev', '-')))} Cr) | ગ્રોથ: <b>{html.escape(str(gp.get('growth', '-')))}</b>\n"
+        f"• <b>ચોખ્ખો નફો (Net Profit):</b> ₹{html.escape(str(np_d.get('curr', '-')))} Cr (ગયા વર્ષે: ₹{html.escape(str(np_d.get('prev', '-')))} Cr) | ગ્રોથ: <b>{html.escape(str(np_d.get('growth', '-')))}</b>\n\n"
+        f"🏦 <b>કંપનીનું દેવું અને ઇન્ટ્રાડે સંકેત:</b>\n"
+        f"• <b>કુલ દેવું (Total Debt):</b> {total_debt}\n"
+        f"• <b>ડેટ-ટુ-ઇક્વિટી (Debt-to-Equity):</b> {de_ratio}\n"
+        f"• <b>ઇન્ટ્રાડે વ્યૂ:</b> {guj_intraday}\n\n"
+        f"📝 <b>સારાંશ:</b> {guj_summary}\n"
+    )
+
+    if blog_url:
+        msg_html += f"\n🌐 <a href=\"{html.escape(blog_url, quote=True)}\"><b>બ્લોગ પોસ્ટ અને બંને ચાર્ટ અહીં જુઓ</b></a>"
+    if source_url:
+        msg_html += f" | <a href=\"{html.escape(source_url, quote=True)}\"><b>BSE PDF</b></a>"
+    msg_html += "\n\n✅ <b>MarketMunafa</b>"
+
+    try:
+        if len(msg_html) <= 1000 and chart_url:
+            photo_res = requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                data={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "photo": chart_url,
+                    "caption": msg_html,
+                    "parse_mode": "HTML",
+                },
+                timeout=20,
+            )
+            if photo_res.status_code == 200:
+                log.info("Telegram Gujarati photo+alert sent successfully")
+                return
+
+        if chart_url:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
+                data={
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "photo": chart_url,
+                    "caption": f"📊 {comp_name} ({qtr_lbl}) - ગયા વર્ષ vs ચાલુ વર્ષ સ્તંભ આલેખ",
+                },
+                timeout=15,
+            )
+
+        txt_res = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            data={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": msg_html,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": False,
+            },
+            timeout=20,
+        )
+        if txt_res.status_code != 200:
+            plain_msg = re.sub(r"<[^>]+>", "", msg_html)
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                data={"chat_id": TELEGRAM_CHAT_ID, "text": plain_msg},
+                timeout=20,
+            )
+        log.info("Telegram Gujarati alert sent successfully")
+    except Exception as exc:
+        log.warning("Telegram send warning: %s", exc)
 
 
 # ---------------- PUBLISHING & BLOGGER LIVE DEDUP ----------------
@@ -674,7 +840,6 @@ def blogger_access_token():
 
 
 def get_existing_blogger_posts():
-    """બ્લોગર પર પહેલેથી લાઈવ થયેલી છેલ્લી 50 પોસ્ટ્સ ચેક કરશે જેથી ડુપ્લિકેટ પોસ્ટ ક્યારેય ન થાય"""
     existing_comp_keys = set()
     existing_file_keys = set()
     if not BLOG_ID:
@@ -696,11 +861,6 @@ def get_existing_blogger_posts():
                 content = post.get("content", "")
                 for match in re.findall(r"[a-zA-Z0-9_-]{10,}\.(?:pdf|xml|xbrl|html)", content, flags=re.I):
                     existing_file_keys.add(match.lower())
-            log.info(
-                "Loaded %d recent Blogger titles and %d file links for duplicate prevention",
-                len(existing_comp_keys),
-                len(existing_file_keys),
-            )
     except Exception as exc:
         log.warning("Could not fetch existing Blogger posts for deduplication: %s", exc)
 
@@ -741,14 +901,17 @@ def blogger_publish(title, content_html):
 def publish_item(item, ai_data, screener_info, item_id, comp_key, file_key):
     source_url = item["link"]
     raw_title = ai_data.get("seo_title") or f"{item['title']} Q2 Results & Debt Analysis | MarketMunafa"
-    blog_html = build_post_html(ai_data, screener_info, source_url)
+    blog_html, yoy_chart_url = build_post_html(ai_data, screener_info, source_url)
 
+    blog_url = ""
     if POST_TO_BLOGGER:
         blog_url = blogger_publish(raw_title, blog_html)
         mark_posted(item_id, comp_key, file_key, item["title"], source_url)
         log.info("Blogger post successful: %s", blog_url)
     else:
         log.warning("Blogger publishing is disabled")
+
+    send_telegram_gujarati(ai_data, screener_info, blog_url, source_url, yoy_chart_url)
 
 
 # ---------------- MAIN ----------------
@@ -768,7 +931,6 @@ def run():
         log.warning("No feed items retrieved.")
         return
 
-    # 1. બ્લોગર પર પહેલેથી લાઈવ થયેલી પોસ્ટ્સ ચેક કરો
     live_comp_keys, live_file_keys = get_existing_blogger_posts()
 
     seen_comp_in_run = set()
@@ -783,7 +945,6 @@ def run():
         file_key = extract_file_key(item["link"])
         item_id = make_item_id(comp_key, file_key, item)
 
-        # 2. ચાલુ રનમાં, SQLite ડેટાબેઝમાં કે લાઈવ બ્લોગરમાં પહેલેથી હોય તો સ્કિપ કરો
         if (
             (comp_key and comp_key in seen_comp_in_run)
             or (file_key and file_key in seen_file_in_run)
@@ -810,7 +971,6 @@ def run():
             ai_data = analyze_with_gemini_json(item["title"], source_text, screener_info)
             publish_item(item, ai_data, screener_info, item_id, comp_key, file_key)
             
-            # સફળ પોસ્ટ પછી લાઈવ લિસ્ટમાં પણ ઉમેરી દો
             if comp_key:
                 live_comp_keys.add(comp_key)
             if file_key:
