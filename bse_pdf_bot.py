@@ -29,7 +29,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9086072964:AAEUyn-GAyJLdsY
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "430834857").strip()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -43,9 +43,8 @@ FEEDS = {
 DB_PATH = os.getenv("DB_PATH", "marketmunafa_seen.sqlite3")
 MAX_ITEMS_PER_FEED = int(os.getenv("MAX_ITEMS_PER_FEED", "100"))
 MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "12"))
-MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "14000"))
+MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "15000"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
-MIN_SOURCE_TEXT = int(os.getenv("MIN_SOURCE_TEXT", "80"))
 POST_TO_BLOGGER = os.getenv("POST_TO_BLOGGER", "true").lower() == "true"
 SEND_TO_TELEGRAM = os.getenv("SEND_TO_TELEGRAM", "true").lower() == "true"
 
@@ -160,14 +159,26 @@ def get_url(url, extra_headers=None):
 
 def to_float(val):
     try:
-        cleaned = re.sub(r"[^\d.-]", "", str(val))
-        num = float(cleaned) if cleaned else 0.0
-        return int(round(num)) if abs(num - round(num)) < 0.05 else round(num, 2)
+        if val is None:
+            return 0.0
+        s = str(val).strip()
+        if not s or s.upper() in ("N/A", "NA", "-", "NONE", "NULL"):
+            return 0.0
+        cleaned = re.sub(r"[^\d.-]", "", s)
+        num = float(cleaned) if cleaned and cleaned not in ("-", ".", "-.") else 0.0
+        return int(round(num)) if abs(num - round(num)) < 0.01 else round(num, 2)
     except Exception:
-        return 0
+        return 0.0
 
 
-# ---------------- SCREENER FUNDAMENTALS ----------------
+def fmt_num(val):
+    num = to_float(val)
+    if isinstance(num, int) or float(num).is_integer():
+        return f"{int(num):,}"
+    return f"{num:,.2f}"
+
+
+# ---------------- SCREENER FUNDAMENTALS & HISTORICAL FALLBACK ----------------
 def get_screener_fundamentals(comp_title):
     clean_name = re.sub(r"\(\d+\)", "", comp_title)
     clean_name = clean_name.split("-")[0].strip()
@@ -197,6 +208,10 @@ def get_screener_fundamentals(comp_title):
         "face_value": "N/A",
         "quarters_text": "",
         "annual_text": "",
+        "q_all_labels": [],
+        "q_all_rev": [],
+        "q_all_gp": [],
+        "q_all_np": [],
         "q_labels": [],
         "q_rev": [],
         "q_gp": [],
@@ -291,16 +306,24 @@ def get_screener_fundamentals(comp_title):
                             continue
                         if not headers and len(cols) > 3:
                             headers = cols[1:]
+                            info["q_all_labels"] = headers
                             info["q_labels"] = headers[-6:]
                         r_title = cols[0].lower()
-                        if any(k in r_title for k in ["sales", "revenue", "operating profit", "ebitda", "financing profit", "net profit", "eps"]):
+                        if any(k in r_title for k in ["sales", "revenue", "operating profit", "ebitda", "financing profit", "profit before tax", "net profit", "eps"]):
                             q_lines.append(" | ".join(cols))
-                            nums = [to_float(c_val) for c_val in cols[1:][-6:]]
+                            all_nums = [to_float(c_val) for c_val in cols[1:]]
+                            nums = all_nums[-6:]
                             if "sales" in r_title or "revenue" in r_title:
+                                info["q_all_rev"] = all_nums
                                 info["q_rev"] = nums
                             elif "operating profit" in r_title or "ebitda" in r_title or "financing profit" in r_title:
+                                info["q_all_gp"] = all_nums
+                                info["q_gp"] = nums
+                            elif "profit before tax" in r_title and not info["q_all_gp"]:
+                                info["q_all_gp"] = all_nums
                                 info["q_gp"] = nums
                             elif "net profit" in r_title:
+                                info["q_all_np"] = all_nums
                                 info["q_np"] = nums
                     if headers:
                         info["quarters_text"] = "Quarters Header: " + " | ".join(headers) + "\n" + "\n".join(q_lines)
@@ -325,7 +348,7 @@ def get_screener_fundamentals(comp_title):
                             elif "net profit" in r_title:
                                 info["y_np"] = nums
                             elif "eps" in r_title and info["eps"] == "N/A" and nums:
-                                info["eps"] = f"{nums[-1]:.2f}"
+                                info["eps"] = f"{nums[-1]}"
                     if pl_headers:
                         info["annual_text"] = "Annual Header: " + " | ".join(pl_headers[-4:]) + "\n" + "\n".join(pl_lines)
                 break
@@ -461,7 +484,7 @@ def fetch_bse_direct_order_announcements():
     return orders
 
 
-# ---------------- DOCUMENT EXTRACTION ----------------
+# ---------------- DOCUMENT EXTRACTION (TEXT + RAW PDF BYTES FOR VISION OCR) ----------------
 def clean_text(value):
     value = value.replace("\x00", " ")
     value = re.sub(r"[ \t]+", " ", value)
@@ -469,45 +492,66 @@ def clean_text(value):
     return value.strip()
 
 
-def extract_pdf_text(url):
-    if not url or not urlparse(url).path.lower().endswith(".pdf"):
-        return ""
-    response = get_url(url)
-    data = response.content
-    text_parts = []
-    with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
-        tmp.write(data)
-        tmp.flush()
-        with open(tmp.name, "rb") as f:
-            reader = PyPDF2.PdfReader(f)
-            for page in reader.pages[:MAX_PDF_PAGES]:
-                text_parts.append(page.extract_text() or "")
-    return clean_text("\n".join(text_parts))[:MAX_TEXT_CHARS]
+def extract_xml_text(content_bytes):
+    root = ET.fromstring(content_bytes)
+    values = []
+    for element in root.iter():
+        if element.text and element.text.strip():
+            values.append(element.text.strip())
+    return clean_text(" ".join(values))[:MAX_TEXT_CHARS]
 
 
-def get_document_text(item):
+def extract_html_text(html_str):
+    soup = BeautifulSoup(html_str, "html.parser")
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+    return clean_text(soup.get_text(separator=" "))[:MAX_TEXT_CHARS]
+
+
+def get_document_payload(item):
+    """PDF ના ટેક્સ્ટ ઉપરાંત રૉ PDF બાઇટ્સ પણ આપશે જેથી સ્કેન કરેલી PDF પણ Gemini Vision વાંચી શકે"""
     parts = []
+    pdf_bytes = None
     if item["description"]:
         parts.append("FEED DESCRIPTION:\n" + item["description"])
+
     url = item["link"]
     if url:
         path = urlparse(url).path.lower()
         try:
+            response = get_url(url)
             if path.endswith(".pdf"):
-                extracted = extract_pdf_text(url)
+                pdf_bytes = response.content
+                text_parts = []
+                with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
+                    tmp.write(pdf_bytes)
+                    tmp.flush()
+                    with open(tmp.name, "rb") as f:
+                        reader = PyPDF2.PdfReader(f)
+                        for page in reader.pages[:MAX_PDF_PAGES]:
+                            text_parts.append(page.extract_text() or "")
+                extracted = clean_text("\n".join(text_parts))[:MAX_TEXT_CHARS]
                 if extracted:
-                    parts.append("ATTACHMENT TEXT:\n" + extracted)
+                    parts.append("EXTRACTED PDF TEXT:\n" + extracted)
+            elif path.endswith((".xml", ".xbrl")):
+                extracted = extract_xml_text(response.content)
+                if extracted:
+                    parts.append("EXTRACTED XML TEXT:\n" + extracted)
+            elif path.endswith((".html", ".htm")):
+                extracted = extract_html_text(response.text)
+                if extracted:
+                    parts.append("EXTRACTED HTML TEXT:\n" + extracted)
         except Exception as exc:
-            log.warning("Attachment extraction failed for %s: %s", url, exc)
+            log.warning("Attachment download/extraction warning for %s: %s", url, exc)
 
-    return clean_text("\n\n".join(parts))[:MAX_TEXT_CHARS]
+    return clean_text("\n\n".join(parts))[:MAX_TEXT_CHARS], pdf_bytes
 
 
-# ---------------- CLASSIFICATION / AI (JSON STRUCTURED) ----------------
+# ---------------- CLASSIFICATION / AI (JSON + MULTIMODAL OCR + FALLBACK) ----------------
 RESULT_WORDS = (
     "financial result", "unaudited financial", "audited financial",
     "quarterly result", "half year result", "annual result", "financial results",
-    "standalone result", "consolidated result",
+    "standalone result", "consolidated result", "standalone and consolidated",
 )
 ORDER_WORDS = (
     "award_of_order", "receipt_of_order", "award of order", "receipt of order",
@@ -524,7 +568,7 @@ def classify_item(item):
     title_desc = (item["title"] + " " + item["description"]).lower()
     if any(word in title_desc for word in ORDER_WORDS):
         return "order"
-    if "prior intimation" in title_desc or "is scheduled on" in title_desc:
+    if "prior intimation" in title_desc or "is scheduled on" in title_desc or "newspaper publication" in title_desc:
         if item["kind"] != "result":
             return ""
     if item["kind"] == "result" or any(word in title_desc for word in RESULT_WORDS):
@@ -537,18 +581,94 @@ def make_item_id(comp_key, file_key, item):
     return hashlib.sha256(basis.encode("utf-8")).hexdigest()
 
 
-def analyze_with_gemini_json(company_title, doc_type, source_text, screener_info):
+def compute_metric_dict(curr_val, prev_val):
+    c = to_float(curr_val)
+    p = to_float(prev_val)
+    diff = round(c - p, 2)
+    diff_sign = "+" if diff > 0 else ""
+    diff_str = f"{diff_sign}{fmt_num(diff)} Cr"
+    if p != 0:
+        g_pct = ((c - p) / abs(p)) * 100.0
+        g_sign = "+" if g_pct > 0 else ""
+        g_str = f"{g_sign}{g_pct:.1f}%"
+    else:
+        g_str = "0.0%"
+    return {
+        "curr": fmt_num(c),
+        "prev": fmt_num(p),
+        "difference": diff_str,
+        "growth": g_str,
+    }
+
+
+def ensure_valid_result_numbers(ai_data, screener_info):
+    """જો PDF સ્કેન હોવાને લીધે કે અન્ય કારણસર કોઈ આંકડો N/A કે 0 આવ્યો હોય, તો Screener ડેટા પરથી આપમેળે ભરી દેશે"""
+    rev = ai_data.get("revenue") or {}
+    gp = ai_data.get("gross_profit") or {}
+    np_d = ai_data.get("net_profit") or {}
+
+    # Check if Revenue is missing/zero and Screener has quarters
+    q_rev_all = screener_info.get("q_all_rev", [])
+    q_gp_all = screener_info.get("q_all_gp", [])
+    q_np_all = screener_info.get("q_all_np", [])
+    q_lbl_all = screener_info.get("q_all_labels", [])
+
+    # Determine comparison index: YoY (index -5) if available, else QoQ (index -2)
+    def pick_curr_prev(arr):
+        if len(arr) >= 5:
+            return arr[-1], arr[-5]
+        elif len(arr) >= 2:
+            return arr[-1], arr[-2]
+        elif len(arr) == 1:
+            return arr[0], arr[0]
+        return 0, 0
+
+    if len(q_lbl_all) >= 5:
+        if str(ai_data.get("curr_period_label", "")).upper() in ("", "N/A", "CURRENT"):
+            ai_data["curr_period_label"] = q_lbl_all[-1]
+        if str(ai_data.get("prev_period_label", "")).upper() in ("", "N/A", "PREVIOUS"):
+            ai_data["prev_period_label"] = q_lbl_all[-5]
+
+    if to_float(rev.get("curr")) == 0 and to_float(rev.get("prev")) == 0 and q_rev_all:
+        c_val, p_val = pick_curr_prev(q_rev_all)
+        ai_data["revenue"] = compute_metric_dict(c_val, p_val)
+    else:
+        ai_data["revenue"] = compute_metric_dict(rev.get("curr"), rev.get("prev"))
+
+    if to_float(gp.get("curr")) == 0 and to_float(gp.get("prev")) == 0 and q_gp_all:
+        c_val, p_val = pick_curr_prev(q_gp_all)
+        ai_data["gross_profit"] = compute_metric_dict(c_val, p_val)
+    else:
+        ai_data["gross_profit"] = compute_metric_dict(gp.get("curr"), gp.get("prev"))
+
+    if to_float(np_d.get("curr")) == 0 and to_float(np_d.get("prev")) == 0 and q_np_all:
+        c_val, p_val = pick_curr_prev(q_np_all)
+        ai_data["net_profit"] = compute_metric_dict(c_val, p_val)
+    else:
+        ai_data["net_profit"] = compute_metric_dict(np_d.get("curr"), np_d.get("prev"))
+
+    return ai_data
+
+
+def analyze_with_gemini_json(company_title, doc_type, source_text, pdf_bytes, screener_info):
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not configured")
 
     prompt = f"""
 You are the Chief Financial Analyst for 'MarketMunafa'.
-Analyze the following BSE corporate filing ({doc_type.upper()}) and Screener fundamentals data.
-IMPORTANT RULE: All English fields MUST be 100% in English (no Gujarati). Only 'gujarati_summary' and 'gujarati_intraday_view' should be in Gujarati.
+Analyze the attached BSE corporate filing ({doc_type.upper()}) PDF and Screener fundamentals data.
+
+CRITICAL RULES:
+1. All English fields MUST be 100% in English (zero Gujarati words in English fields). Only 'gujarati_summary' and 'gujarati_intraday_view' must be in Gujarati.
+2. NEVER return "N/A" for Revenue, Gross Profit, or Net Profit in a 'result' filing!
+   - Read the financial table from the attached PDF carefully (even if it is a scanned image).
+   - UNIT CONVERSION: If the PDF table says "(Rs. in Lakhs)" or "(Rs. in Lacs)", divide every number by 100 to convert into Rs. Crores (e.g., 3,450 Lakhs = 34.50 Cr). If "(Rs. in Millions)", divide by 10. Keep up to 2 decimal places for figures under 100 Cr.
+   - If "Gross Profit" is not explicitly labeled in the PDF statement, compute it as (Revenue from Operations minus Cost of Materials/Operating Expenses) OR use Operating Profit (EBITDA) / Profit Before Tax (PBT).
+   - If the PDF is unreadable, use the latest quarter and YoY quarter numbers from "Screener Historical Quarters" provided below!
 
 Company Headline: {company_title}
 Document Type: {doc_type}
-Screener Fundamentals (Before Filing):
+Screener Fundamentals:
 - Market Cap: {screener_info['market_cap']}
 - Current Price: {screener_info['price_str']}
 - P/E Ratio (TTM): {screener_info['pe_ratio']}
@@ -556,35 +676,40 @@ Screener Fundamentals (Before Filing):
 - Industry P/E: {screener_info['industry_pe']}
 - ROE: {screener_info['roe']}
 - EPS (TTM): {screener_info['eps']}
+- Div Yield: {screener_info['div_yield']}
+- Book Value: {screener_info['book_value']}
 - Total Debt: {screener_info['curr_debt_num']} Cr (Previous: {screener_info['prev_debt_num']} Cr)
 - Debt-to-Equity: {screener_info['debt_to_equity']}
+- Face Value: {screener_info['face_value']}
 
-Tasks:
-If Document Type is 'result', extract Revenue, Gross Profit, Net Profit for current vs previous period.
-If Document Type is 'order', fill 'order_details' with exact Client Name, Order Value, Scope of Work, and Timeline.
-Calculate the Estimated Stock Return / Target Boost percentage in English (e.g., "+6.0% to +10.5% Bullish Upside").
+Screener Historical Quarters (Fallback & Multi-Quarter Trend in Rs. Cr.):
+{screener_info['quarters_text']}
 
-Return ONLY a valid JSON object:
+Screener Annual YoY Data (in Rs. Cr.):
+{screener_info['annual_text']}
+
+Return ONLY a valid JSON object with this exact structure:
 {{
-  "seo_title": "Catchy Google News SEO Title in 100% English",
+  "seo_title": "Catchy Google News SEO Title in 100% English (under 110 chars)",
   "company_short_name": "Clean Company Name in English",
-  "result_date": "Date of filing in English",
+  "result_date": "Date of filing in English (e.g. November 10, 2026)",
   "price_display": "{screener_info['price_str']}",
   "quarter_label": "e.g. Q2 FY26-27",
   "curr_period_label": "e.g. Sep 26",
   "prev_period_label": "e.g. Sep 25",
   "result_type": "Consolidated or Standalone",
-  "revenue": {{"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"}},
-  "gross_profit": {{"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"}},
-  "net_profit": {{"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"}},
+  "revenue": {{"curr": "36.76", "prev": "27.15", "growth": "+35.4%", "difference": "+9.61 Cr"}},
+  "gross_profit": {{"curr": "14.24", "prev": "7.75", "growth": "+83.7%", "difference": "+6.49 Cr"}},
+  "net_profit": {{"curr": "11.27", "prev": "6.89", "growth": "+63.6%", "difference": "+4.38 Cr"}},
+  "debt_comparison": {{"curr": "{screener_info['curr_debt_num']}", "prev": "{screener_info['prev_debt_num']}"}},
   "order_details": {{
     "client_or_awarder": "Client or Subsidiary Name (for order filings)",
     "order_value": "Order / Award Value in Rs. Cr.",
-    "scope_of_work": "Brief description of order",
-    "execution_timeline": "Execution timeline"
+    "scope_of_work": "Brief description of order in English",
+    "execution_timeline": "Execution timeline in English"
   }},
   "market_cap": "{screener_info['market_cap']}",
-  "pe_ratio": "Updated P/E Ratio after filing (or {screener_info['pe_ratio']})",
+  "pe_ratio": "{screener_info['pe_ratio']}",
   "pb_ratio": "{screener_info['pb_ratio']}",
   "industry_pe": "{screener_info['industry_pe']}",
   "roe": "{screener_info['roe']}",
@@ -594,32 +719,45 @@ Return ONLY a valid JSON object:
   "total_debt": "{screener_info['total_debt']}",
   "debt_to_equity": "{screener_info['debt_to_equity']}",
   "face_value": "{screener_info['face_value']}",
-  "fundamental_impact_note": "1-2 sentences in 100% English explaining what changed.",
-  "estimated_stock_return": "Estimated % return in English (e.g. +8.0% to +12.5% Short-Term Bullish)",
+  "fundamental_impact_note": "1-2 sentences in 100% English explaining what changed in the fundamentals.",
+  "estimated_stock_return": "Estimated % return in 100% English (e.g. +8.0% to +12.5% Short-Term Bullish)",
   "intraday_signal": "1-2 sentences in 100% English explaining intraday/positional sentiment.",
   "quarter_chart_labels": ["Jun 25", "Sep 25", "Dec 25", "Mar 26", "Jun 26", "Sep 26"],
-  "quarter_chart_revenue": [100, 110, 115, 120, 125, 135],
-  "quarter_chart_net_profit": [10, 12, 11, 14, 15, 18],
-  "yearly_chart_labels": ["FY25", "FY26"],
-  "yearly_chart_revenue": [450, 520],
-  "yearly_chart_net_profit": [48, 62],
+  "quarter_chart_revenue": [24.1, 27.15, 26.04, 28.31, 30.8, 36.76],
+  "quarter_chart_gross_profit": [7.1, 7.75, 7.9, 8.6, 10.2, 14.24],
+  "quarter_chart_net_profit": [5.45, 6.89, 5.83, 7.51, 9.02, 11.27],
   "seo_article_paragraphs": [
-    "Paragraph 1 in 100% English: Journalistic breakdown of the financial result OR new order receipt.",
-    "Paragraph 2 in 100% English: Fundamental valuation analysis (P/E, ROE, Debt)."
+    "Paragraph 1 (80-100 words in 100% English): Journalistic breakdown of the financial result OR new order receipt.",
+    "Paragraph 2 (80-100 words in 100% English): Fundamental valuation analysis covering Market Cap, P/E, ROE, EPS, Book Value, Debt-to-Equity, and expected return."
   ],
   "gujarati_summary": "2-3 sentences in natural Gujarati summarizing the result or new order.",
   "gujarati_intraday_view": "1-2 sentences in natural Gujarati explaining debt, valuation, and expected return."
 }}
 
-BSE PDF Filing Text:
+Extracted Text from Filing (if any):
 {source_text[:MAX_TEXT_CHARS]}
 """
-    response = gemini_model.generate_content(prompt)
+    response = None
+    # Pass raw PDF bytes to Gemini Vision so scanned image PDFs are read via OCR
+    if pdf_bytes and len(pdf_bytes) < 18 * 1024 * 1024:
+        try:
+            pdf_part = {"mime_type": "application/pdf", "data": pdf_bytes}
+            response = gemini_model.generate_content([prompt, pdf_part])
+        except Exception as exc:
+            log.warning("Multimodal PDF OCR fallback to text prompt: %s", exc)
+
+    if response is None:
+        response = gemini_model.generate_content(prompt)
+
     raw = (response.text or "").strip()
     match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
     if not match:
         raise RuntimeError("Gemini did not return valid JSON")
-    return json.loads(match.group(0))
+    parsed = json.loads(match.group(0))
+
+    if doc_type == "result":
+        parsed = ensure_valid_result_numbers(parsed, screener_info)
+    return parsed
 
 
 # ---------------- VISUAL CHARTS BUILDER (WITH NUMBERS ON TOP) ----------------
@@ -628,12 +766,12 @@ def build_quarterly_column_chart_url(comp_name, labels, rev_list, gp_list, np_li
         {
             "label": "Revenue",
             "backgroundColor": "#1b5e20",
-            "data": rev_list,
+            "data": [to_float(x) for x in rev_list],
         },
         {
             "label": "Net Profit",
             "backgroundColor": "#2563eb",
-            "data": np_list,
+            "data": [to_float(x) for x in np_list],
         },
     ]
     if gp_list and any(to_float(x) != 0 for x in gp_list):
@@ -642,7 +780,7 @@ def build_quarterly_column_chart_url(comp_name, labels, rev_list, gp_list, np_li
             {
                 "label": "Gross Profit",
                 "backgroundColor": "#90a4ae",
-                "data": gp_list,
+                "data": [to_float(x) for x in gp_list],
             },
         )
 
@@ -653,7 +791,7 @@ def build_quarterly_column_chart_url(comp_name, labels, rev_list, gp_list, np_li
             "datasets": datasets,
         },
         "options": {
-            "layout": {"padding": {"top": 24, "right": 12, "left": 8, "bottom": 8}},
+            "layout": {"padding": {"top": 26, "right": 12, "left": 8, "bottom": 8}},
             "title": {
                 "display": True,
                 "text": f"{comp_name} - Multi-Quarter Trend (Rs.Cr.)",
@@ -750,14 +888,13 @@ def build_yoy_comparison_chart_url(comp_name, qtr_lbl, prev_lbl, curr_lbl, rev, 
 
 
 def build_post_html(data, doc_type, screener_info, source_url):
-    """ઓર્ડર માટે ફક્ત ઓર્ડર અને ફંડામેન્ટલ, રિઝલ્ટ માટે ચાર્ટ અને રિઝલ્ટ ટેબલ"""
     comp_name = html.escape(str(data.get("company_short_name", "Company")))
     res_date = html.escape(str(data.get("result_date", datetime.now().strftime("%B %d, %Y"))))
     price_disp = html.escape(str(data.get("price_display", screener_info["price_str"])))
     qtr_lbl = html.escape(str(data.get("quarter_label", "Q2 FY26-27")))
     curr_lbl = html.escape(str(data.get("curr_period_label", "Sep 26")))
     prev_lbl = html.escape(str(data.get("prev_period_label", "Sep 25")))
-    res_type = html.escape(str(data.get("result_type", "Consolidated")))
+    res_type = html.escape(str(data.get("result_type", "Standalone")))
 
     mkt_cap = html.escape(str(data.get("market_cap") or screener_info["market_cap"]))
     pe_ratio = html.escape(str(data.get("pe_ratio") or screener_info["pe_ratio"]))
@@ -789,7 +926,7 @@ def build_post_html(data, doc_type, screener_info, source_url):
 
     content_blocks = []
 
-    # 1. ORDER LAYOUT (No result charts or empty result tables)
+    # 1. ORDER LAYOUT (Only Order Card + Fundamentals)
     if doc_type == "order":
         ord_info = data.get("order_details", {}) or {}
         client_str = html.escape(str(ord_info.get("client_or_awarder", "Disclosed in Filing")))
@@ -800,6 +937,7 @@ def build_post_html(data, doc_type, screener_info, source_url):
         order_card = f"""
         <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 16px; padding: 22px; margin-bottom: 24px;">
           <h3 style="margin: 0 0 16px 0; font-size: 20px; color: #1e3a8a;">🏆 New Order / Contract Receipt</h3>
+          <p style="margin: 8px 0; font-size: 16px;"><strong>Company Name:</strong> {comp_name} ({price_disp})</p>
           <p style="margin: 8px 0; font-size: 16px;"><strong>Client / Awarding Entity:</strong> {client_str}</p>
           <p style="margin: 8px 0; font-size: 16px;"><strong>Order / Award Value:</strong> <span style="color:#16a34a; font-weight:700;">{val_str}</span></p>
           <p style="margin: 8px 0; font-size: 16px;"><strong>Nature of Order / Scope:</strong> {scope_str}</p>
@@ -809,16 +947,16 @@ def build_post_html(data, doc_type, screener_info, source_url):
         content_blocks.append(order_card)
         yoy_chart_url = ""
 
-    # 2. RESULT LAYOUT (Full tables and charts)
+    # 2. RESULT LAYOUT (Mobile-Friendly Result Table + Both Labeled Column Charts)
     else:
-        rev = data.get("revenue", {"curr": "-", "prev": "-", "growth": "-", "difference": "-"})
-        gp = data.get("gross_profit", {"curr": "-", "prev": "-", "growth": "-", "difference": "-"})
-        np_d = data.get("net_profit", {"curr": "-", "prev": "-", "growth": "-", "difference": "-"})
+        rev = data.get("revenue", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
+        gp = data.get("gross_profit", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
+        np_d = data.get("net_profit", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
         debt_comp = data.get("debt_comparison") or {"curr": screener_info["curr_debt_num"], "prev": screener_info["prev_debt_num"]}
 
         q_labels = data.get("quarter_chart_labels") or screener_info["q_labels"] or [prev_lbl, curr_lbl]
         q_rev = data.get("quarter_chart_revenue") or screener_info["q_rev"] or [to_float(rev.get("prev")), to_float(rev.get("curr"))]
-        q_gp = data.get("quarter_chart_gross_profit") or screener_info["q_gp"] or []
+        q_gp = data.get("quarter_chart_gross_profit") or screener_info["q_gp"] or [to_float(gp.get("prev")), to_float(gp.get("curr"))]
         q_np = data.get("quarter_chart_net_profit") or screener_info["q_np"] or [to_float(np_d.get("prev")), to_float(np_d.get("curr"))]
         
         quarter_chart_url = build_quarterly_column_chart_url(comp_name, q_labels, q_rev, q_gp, q_np)
@@ -828,46 +966,46 @@ def build_post_html(data, doc_type, screener_info, source_url):
             return "#dc2626" if "-" in str(growth_str) else "#16a34a"
 
         result_card = f"""
-        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 22px; box-shadow: 0 4px 14px rgba(0,0,0,0.05); margin-bottom: 24px;">
+        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 18px; box-shadow: 0 4px 14px rgba(0,0,0,0.05); margin-bottom: 24px; overflow-x: auto;">
           <div style="display: flex; justify-content: space-between; color: #64748b; font-size: 14px; margin-bottom: 10px;">
             <span>{res_date}</span>
             <span>Rs.Cr.</span>
           </div>
           <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 18px;">
-            <strong style="font-size: 22px; color: #0f172a;">{comp_name}</strong>
-            <span style="font-size: 20px; font-weight: 600; color: #0f172a;">{price_disp}</span>
+            <strong style="font-size: 21px; color: #0f172a;">{comp_name}</strong>
+            <span style="font-size: 19px; font-weight: 600; color: #0f172a;">{price_disp}</span>
           </div>
-          <table style="width: 100%; border-collapse: collapse; font-size: 15px;">
+          <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
             <thead>
-              <tr style="border-top: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0; color: #64748b; font-weight: 500;">
-                <th style="text-align: left; padding: 10px 4px;">{qtr_lbl}</th>
-                <th style="text-align: right; padding: 10px 4px;">{curr_lbl}</th>
-                <th style="text-align: right; padding: 10px 4px;">{prev_lbl}</th>
-                <th style="text-align: right; padding: 10px 4px;">Difference</th>
-                <th style="text-align: right; padding: 10px 4px;">Growth</th>
+              <tr style="border-top: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0; color: #64748b; font-weight: 600;">
+                <th style="text-align: left; padding: 10px 4px; white-space: nowrap;">{qtr_lbl}</th>
+                <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">{curr_lbl}</th>
+                <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">{prev_lbl}</th>
+                <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">Diff</th>
+                <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">Growth</th>
               </tr>
             </thead>
             <tbody>
               <tr style="border-bottom: 1px solid #f1f5f9;">
-                <td style="padding: 12px 4px; color: #1e293b; font-weight: 500;">Revenue</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600;">{html.escape(str(rev.get('curr', '-')))}</td>
-                <td style="padding: 12px 4px; text-align: right; color: #475569;">{html.escape(str(rev.get('prev', '-')))}</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: #0f172a;">{html.escape(str(rev.get('difference', '-')))}</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: {growth_color(rev.get('growth', ''))};">{html.escape(str(rev.get('growth', '-')))}</td>
+                <td style="padding: 12px 4px; color: #1e293b; font-weight: 500; white-space: nowrap;">Revenue</td>
+                <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap;">{html.escape(str(rev.get('curr', '0')))}</td>
+                <td style="padding: 12px 4px; text-align: right; color: #475569; white-space: nowrap;">{html.escape(str(rev.get('prev', '0')))}</td>
+                <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: #0f172a; white-space: nowrap;">{html.escape(str(rev.get('difference', '0')))}</td>
+                <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap; color: {growth_color(rev.get('growth', ''))};">{html.escape(str(rev.get('growth', '0%')))}</td>
               </tr>
               <tr style="border-bottom: 1px solid #f1f5f9;">
-                <td style="padding: 12px 4px; color: #1e293b; font-weight: 500;">Gross Profit</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600;">{html.escape(str(gp.get('curr', '-')))}</td>
-                <td style="padding: 12px 4px; text-align: right; color: #475569;">{html.escape(str(gp.get('prev', '-')))}</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: #0f172a;">{html.escape(str(gp.get('difference', '-')))}</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: {growth_color(gp.get('growth', ''))};">{html.escape(str(gp.get('growth', '-')))}</td>
+                <td style="padding: 12px 4px; color: #1e293b; font-weight: 500; white-space: nowrap;">Gross Profit</td>
+                <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap;">{html.escape(str(gp.get('curr', '0')))}</td>
+                <td style="padding: 12px 4px; text-align: right; color: #475569; white-space: nowrap;">{html.escape(str(gp.get('prev', '0')))}</td>
+                <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: #0f172a; white-space: nowrap;">{html.escape(str(gp.get('difference', '0')))}</td>
+                <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap; color: {growth_color(gp.get('growth', ''))};">{html.escape(str(gp.get('growth', '0%')))}</td>
               </tr>
               <tr>
-                <td style="padding: 12px 4px; color: #1e293b; font-weight: 500;">Net Profit</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600;">{html.escape(str(np_d.get('curr', '-')))}</td>
-                <td style="padding: 12px 4px; text-align: right; color: #475569;">{html.escape(str(np_d.get('prev', '-')))}</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: #0f172a;">{html.escape(str(np_d.get('difference', '-')))}</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: {growth_color(np_d.get('growth', ''))};">{html.escape(str(np_d.get('growth', '-')))}</td>
+                <td style="padding: 12px 4px; color: #1e293b; font-weight: 500; white-space: nowrap;">Net Profit</td>
+                <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap;">{html.escape(str(np_d.get('curr', '0')))}</td>
+                <td style="padding: 12px 4px; text-align: right; color: #475569; white-space: nowrap;">{html.escape(str(np_d.get('prev', '0')))}</td>
+                <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: #0f172a; white-space: nowrap;">{html.escape(str(np_d.get('difference', '0')))}</td>
+                <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap; color: {growth_color(np_d.get('growth', ''))};">{html.escape(str(np_d.get('growth', '0%')))}</td>
               </tr>
             </tbody>
           </table>
@@ -889,40 +1027,40 @@ def build_post_html(data, doc_type, screener_info, source_url):
         """
         content_blocks.append(result_card)
 
-    # 3. COMMON FUNDAMENTALS BLOCK (For both Results and Orders)
+    # 3. COMMON FUNDAMENTALS BLOCK
     fundamentals_card = f"""
-    <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 22px; box-shadow: 0 4px 14px rgba(0,0,0,0.05); margin-bottom: 24px;">
+    <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 20px; box-shadow: 0 4px 14px rgba(0,0,0,0.05); margin-bottom: 24px;">
       <h3 style="margin: 0 0 16px 0; font-size: 20px; color: #0f172a;">Fundamentals (All 10 Indicators)</h3>
-      <table style="width: 100%; border-collapse: collapse; font-size: 15px;">
+      <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
         <tbody>
           <tr style="border-bottom: 1px solid #f1f5f9;">
-            <td style="padding: 10px 6px; color: #64748b;">Mkt Cap</td>
-            <td style="padding: 10px 12px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{mkt_cap}</td>
-            <td style="padding: 10px 6px 10px 12px; color: #64748b; border-left: 1px solid #f1f5f9;">ROE</td>
+            <td style="padding: 10px 4px; color: #64748b;">Mkt Cap</td>
+            <td style="padding: 10px 8px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{mkt_cap}</td>
+            <td style="padding: 10px 4px 10px 8px; color: #64748b; border-left: 1px solid #f1f5f9;">ROE</td>
             <td style="padding: 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{roe}</td>
           </tr>
           <tr style="border-bottom: 1px solid #f1f5f9;">
-            <td style="padding: 10px 6px; color: #64748b;">P/E Ratio(TTM)</td>
-            <td style="padding: 10px 12px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{pe_ratio}</td>
-            <td style="padding: 10px 6px 10px 12px; color: #64748b; border-left: 1px solid #f1f5f9;">EPS(TTM)</td>
+            <td style="padding: 10px 4px; color: #64748b;">P/E Ratio(TTM)</td>
+            <td style="padding: 10px 8px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{pe_ratio}</td>
+            <td style="padding: 10px 4px 10px 8px; color: #64748b; border-left: 1px solid #f1f5f9;">EPS(TTM)</td>
             <td style="padding: 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{eps}</td>
           </tr>
           <tr style="border-bottom: 1px solid #f1f5f9;">
-            <td style="padding: 10px 6px; color: #64748b;">P/B Ratio</td>
-            <td style="padding: 10px 12px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{pb_ratio}</td>
-            <td style="padding: 10px 6px 10px 12px; color: #64748b; border-left: 1px solid #f1f5f9;">Div Yield</td>
+            <td style="padding: 10px 4px; color: #64748b;">P/B Ratio</td>
+            <td style="padding: 10px 8px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{pb_ratio}</td>
+            <td style="padding: 10px 4px 10px 8px; color: #64748b; border-left: 1px solid #f1f5f9;">Div Yield</td>
             <td style="padding: 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{div_yield}</td>
           </tr>
           <tr style="border-bottom: 1px solid #f1f5f9;">
-            <td style="padding: 10px 6px; color: #64748b;">Industry P/E</td>
-            <td style="padding: 10px 12px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{ind_pe}</td>
-            <td style="padding: 10px 6px 10px 12px; color: #64748b; border-left: 1px solid #f1f5f9;">Book Value</td>
+            <td style="padding: 10px 4px; color: #64748b;">Industry P/E</td>
+            <td style="padding: 10px 8px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{ind_pe}</td>
+            <td style="padding: 10px 4px 10px 8px; color: #64748b; border-left: 1px solid #f1f5f9;">Book Value</td>
             <td style="padding: 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{book_value}</td>
           </tr>
           <tr>
-            <td style="padding: 10px 6px; color: #64748b;">Debt to Equity</td>
-            <td style="padding: 10px 12px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{de_ratio}</td>
-            <td style="padding: 10px 6px 10px 12px; color: #64748b; border-left: 1px solid #f1f5f9;">Face Value</td>
+            <td style="padding: 10px 4px; color: #64748b;">Debt to Equity</td>
+            <td style="padding: 10px 8px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{de_ratio}</td>
+            <td style="padding: 10px 4px 10px 8px; color: #64748b; border-left: 1px solid #f1f5f9;">Face Value</td>
             <td style="padding: 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{face_val}</td>
           </tr>
         </tbody>
@@ -1000,14 +1138,14 @@ def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, 
         )
     else:
         header_title = f"📊 <b>{comp_name} - {qtr_lbl} રિઝલ્ટ અપડેટ</b>"
-        rev = data.get("revenue", {"curr": "-", "prev": "-", "growth": "-", "difference": "-"})
-        gp = data.get("gross_profit", {"curr": "-", "prev": "-", "growth": "-", "difference": "-"})
-        np_d = data.get("net_profit", {"curr": "-", "prev": "-", "growth": "-", "difference": "-"})
+        rev = data.get("revenue", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
+        gp = data.get("gross_profit", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
+        np_d = data.get("net_profit", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
         dynamic_block_gu = (
             f"📈 <b>નાણાકીય કામગીરી ({curr_lbl} vs {prev_lbl}):</b>\n"
-            f"• <b>આવક (Revenue):</b> ₹{html.escape(str(rev.get('curr', '-')))} Cr (તફાવત: {html.escape(str(rev.get('difference', '-')))}) | ગ્રોથ: <b>{html.escape(str(rev.get('growth', '-')))}</b>\n"
-            f"• <b>કુલ નફો (Gross Profit):</b> ₹{html.escape(str(gp.get('curr', '-')))} Cr (તફાવત: {html.escape(str(gp.get('difference', '-')))}) | ગ્રોથ: <b>{html.escape(str(gp.get('growth', '-')))}</b>\n"
-            f"• <b>ચોખ્ખો નફો (Net Profit):</b> ₹{html.escape(str(np_d.get('curr', '-')))} Cr (તફાવત: {html.escape(str(np_d.get('difference', '-')))}) | ગ્રોથ: <b>{html.escape(str(np_d.get('growth', '-')))}</b>\n\n"
+            f"• <b>આવક (Revenue):</b> ₹{html.escape(str(rev.get('curr', '0')))} Cr (તફાવત: {html.escape(str(rev.get('difference', '0')))}) | ગ્રોથ: <b>{html.escape(str(rev.get('growth', '0%')))}</b>\n"
+            f"• <b>કુલ નફો (Gross Profit):</b> ₹{html.escape(str(gp.get('curr', '0')))} Cr (તફાવત: {html.escape(str(gp.get('difference', '0')))}) | ગ્રોથ: <b>{html.escape(str(gp.get('growth', '0%')))}</b>\n"
+            f"• <b>ચોખ્ખો નફો (Net Profit):</b> ₹{html.escape(str(np_d.get('curr', '0')))} Cr (તફાવત: {html.escape(str(np_d.get('difference', '0')))}) | ગ્રોથ: <b>{html.escape(str(np_d.get('growth', '0%')))}</b>\n\n"
         )
 
     msg_html = (
@@ -1198,20 +1336,29 @@ def run():
             log.info("Skipping duplicate (%s): %s", doc_type, item["title"])
             continue
 
-        if comp_key:
-            seen_comp_in_run.add(comp_key)
-        if file_key:
-            seen_file_in_run.add(file_key)
-
         log.info("Processing %s: %s", doc_type, item["title"])
         try:
-            source_text = get_document_text(item)
-            if len(source_text) < MIN_SOURCE_TEXT:
-                log.warning("Skipped: insufficient filing text (%d chars): %s", len(source_text), item["title"])
+            source_text, pdf_bytes = get_document_payload(item)
+            if not pdf_bytes and len(source_text) < 80:
+                log.warning("Skipped: no PDF and insufficient text: %s", item["title"])
                 continue
 
             screener_info = get_screener_fundamentals(item["title"])
-            ai_data = analyze_with_gemini_json(item["title"], doc_type, source_text, screener_info)
+            ai_data = analyze_with_gemini_json(item["title"], doc_type, source_text, pdf_bytes, screener_info)
+
+            # જો રિઝલ્ટ પોસ્ટ હોય અને PDF તેમજ Screener બંનેમાંથી એક પણ આંકડો ન મળે તો ખાલી N/A પોસ્ટ ન કરવી
+            if doc_type == "result":
+                r_curr = to_float(ai_data.get("revenue", {}).get("curr"))
+                np_curr = to_float(ai_data.get("net_profit", {}).get("curr"))
+                if r_curr == 0 and np_curr == 0:
+                    log.warning("Skipping result post with 0/empty financial figures: %s", item["title"])
+                    continue
+
+            if comp_key:
+                seen_comp_in_run.add(comp_key)
+            if file_key:
+                seen_file_in_run.add(file_key)
+
             publish_item(item, doc_type, ai_data, screener_info, item_id, comp_key, file_key)
             
             if comp_key:
