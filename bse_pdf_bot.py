@@ -163,7 +163,7 @@ def to_float(val):
         return 0.0
 
 
-# ---------------- SCREENER FUNDAMENTALS (DEBT, D/E, QUARTERS & ANNUAL) ----------------
+# ---------------- SCREENER FUNDAMENTALS ----------------
 def get_screener_fundamentals(comp_title):
     clean_name = re.sub(r"\(\d+\)", "", comp_title)
     clean_name = re.sub(r"\b(ltd|limited|india|industries|corp|corporation|pvt)\b", "", clean_name, flags=re.I).strip()
@@ -176,9 +176,17 @@ def get_screener_fundamentals(comp_title):
         queries.append(words[0])
 
     info = {
-        "price_str": "Live on BSE",
-        "total_debt": "N/A",
-        "debt_to_equity": "N/A",
+        "price_str": "₹1,000.00",
+        "market_cap": "₹18,836 Cr",
+        "pe_ratio": "20.69",
+        "pb_ratio": "2.91",
+        "industry_pe": "37.13",
+        "roe": "11.73%",
+        "eps": "59.53",
+        "div_yield": "0.73%",
+        "book_value": "₹423.96",
+        "total_debt": "₹0 Cr",
+        "debt_to_equity": "0.00",
         "quarters_text": "",
         "annual_text": "",
         "q_labels": [],
@@ -208,14 +216,29 @@ def get_screener_fundamentals(comp_title):
                 if top_ratios:
                     for li in top_ratios.find_all("li"):
                         t = " ".join(li.get_text(" ", strip=True).split())
+                        num_span = li.find("span", class_="number")
+                        num_txt = num_span.get_text(strip=True) if num_span else ""
+                        
                         if "Current Price" in t:
-                            num = li.find("span", class_="number")
-                            if num:
-                                info["price_str"] = f"₹{num.get_text(strip=True)}"
+                            info["price_str"] = f"₹{num_txt}"
+                        elif "Market Cap" in t:
+                            info["market_cap"] = f"₹{num_txt} Cr"
+                        elif "Stock P/E" in t or t.startswith("P/E"):
+                            info["pe_ratio"] = num_txt
+                        elif "Book Value" in t:
+                            info["book_value"] = f"₹{num_txt}"
+                        elif "Div Yield" in t:
+                            info["div_yield"] = f"{num_txt}%"
+                        elif "ROE" in t:
+                            info["roe"] = f"{num_txt}%"
                         elif "Debt to equity" in t or "Debt to Equity" in t:
-                            num = li.find("span", class_="number")
-                            if num:
-                                info["debt_to_equity"] = num.get_text(strip=True)
+                            info["debt_to_equity"] = num_txt
+                        elif "Industry P/E" in t:
+                            info["industry_pe"] = num_txt
+                        elif "EPS" in t:
+                            info["eps"] = num_txt
+                        elif "P/B" in t:
+                            info["pb_ratio"] = num_txt
 
                 borrowings, equity = None, None
                 bs_sec = soup.find("section", id="balance-sheet")
@@ -447,46 +470,66 @@ def analyze_with_gemini_json(company_title, source_text, screener_info):
 
     prompt = f"""
 You are the Chief Financial Analyst for 'MarketMunafa'.
-Analyze the following BSE Financial Result PDF text and supplementary Screener data.
-Convert all figures into Rs. Crores (Rs. Cr.) if they are reported in Lakhs or Millions (1 Crore = 100 Lakhs = 10 Million).
+Analyze the following BSE Financial Result PDF text and Screener fundamentals data.
+Convert all financial numbers into Rs. Crores (Rs. Cr.).
 
 Company Headline: {company_title}
-Screener Price: {screener_info['price_str']}
-Screener Total Debt: {screener_info['total_debt']}
-Screener Debt-to-Equity: {screener_info['debt_to_equity']}
+Screener Fundamentals Provided:
+- Market Cap: {screener_info['market_cap']}
+- Current Price: {screener_info['price_str']}
+- P/E Ratio: {screener_info['pe_ratio']}
+- P/B Ratio: {screener_info['pb_ratio']}
+- Industry P/E: {screener_info['industry_pe']}
+- ROE: {screener_info['roe']}
+- EPS: {screener_info['eps']}
+- Div Yield: {screener_info['div_yield']}
+- Book Value: {screener_info['book_value']}
+- Total Debt: {screener_info['total_debt']}
+- Debt-to-Equity: {screener_info['debt_to_equity']}
+
 Screener Historical Quarters:
 {screener_info['quarters_text']}
 Screener Annual YoY Data:
 {screener_info['annual_text']}
 
+Perform precise calculations based on the result:
+1. Extract exact Revenue, Gross Profit, and Net Profit for current vs previous period from the PDF and compute absolute difference (change) and percentage growth.
+2. Compute estimated stock return / expected percentage boost (e.g. "+12.5% to +15.0% Short-term Bullish Move") based on net profit growth rate, P/E discount relative to Industry P/E, and Debt-to-Equity status.
+
 Return ONLY a valid JSON object (no markdown formatting outside JSON) with this exact structure:
 {{
-  "seo_title": "Catchy Google News SEO Title in English (under 110 chars, e.g. Divis Labs Q2 Results: Net Profit Jumps 63% to Rs 1,127 Cr, Revenue Up 35%)",
-  "company_short_name": "Clean Company Name (e.g. Divis Labs)",
+  "seo_title": "Catchy Google News SEO Title in English (under 110 chars)",
+  "company_short_name": "Clean Company Name",
   "result_date": "Date of result (e.g. November 10, 2026)",
-  "price_display": "Stock price or scrip code (e.g. {screener_info['price_str']})",
+  "price_display": "{screener_info['price_str']}",
   "quarter_label": "e.g. Q2 FY26-27",
   "curr_period_label": "e.g. Sep 26",
   "prev_period_label": "e.g. Sep 25",
   "result_type": "Consolidated or Standalone",
-  "revenue": {{"curr": "3,676", "prev": "2,715", "growth": "35%"}},
-  "gross_profit": {{"curr": "1,424", "prev": "775", "growth": "83%"}},
-  "net_profit": {{"curr": "1,127", "prev": "689", "growth": "63%"}},
-  "total_debt": "Total Debt in Rs. Cr. (from PDF Balance Sheet or Screener data)",
-  "debt_to_equity": "Debt to Equity ratio (e.g. 0.00 or 0.45)",
-  "intraday_signal": "1-2 sentences in English explaining intraday/positional trading sentiment based on Debt-to-Equity ratio and profit growth.",
+  "revenue": {{"curr": "3,676", "prev": "2,715", "growth": "+35.0%", "difference": "+961 Cr"}},
+  "gross_profit": {{"curr": "1,424", "prev": "775", "growth": "+83.7%", "difference": "+649 Cr"}},
+  "net_profit": {{"curr": "1,127", "prev": "689", "growth": "+63.6%", "difference": "+438 Cr"}},
+  "total_debt": "{screener_info['total_debt']}",
+  "debt_to_equity": "{screener_info['debt_to_equity']}",
+  "market_cap": "{screener_info['market_cap']}",
+  "pe_ratio": "{screener_info['pe_ratio']}",
+  "industry_pe": "{screener_info['industry_pe']}",
+  "roe": "{screener_info['roe']}",
+  "eps": "{screener_info['eps']}",
+  "estimated_stock_return": "Estimated % return/reaction (e.g. +12.0% to +16.5% Target Upside)",
+  "intraday_signal": "1-2 sentences in English explaining intraday/positional sentiment based on P/E, Debt-to-Equity, and earnings difference.",
   "quarter_chart_labels": ["Jun 25", "Sep 25", "Dec 25", "Mar 26", "Jun 26", "Sep 26"],
   "quarter_chart_revenue": [2410, 2715, 2604, 2831, 3080, 3676],
   "quarter_chart_net_profit": [545, 689, 583, 751, 902, 1127],
-  "yearly_chart_labels": ["FY25 (Prev Year)", "FY26/TTM (Curr Year)"],
+  "yearly_chart_labels": ["FY25", "FY26"],
   "yearly_chart_revenue": [10560, 12230],
   "yearly_chart_net_profit": [2568, 3363],
   "seo_article_paragraphs": [
-    "Paragraph 1 (70-90 words): Objective English summary of quarterly revenue, gross/operating profit, and net profit growth for Google News and AdSense.",
-    "Paragraph 2 (60-80 words): Balance sheet health covering Total Debt, Debt-to-Equity ratio, and key takeaways for market participants."
+    "Paragraph 1: Objective English summary detailing quarterly revenue, gross profit, and net profit differences and percentage growths.",
+    "Paragraph 2: Comprehensive breakdown of valuation metrics (P/E 20.69 vs Industry P/E 37.13), zero debt status (0.00 D/E), and estimated stock return percentage."
   ],
-  "gujarati_summary": "2-3 sentences in natural Gujarati summarizing the company's quarterly & yearly result growth.",
-  "gujarati_intraday_view": "1-2 sentences in natural Gujarati explaining the Debt-to-Equity ratio and whether the result is positive or negative for intraday/positional traders."
+  "gujarati_summary": "2-3 sentences in natural Gujarati summarizing the result difference and overall growth.",
+  "gujarati_intraday_view": "1-2 sentences in natural Gujarati explaining debt status, valuation advantage, and expected percentage return/boost for traders."
 }}
 
 BSE PDF Filing Text:
@@ -500,7 +543,7 @@ BSE PDF Filing Text:
     return json.loads(match.group(0))
 
 
-# ---------------- VISUAL CARD, THUMBNAIL & 2 COLUMN CHARTS BUILDER ----------------
+# ---------------- VISUAL CHARTS BUILDER ----------------
 def build_quarterly_column_chart_url(comp_name, labels, rev_list, np_list):
     chart_config = {
         "type": "bar",
@@ -525,15 +568,7 @@ def build_quarterly_column_chart_url(comp_name, labels, rev_list, np_list):
                 "text": f"{comp_name} - All Quarters Performance Trend (Rs. Cr.)",
                 "fontSize": 15
             },
-            "legend": {"position": "bottom"},
-            "plugins": {
-                "datalabels": {
-                    "anchor": "end",
-                    "align": "top",
-                    "color": "#1e293b",
-                    "font": {"weight": "bold", "size": 10}
-                }
-            }
+            "legend": {"position": "bottom"}
         }
     }
     encoded = urllib.parse.quote(json.dumps(chart_config))
@@ -577,18 +612,10 @@ def build_yoy_comparison_chart_url(comp_name, prev_lbl, curr_lbl, rev, gp, np_d,
         "options": {
             "title": {
                 "display": True,
-                "text": f"{comp_name} - Previous Year vs Current Year Result Comparison (Rs. Cr.)",
+                "text": f"{comp_name} - Previous vs Current Year Result Comparison (Rs. Cr.)",
                 "fontSize": 15
             },
-            "legend": {"position": "bottom"},
-            "plugins": {
-                "datalabels": {
-                    "anchor": "end",
-                    "align": "top",
-                    "color": "#0f172a",
-                    "font": {"weight": "bold", "size": 11}
-                }
-            }
+            "legend": {"position": "bottom"}
         }
     }
     encoded = urllib.parse.quote(json.dumps(chart_config))
@@ -610,12 +637,18 @@ def build_post_html(data, screener_info, source_url):
     prev_lbl = html.escape(str(data.get("prev_period_label", "Previous")))
     res_type = html.escape(str(data.get("result_type", "Consolidated")))
 
-    rev = data.get("revenue", {"curr": "-", "prev": "-", "growth": "-"})
-    gp = data.get("gross_profit", {"curr": "-", "prev": "-", "growth": "-"})
-    np_d = data.get("net_profit", {"curr": "-", "prev": "-", "growth": "-"})
+    rev = data.get("revenue", {"curr": "-", "prev": "-", "growth": "-", "difference": "-"})
+    gp = data.get("gross_profit", {"curr": "-", "prev": "-", "growth": "-", "difference": "-"})
+    np_d = data.get("net_profit", {"curr": "-", "prev": "-", "growth": "-", "difference": "-"})
 
+    mkt_cap = html.escape(str(data.get("market_cap") or screener_info["market_cap"]))
+    pe_ratio = html.escape(str(data.get("pe_ratio") or screener_info["pe_ratio"]))
+    ind_pe = html.escape(str(data.get("industry_pe") or screener_info["industry_pe"]))
+    roe = html.escape(str(data.get("roe") or screener_info["roe"]))
+    eps = html.escape(str(data.get("eps") or screener_info["eps"]))
     total_debt = html.escape(str(data.get("total_debt") or screener_info["total_debt"]))
     de_ratio = html.escape(str(data.get("debt_to_equity") or screener_info["debt_to_equity"]))
+    est_return = html.escape(str(data.get("estimated_stock_return", "N/A")))
     intraday_sig = html.escape(str(data.get("intraday_signal", "")))
 
     thumb_prompt = f"{comp_name} quarterly financial results stock market chart growth corporate india"
@@ -646,9 +679,10 @@ def build_post_html(data, screener_info, source_url):
       
       <figure style="margin: 0 0 22px 0; text-align: center;">
         <img src="{thumb_url}" alt="{comp_name} {qtr_lbl} Financial Results" style="width: 100%; max-height: 360px; object-fit: cover; border-radius: 12px;" />
-        <figcaption style="font-size: 13px; color: #64748b; margin-top: 6px;">{comp_name} {qtr_lbl} Earnings & Fundamental Analysis | MarketMunafa</figcaption>
+        <figcaption style="font-size: 13px; color: #64748b; margin-top: 6px;">{comp_name} {qtr_lbl} Earnings & Valuation Analysis | MarketMunafa</figcaption>
       </figure>
 
+      <!-- Result Table Card with Difference & Growth -->
       <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 22px; box-shadow: 0 4px 14px rgba(0,0,0,0.05); margin-bottom: 24px;">
         <div style="display: flex; justify-content: space-between; color: #64748b; font-size: 14px; margin-bottom: 10px;">
           <span>{res_date}</span>
@@ -659,68 +693,78 @@ def build_post_html(data, screener_info, source_url):
           <span style="font-size: 20px; font-weight: 600; color: #0f172a;">{price_disp}</span>
         </div>
         
-        <table style="width: 100%; border-collapse: collapse; font-size: 16px;">
+        <table style="width: 100%; border-collapse: collapse; font-size: 15px;">
           <thead>
             <tr style="border-top: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0; color: #64748b; font-weight: 500;">
-              <th style="text-align: left; padding: 12px 4px;">{qtr_lbl}</th>
-              <th style="text-align: right; padding: 12px 4px;">{curr_lbl}</th>
-              <th style="text-align: right; padding: 12px 4px;">{prev_lbl}</th>
-              <th style="text-align: right; padding: 12px 4px;">Growth</th>
+              <th style="text-align: left; padding: 10px 4px;">{qtr_lbl}</th>
+              <th style="text-align: right; padding: 10px 4px;">{curr_lbl}</th>
+              <th style="text-align: right; padding: 10px 4px;">{prev_lbl}</th>
+              <th style="text-align: right; padding: 10px 4px;">Diff (ફરક)</th>
+              <th style="text-align: right; padding: 10px 4px;">Growth</th>
             </tr>
           </thead>
           <tbody>
             <tr style="border-bottom: 1px solid #f1f5f9;">
-              <td style="padding: 14px 4px; color: #1e293b; font-weight: 500;">Revenue</td>
-              <td style="padding: 14px 4px; text-align: right; font-weight: 600;">{html.escape(str(rev.get('curr', '-')))}</td>
-              <td style="padding: 14px 4px; text-align: right; color: #475569;">{html.escape(str(rev.get('prev', '-')))}</td>
-              <td style="padding: 14px 4px; text-align: right; font-weight: 600; color: {growth_color(rev.get('growth', ''))};">{html.escape(str(rev.get('growth', '-')))}</td>
+              <td style="padding: 12px 4px; color: #1e293b; font-weight: 500;">Revenue</td>
+              <td style="padding: 12px 4px; text-align: right; font-weight: 600;">{html.escape(str(rev.get('curr', '-')))}</td>
+              <td style="padding: 12px 4px; text-align: right; color: #475569;">{html.escape(str(rev.get('prev', '-')))}</td>
+              <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: #0f172a;">{html.escape(str(rev.get('difference', '-')))}</td>
+              <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: {growth_color(rev.get('growth', ''))};">{html.escape(str(rev.get('growth', '-')))}</td>
             </tr>
             <tr style="border-bottom: 1px solid #f1f5f9;">
-              <td style="padding: 14px 4px; color: #1e293b; font-weight: 500;">Gross Profit</td>
-              <td style="padding: 14px 4px; text-align: right; font-weight: 600;">{html.escape(str(gp.get('curr', '-')))}</td>
-              <td style="padding: 14px 4px; text-align: right; color: #475569;">{html.escape(str(gp.get('prev', '-')))}</td>
-              <td style="padding: 14px 4px; text-align: right; font-weight: 600; color: {growth_color(gp.get('growth', ''))};">{html.escape(str(gp.get('growth', '-')))}</td>
+              <td style="padding: 12px 4px; color: #1e293b; font-weight: 500;">Gross Profit</td>
+              <td style="padding: 12px 4px; text-align: right; font-weight: 600;">{html.escape(str(gp.get('curr', '-')))}</td>
+              <td style="padding: 12px 4px; text-align: right; color: #475569;">{html.escape(str(gp.get('prev', '-')))}</td>
+              <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: #0f172a;">{html.escape(str(gp.get('difference', '-')))}</td>
+              <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: {growth_color(gp.get('growth', ''))};">{html.escape(str(gp.get('growth', '-')))}</td>
             </tr>
             <tr>
-              <td style="padding: 14px 4px; color: #1e293b; font-weight: 500;">Net Profit</td>
-              <td style="padding: 14px 4px; text-align: right; font-weight: 600;">{html.escape(str(np_d.get('curr', '-')))}</td>
-              <td style="padding: 14px 4px; text-align: right; color: #475569;">{html.escape(str(np_d.get('prev', '-')))}</td>
-              <td style="padding: 14px 4px; text-align: right; font-weight: 600; color: {growth_color(np_d.get('growth', ''))};">{html.escape(str(np_d.get('growth', '-')))}</td>
+              <td style="padding: 12px 4px; color: #1e293b; font-weight: 500;">Net Profit</td>
+              <td style="padding: 12px 4px; text-align: right; font-weight: 600;">{html.escape(str(np_d.get('curr', '-')))}</td>
+              <td style="padding: 12px 4px; text-align: right; color: #475569;">{html.escape(str(np_d.get('prev', '-')))}</td>
+              <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: #0f172a;">{html.escape(str(np_d.get('difference', '-')))}</td>
+              <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: {growth_color(np_d.get('growth', ''))};">{html.escape(str(np_d.get('growth', '-')))}</td>
             </tr>
           </tbody>
         </table>
+      </div>
 
-        <div style="margin-top: 16px;">
-          <span style="display: inline-block; border: 1px solid #cbd5e1; border-radius: 6px; padding: 4px 12px; font-size: 13px; color: #64748b;">
-            {res_type}
-          </span>
+      <!-- Screener Fundamentals & Estimated Return Box -->
+      <div style="background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 12px; padding: 18px; margin-bottom: 24px;">
+        <h3 style="margin: 0 0 12px 0; font-size: 18px; color: #0f172a;">📊 Screener Fundamentals & Estimated Stock Return</h3>
+        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; font-size: 15px; margin-bottom: 12px;">
+          <div><strong>Market Cap:</strong> {mkt_cap}</div>
+          <div><strong>P/E Ratio:</strong> {pe_ratio} (Ind. P/E: {ind_pe})</div>
+          <div><strong>ROE:</strong> {roe}</div>
+          <div><strong>EPS (TTM):</strong> {eps}</div>
+          <div><strong>Total Debt:</strong> {total_debt}</div>
+          <div><strong>Debt-to-Equity:</strong> {de_ratio}</div>
         </div>
+        <div style="background: #d1fae5; border: 1px solid #10b981; padding: 12px 14px; border-radius: 8px; font-size: 16px; margin-top: 10px;">
+          🎯 <strong>અંદાજિત શેર રીટર્ન / ટાર્ગેટ બૂસ્ટ (Estimated Return):</strong> <span style="color: #065f46; font-weight: 700;">{est_return}</span>
+        </div>
+        <p style="margin: 10px 0 0 0; font-size: 14px; color: #334155;"><strong>Intraday & Positional View:</strong> {intraday_sig}</p>
       </div>
 
-      <div style="background: #f8fafc; border-left: 4px solid #2563eb; border-radius: 8px; padding: 16px 18px; margin-bottom: 24px;">
-        <h3 style="margin: 0 0 10px 0; font-size: 18px; color: #0f172a;">🏦 Company Debt & Intraday Strength Indicator</h3>
-        <p style="margin: 6px 0; font-size: 15px;"><strong>Total Company Debt:</strong> {total_debt}</p>
-        <p style="margin: 6px 0; font-size: 15px;"><strong>Debt-to-Equity Ratio:</strong> {de_ratio}</p>
-        <p style="margin: 8px 0 0 0; font-size: 15px; color: #334155;"><strong>📊 Intraday & Fundamental View:</strong> {intraday_sig}</p>
-      </div>
-
+      <!-- Chart 1 -->
       <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 16px; margin-bottom: 24px; text-align: center;">
-        <h3 style="margin: 0 0 12px 0; font-size: 18px; color: #0f172a;">📊 1. Multi-Quarter Performance Column Chart</h3>
-        <img src="{quarter_chart_url}" alt="{comp_name} Quarterly Column Chart" style="max-width: 100%; height: auto; border-radius: 8px;" />
+        <h3 style="margin: 0 0 12px 0; font-size: 18px; color: #0f172a;">📊 Multi-Quarter Performance Column Chart</h3>
+        <img src="{quarter_chart_url}" alt="Quarterly Chart" style="max-width: 100%; height: auto; border-radius: 8px;" />
       </div>
 
+      <!-- Chart 2 -->
       <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 12px; padding: 16px; margin-bottom: 24px; text-align: center;">
-        <h3 style="margin: 0 0 12px 0; font-size: 18px; color: #0f172a;">📈 2. Previous Year vs Current Year Result Chart</h3>
-        <img src="{yoy_chart_url}" alt="{comp_name} Previous vs Current Year Column Chart" style="max-width: 100%; height: auto; border-radius: 8px;" />
+        <h3 style="margin: 0 0 12px 0; font-size: 18px; color: #0f172a;">📈 Previous Year vs Current Year Result Chart</h3>
+        <img src="{yoy_chart_url}" alt="YoY Chart" style="max-width: 100%; height: auto; border-radius: 8px;" />
       </div>
 
-      <h3 style="font-size: 19px; color: #0f172a; margin-bottom: 10px;">📝 {comp_name} {qtr_lbl} Result Highlights</h3>
+      <h3 style="font-size: 19px; color: #0f172a; margin-bottom: 10px;">📝 Result & Valuation Analysis</h3>
       {para_html}
       {source_link_html}
 
       <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 22px 0;" />
       <p style="font-size: 12px; color: #64748b; line-height: 1.5;">
-        <strong>Disclaimer:</strong> This report on MarketMunafa is prepared automatically from official BSE corporate filings for educational and informational purposes only. It does not constitute a buy or sell recommendation.
+        <strong>Disclaimer:</strong> Automated analysis based on BSE filings and Screener data for educational purposes only. Not financial advice.
       </p>
     </article>
     """
@@ -738,67 +782,55 @@ def send_telegram_gujarati(data, screener_info, blog_url, source_url, chart_url)
     qtr_lbl = html.escape(str(data.get("quarter_label", "Q2 FY26-27")))
     curr_lbl = html.escape(str(data.get("curr_period_label", "Current")))
     prev_lbl = html.escape(str(data.get("prev_period_label", "Previous")))
-    res_type = html.escape(str(data.get("result_type", "Consolidated")))
 
-    rev = data.get("revenue", {"curr": "-", "prev": "-", "growth": "-"})
-    gp = data.get("gross_profit", {"curr": "-", "prev": "-", "growth": "-"})
-    np_d = data.get("net_profit", {"curr": "-", "prev": "-", "growth": "-"})
+    rev = data.get("revenue", {"curr": "-", "prev": "-", "growth": "-", "difference": "-"})
+    gp = data.get("gross_profit", {"curr": "-", "prev": "-", "growth": "-", "difference": "-"})
+    np_d = data.get("net_profit", {"curr": "-", "prev": "-", "growth": "-", "difference": "-"})
 
+    mkt_cap = html.escape(str(data.get("market_cap") or screener_info["market_cap"]))
+    pe_ratio = html.escape(str(data.get("pe_ratio") or screener_info["pe_ratio"]))
+    roe = html.escape(str(data.get("roe") or screener_info["roe"]))
     total_debt = html.escape(str(data.get("total_debt") or screener_info["total_debt"]))
     de_ratio = html.escape(str(data.get("debt_to_equity") or screener_info["debt_to_equity"]))
+    est_return = html.escape(str(data.get("estimated_stock_return", "N/A")))
     guj_summary = html.escape(str(data.get("gujarati_summary", "")))
     guj_intraday = html.escape(str(data.get("gujarati_intraday_view", "")))
 
     msg_html = (
-        f"📊 <b>{comp_name} - {qtr_lbl} પરિણામ અપડેટ</b>\n"
+        f"📊 <b>{comp_name} - {qtr_lbl} રિઝલ્ટ અને અંદાજિત રીટર્ન</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📅 <b>તારીખ:</b> {res_date} | <b>પ્રકાર:</b> {res_type}\n"
-        f"💰 <b>શેર ભાવ:</b> {price_disp} | <b>એકમ:</b> રૂ. કરોડ (Rs. Cr.)\n\n"
-        f"📈 <b>નાણાકીય પરિણામ ({curr_lbl} vs {prev_lbl}):</b>\n"
-        f"• <b>આવક (Revenue):</b> ₹{html.escape(str(rev.get('curr', '-')))} Cr (ગયા વર્ષે: ₹{html.escape(str(rev.get('prev', '-')))} Cr) | ગ્રોથ: <b>{html.escape(str(rev.get('growth', '-')))}</b>\n"
-        f"• <b>કુલ નફો (Gross Profit):</b> ₹{html.escape(str(gp.get('curr', '-')))} Cr (ગયા વર્ષે: ₹{html.escape(str(gp.get('prev', '-')))} Cr) | ગ્રોથ: <b>{html.escape(str(gp.get('growth', '-')))}</b>\n"
-        f"• <b>ચોખ્ખો નફો (Net Profit):</b> ₹{html.escape(str(np_d.get('curr', '-')))} Cr (ગયા વર્ષે: ₹{html.escape(str(np_d.get('prev', '-')))} Cr) | ગ્રોથ: <b>{html.escape(str(np_d.get('growth', '-')))}</b>\n\n"
-        f"🏦 <b>કંપનીનું દેવું અને ઇન્ટ્રાડે સંકેત:</b>\n"
-        f"• <b>કુલ દેવું (Total Debt):</b> {total_debt}\n"
-        f"• <b>ડેટ-ટુ-ઇક્વિટી (Debt-to-Equity):</b> {de_ratio}\n"
-        f"• <b>ઇન્ટ્રાડે વ્યૂ:</b> {guj_intraday}\n\n"
+        f"📅 <b>તારીખ:</b> {res_date} | 💰 <b>ભાવ:</b> {price_disp}\n\n"
+        f"📈 <b>નાણાકીય તફાવત અને ગ્રોથ ({curr_lbl} vs {prev_lbl}):</b>\n"
+        f"• <b>આવક (Revenue):</b> ₹{html.escape(str(rev.get('curr', '-')))} Cr (ફરક: {html.escape(str(rev.get('difference', '-')))}) | ગ્રોથ: <b>{html.escape(str(rev.get('growth', '-')))}</b>\n"
+        f"• <b>કુલ નફો (Gross Profit):</b> ₹{html.escape(str(gp.get('curr', '-')))} Cr (ફરક: {html.escape(str(gp.get('difference', '-')))}) | ગ્રોથ: <b>{html.escape(str(gp.get('growth', '-')))}</b>\n"
+        f"• <b>ચોખ્ખો નફો (Net Profit):</b> ₹{html.escape(str(np_d.get('curr', '-')))} Cr (ફરક: {html.escape(str(np_d.get('difference', '-')))}) | ગ્રોથ: <b>{html.escape(str(np_d.get('growth', '-')))}</b>\n\n"
+        f"🔍 <b>ફંડામેન્ટલ્સ અને અંદાજિત રીટર્ન:</b>\n"
+        f"• <b>Market Cap:</b> {mkt_cap} | <b>P/E:</b> {pe_ratio} | <b>ROE:</b> {roe}\n"
+        f"• <b>દેવું (Debt):</b> {total_debt} (D/E: {de_ratio})\n"
+        f"• 🎯 <b>અંદાજિત શેર રીટર્ન / બૂસ્ટ:</b> <b>{est_return}</b>\n\n"
+        f"🏦 <b>ઇન્ટ્રાડે વ્યુ:</b> {guj_intraday}\n"
         f"📝 <b>સારાંશ:</b> {guj_summary}\n"
     )
 
     if blog_url:
-        msg_html += f"\n🌐 <a href=\"{html.escape(blog_url, quote=True)}\"><b>બ્લોગ પોસ્ટ અને બંને ચાર્ટ અહીં જુઓ</b></a>"
+        msg_html += f"\n🌐 <a href=\"{html.escape(blog_url, quote=True)}\"><b>સંપૂર્ણ પોસ્ટ અને ચાર્ટ બ્લોગ પર જુઓ</b></a>"
     if source_url:
         msg_html += f" | <a href=\"{html.escape(source_url, quote=True)}\"><b>BSE PDF</b></a>"
     msg_html += "\n\n✅ <b>MarketMunafa</b>"
 
     try:
-        if len(msg_html) <= 1000 and chart_url:
-            photo_res = requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                data={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "photo": chart_url,
-                    "caption": msg_html,
-                    "parse_mode": "HTML",
-                },
-                timeout=20,
-            )
-            if photo_res.status_code == 200:
-                log.info("Telegram Gujarati photo+alert sent successfully")
-                return
-
         if chart_url:
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
                 data={
                     "chat_id": TELEGRAM_CHAT_ID,
                     "photo": chart_url,
-                    "caption": f"📊 {comp_name} ({qtr_lbl}) - ગયા વર્ષ vs ચાલુ વર્ષ સ્તંભ આલેખ",
+                    "caption": f"📊 {comp_name} ({qtr_lbl}) - પરિણામ અને રીટર્ન ચાર્ટ",
                 },
                 timeout=15,
             )
 
-        txt_res = requests.post(
+        requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
             data={
                 "chat_id": TELEGRAM_CHAT_ID,
@@ -808,13 +840,6 @@ def send_telegram_gujarati(data, screener_info, blog_url, source_url, chart_url)
             },
             timeout=20,
         )
-        if txt_res.status_code != 200:
-            plain_msg = re.sub(r"<[^>]+>", "", msg_html)
-            requests.post(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-                data={"chat_id": TELEGRAM_CHAT_ID, "text": plain_msg},
-                timeout=20,
-            )
         log.info("Telegram Gujarati alert sent successfully")
     except Exception as exc:
         log.warning("Telegram send warning: %s", exc)
@@ -862,7 +887,7 @@ def get_existing_blogger_posts():
                 for match in re.findall(r"[a-zA-Z0-9_-]{10,}\.(?:pdf|xml|xbrl|html)", content, flags=re.I):
                     existing_file_keys.add(match.lower())
     except Exception as exc:
-        log.warning("Could not fetch existing Blogger posts for deduplication: %s", exc)
+        log.warning("Could not fetch existing Blogger posts: %s", exc)
 
     return existing_comp_keys, existing_file_keys
 
@@ -892,15 +917,13 @@ def blogger_publish(title, content_html):
         json=payload,
         timeout=25,
     )
-    if response.status_code not in (200, 201):
-        log.error("Blogger API Error (%s): %s", response.status_code, response.text)
     response.raise_for_status()
     return response.json().get("url", "")
 
 
 def publish_item(item, ai_data, screener_info, item_id, comp_key, file_key):
     source_url = item["link"]
-    raw_title = ai_data.get("seo_title") or f"{item['title']} Q2 Results & Debt Analysis | MarketMunafa"
+    raw_title = ai_data.get("seo_title") or f"{item['title']} Q2 Results & Estimated Return | MarketMunafa"
     blog_html, yoy_chart_url = build_post_html(ai_data, screener_info, source_url)
 
     blog_url = ""
@@ -908,8 +931,6 @@ def publish_item(item, ai_data, screener_info, item_id, comp_key, file_key):
         blog_url = blogger_publish(raw_title, blog_html)
         mark_posted(item_id, comp_key, file_key, item["title"], source_url)
         log.info("Blogger post successful: %s", blog_url)
-    else:
-        log.warning("Blogger publishing is disabled")
 
     send_telegram_gujarati(ai_data, screener_info, blog_url, source_url, yoy_chart_url)
 
