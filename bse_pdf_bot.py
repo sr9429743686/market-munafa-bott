@@ -7,9 +7,12 @@ import hashlib
 import logging
 import sqlite3
 import tempfile
+import warnings
 import urllib.parse
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
+
+warnings.filterwarnings("ignore")
 
 from curl_cffi import requests as c_requests
 import requests
@@ -29,7 +32,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9086072964:AAEUyn-GAyJLdsY
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "430834857").strip()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -73,7 +76,10 @@ def extract_file_key(url):
     if not url:
         return ""
     path = urlparse(url).path.lower()
-    return path.rsplit("/", 1)[-1].strip()
+    fname = path.rsplit("/", 1)[-1].strip()
+    if fname.endswith((".pdf", ".xml", ".xbrl")):
+        return fname
+    return ""
 
 
 def init_db():
@@ -129,31 +135,28 @@ def get_url(url, extra_headers=None):
     last_error = None
     profiles = ["chrome120", "chrome110", "edge101", "chrome104"]
     
-    for attempt in range(4):
+    for attempt in range(3):
         try:
             profile = profiles[attempt % len(profiles)]
             headers = {
-                "Accept": "application/json, application/rss+xml, application/xml, text/xml, application/pdf, text/html, */*",
+                "Accept": "application/rss+xml, application/xml, text/xml, application/pdf, text/html, */*",
                 "Accept-Language": "en-US,en;q=0.9",
-                "Referer": "https://www.bseindia.com/corporates/ann.html",
-                "Origin": "https://www.bseindia.com",
+                "Referer": "https://www.bseindia.com/",
             }
             if extra_headers:
                 headers.update(extra_headers)
             response = c_requests.get(url, impersonate=profile, headers=headers, timeout=REQUEST_TIMEOUT)
             if response.status_code in (403, 429):
                 raise requests.HTTPError(
-                    f"Server returned {response.status_code}; rate-limited",
+                    f"Server returned {response.status_code}",
                     response=response,
                 )
             response.raise_for_status()
             return response
         except Exception as exc:
             last_error = exc
-            wait = min(3 * (2 ** attempt), 30)
-            log.warning("GET failed (%s). Retry in %ss", exc, wait)
-            if attempt < 3:
-                time.sleep(wait)
+            if attempt < 2:
+                time.sleep(2 * (attempt + 1))
     raise RuntimeError(f"Could not fetch {url}: {last_error}")
 
 
@@ -357,7 +360,7 @@ def get_screener_fundamentals(comp_title):
     return info
 
 
-# ---------------- BSE DIRECT ORDER API & FEED PARSING ----------------
+# ---------------- BSE XML FEED PARSING ----------------
 def local_name(tag):
     return tag.rsplit("}", 1)[-1].lower()
 
@@ -428,62 +431,6 @@ def parse_feed(feed_url, feed_kind):
     return output
 
 
-def fetch_bse_direct_order_announcements():
-    ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
-    today_str = ist_now.strftime("%Y%m%d")
-    yesterday_str = (ist_now - timedelta(days=1)).strftime("%Y%m%d")
-
-    api_urls = [
-        (
-            "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
-            f"?pageno=1&strCat=Company+Update&strPrevDate={yesterday_str}"
-            f"&strScrip=&strSearch=P&strToDate={today_str}&strType=C"
-            "&subcategory=Award+of+Order+%2F+Receipt+of+Order"
-        ),
-        (
-            "https://api.bseindia.com/BseIndiaAPI/api/AnnGetData/w"
-            f"?strCat=Company+Update&strPrevDate={today_str}"
-            f"&strScrip=&strSearch=P&strToDate={today_str}&strType=C"
-        ),
-    ]
-
-    orders = []
-    for api_url in api_urls:
-        try:
-            res = get_url(api_url)
-            data = res.json()
-            table = data.get("Table", []) if isinstance(data, dict) else []
-            for row in table:
-                comp_name = str(row.get("SLONGNAME") or "").strip()
-                scrip = str(row.get("SCRIP_CD") or "").strip()
-                headline = str(row.get("NEWSSUB") or "").strip()
-                more_desc = str(row.get("MORE") or "").strip()
-                subcat = str(row.get("SUBCATNAME") or "").strip()
-                att_name = str(row.get("ATTACHMENTNAME") or "").strip()
-                news_id = str(row.get("NEWSID") or "").strip()
-                dt_tm = str(row.get("DT_TM") or "").strip()
-
-                full_text_check = f"{headline} {more_desc} {subcat}".lower()
-                if "order" not in full_text_check and "contract" not in full_text_check and "award" not in full_text_check and "loa" not in full_text_check:
-                    continue
-
-                pdf_link = f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{att_name}" if att_name else ""
-                display_title = f"{comp_name} ({scrip})" if comp_name and scrip else (comp_name or headline)
-                full_desc = f"{headline}. {more_desc}".strip()
-
-                orders.append({
-                    "kind": "order",
-                    "title": display_title,
-                    "description": full_desc,
-                    "link": pdf_link,
-                    "guid": news_id or pdf_link or display_title,
-                    "published": dt_tm,
-                })
-        except Exception as exc:
-            log.warning("Direct BSE Order API check warning: %s", exc)
-    return orders
-
-
 # ---------------- DOCUMENT EXTRACTION (TEXT + RAW PDF BYTES FOR VISION OCR) ----------------
 def clean_text(value):
     value = value.replace("\x00", " ")
@@ -509,8 +456,7 @@ def extract_html_text(html_str):
 
 
 def get_document_payload(item):
-    """PDF ના ટેક્સ્ટ ઉપરાંત રૉ PDF બાઇટ્સ પણ આપશે જેથી સ્કેન કરેલી PDF પણ Gemini Vision વાંચી શકે"""
-    parts = []
+    parts = [f"COMPANY TITLE: {item['title']}"]
     pdf_bytes = None
     if item["description"]:
         parts.append("FEED DESCRIPTION:\n" + item["description"])
@@ -519,8 +465,8 @@ def get_document_payload(item):
     if url:
         path = urlparse(url).path.lower()
         try:
-            response = get_url(url)
             if path.endswith(".pdf"):
+                response = get_url(url)
                 pdf_bytes = response.content
                 text_parts = []
                 with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
@@ -534,15 +480,17 @@ def get_document_payload(item):
                 if extracted:
                     parts.append("EXTRACTED PDF TEXT:\n" + extracted)
             elif path.endswith((".xml", ".xbrl")):
+                response = get_url(url)
                 extracted = extract_xml_text(response.content)
                 if extracted:
                     parts.append("EXTRACTED XML TEXT:\n" + extracted)
             elif path.endswith((".html", ".htm")):
+                response = get_url(url)
                 extracted = extract_html_text(response.text)
                 if extracted:
                     parts.append("EXTRACTED HTML TEXT:\n" + extracted)
         except Exception as exc:
-            log.warning("Attachment download/extraction warning for %s: %s", url, exc)
+            log.warning("Attachment download warning for %s: %s", url, exc)
 
     return clean_text("\n\n".join(parts))[:MAX_TEXT_CHARS], pdf_bytes
 
@@ -602,18 +550,15 @@ def compute_metric_dict(curr_val, prev_val):
 
 
 def ensure_valid_result_numbers(ai_data, screener_info):
-    """જો PDF સ્કેન હોવાને લીધે કે અન્ય કારણસર કોઈ આંકડો N/A કે 0 આવ્યો હોય, તો Screener ડેટા પરથી આપમેળે ભરી દેશે"""
     rev = ai_data.get("revenue") or {}
     gp = ai_data.get("gross_profit") or {}
     np_d = ai_data.get("net_profit") or {}
 
-    # Check if Revenue is missing/zero and Screener has quarters
     q_rev_all = screener_info.get("q_all_rev", [])
     q_gp_all = screener_info.get("q_all_gp", [])
     q_np_all = screener_info.get("q_all_np", [])
     q_lbl_all = screener_info.get("q_all_labels", [])
 
-    # Determine comparison index: YoY (index -5) if available, else QoQ (index -2)
     def pick_curr_prev(arr):
         if len(arr) >= 5:
             return arr[-1], arr[-5]
@@ -656,7 +601,7 @@ def analyze_with_gemini_json(company_title, doc_type, source_text, pdf_bytes, sc
 
     prompt = f"""
 You are the Chief Financial Analyst for 'MarketMunafa'.
-Analyze the attached BSE corporate filing ({doc_type.upper()}) PDF and Screener fundamentals data.
+Analyze the attached BSE corporate filing ({doc_type.upper()}) and Screener fundamentals data.
 
 CRITICAL RULES:
 1. All English fields MUST be 100% in English (zero Gujarati words in English fields). Only 'gujarati_summary' and 'gujarati_intraday_view' must be in Gujarati.
@@ -664,7 +609,7 @@ CRITICAL RULES:
    - Read the financial table from the attached PDF carefully (even if it is a scanned image).
    - UNIT CONVERSION: If the PDF table says "(Rs. in Lakhs)" or "(Rs. in Lacs)", divide every number by 100 to convert into Rs. Crores (e.g., 3,450 Lakhs = 34.50 Cr). If "(Rs. in Millions)", divide by 10. Keep up to 2 decimal places for figures under 100 Cr.
    - If "Gross Profit" is not explicitly labeled in the PDF statement, compute it as (Revenue from Operations minus Cost of Materials/Operating Expenses) OR use Operating Profit (EBITDA) / Profit Before Tax (PBT).
-   - If the PDF is unreadable, use the latest quarter and YoY quarter numbers from "Screener Historical Quarters" provided below!
+   - If no PDF is attached or it is unreadable, use the latest quarter and YoY quarter numbers from "Screener Historical Quarters" provided below!
 
 Company Headline: {company_title}
 Document Type: {doc_type}
@@ -734,11 +679,10 @@ Return ONLY a valid JSON object with this exact structure:
   "gujarati_intraday_view": "1-2 sentences in natural Gujarati explaining debt, valuation, and expected return."
 }}
 
-Extracted Text from Filing (if any):
+Extracted Text from Filing:
 {source_text[:MAX_TEXT_CHARS]}
 """
     response = None
-    # Pass raw PDF bytes to Gemini Vision so scanned image PDFs are read via OCR
     if pdf_bytes and len(pdf_bytes) < 18 * 1024 * 1024:
         try:
             pdf_part = {"mime_type": "application/pdf", "data": pdf_bytes}
@@ -926,7 +870,6 @@ def build_post_html(data, doc_type, screener_info, source_url):
 
     content_blocks = []
 
-    # 1. ORDER LAYOUT (Only Order Card + Fundamentals)
     if doc_type == "order":
         ord_info = data.get("order_details", {}) or {}
         client_str = html.escape(str(ord_info.get("client_or_awarder", "Disclosed in Filing")))
@@ -946,8 +889,6 @@ def build_post_html(data, doc_type, screener_info, source_url):
         """
         content_blocks.append(order_card)
         yoy_chart_url = ""
-
-    # 2. RESULT LAYOUT (Mobile-Friendly Result Table + Both Labeled Column Charts)
     else:
         rev = data.get("revenue", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
         gp = data.get("gross_profit", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
@@ -1027,7 +968,6 @@ def build_post_html(data, doc_type, screener_info, source_url):
         """
         content_blocks.append(result_card)
 
-    # 3. COMMON FUNDAMENTALS BLOCK
     fundamentals_card = f"""
     <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 20px; box-shadow: 0 4px 14px rgba(0,0,0,0.05); margin-bottom: 24px;">
       <h3 style="margin: 0 0 16px 0; font-size: 20px; color: #0f172a;">Fundamentals (All 10 Indicators)</h3>
@@ -1296,10 +1236,6 @@ def run():
     init_db()
     all_items = []
 
-    direct_orders = fetch_bse_direct_order_announcements()
-    log.info("Direct BSE Order API: %d items", len(direct_orders))
-    all_items.extend(direct_orders)
-
     for kind, feed_url in FEEDS.items():
         try:
             items = parse_feed(feed_url, kind)
@@ -1339,14 +1275,14 @@ def run():
         log.info("Processing %s: %s", doc_type, item["title"])
         try:
             source_text, pdf_bytes = get_document_payload(item)
-            if not pdf_bytes and len(source_text) < 80:
-                log.warning("Skipped: no PDF and insufficient text: %s", item["title"])
+            screener_info = get_screener_fundamentals(item["title"])
+
+            if doc_type == "result" and not pdf_bytes and not screener_info["q_all_rev"] and len(source_text) < 120:
+                log.warning("Skipped: no PDF and no Screener quarterly data for %s", item["title"])
                 continue
 
-            screener_info = get_screener_fundamentals(item["title"])
             ai_data = analyze_with_gemini_json(item["title"], doc_type, source_text, pdf_bytes, screener_info)
 
-            # જો રિઝલ્ટ પોસ્ટ હોય અને PDF તેમજ Screener બંનેમાંથી એક પણ આંકડો ન મળે તો ખાલી N/A પોસ્ટ ન કરવી
             if doc_type == "result":
                 r_curr = to_float(ai_data.get("revenue", {}).get("curr"))
                 np_curr = to_float(ai_data.get("net_profit", {}).get("curr"))
