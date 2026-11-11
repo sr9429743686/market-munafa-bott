@@ -9,7 +9,7 @@ import sqlite3
 import tempfile
 import warnings
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
 
 warnings.filterwarnings("ignore")
@@ -32,11 +32,10 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9086072964:AAEUyn-GAyJLdsY
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "430834857").strip()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel(GEMINI_MODEL)
 
 FEEDS = {
     "result": "https://www.bseindia.com/Data/XML/FinancialResultsFeed.aspx",
@@ -45,6 +44,7 @@ FEEDS = {
 
 DB_PATH = os.getenv("DB_PATH", "marketmunafa_seen.sqlite3")
 MAX_ITEMS_PER_FEED = int(os.getenv("MAX_ITEMS_PER_FEED", "100"))
+MAX_BLOG_POSTS_TO_SCAN = int(os.getenv("MAX_BLOG_POSTS_TO_SCAN", "500"))
 MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "12"))
 MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "15000"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
@@ -58,18 +58,51 @@ logging.basicConfig(
 log = logging.getLogger("marketmunafa")
 
 
-# ---------------- DUPLICATE PROTECTION & STORAGE ----------------
+# ---------------- STRICT DUPLICATE PROTECTION & COMPANY KEY NORMALIZATION ----------------
+STOP_WORDS_REGEX = re.compile(
+    r"\b("
+    r"q1|q2|q3|q4|fy\d+|fy\d{2}-\d{2}|h1|h2|9m|results|result|order|orders|contract|contracts|"
+    r"consolidated|standalone|pat|net|profit|revenue|sales|income|ebitda|growth|yoy|qoq|"
+    r"jumps|surges|rises|soars|falls|drops|declines|slips|reports|posts|posted|announces|declared|"
+    r"bags|wins|secures|receives|received|awarded|award|worth|rs|inr|cr|crore|crores|lakh|lakhs|"
+    r"analysis|update|updates|valuation|share|shares|stock|price|target|marketmunafa|"
+    r"ltd|limited|india|indian|industries|industry|pvt|private|corp|corporation|company|co|"
+    r"enterprises|enterprise|international|global|solutions|technologies|technology|tech|"
+    r"finance|financial|services|projects|infra|infrastructure|power|energy|pharma|pharmaceuticals|"
+    r"chemicals|chemical|steel|motors|motor|bank|holding|holdings|group|commercial|trading|exports"
+    r")\b",
+    flags=re.I,
+)
+
+
+def extract_scrip_code(text):
+    if not text:
+        return ""
+    m = re.search(r"\b(5\d{5})\b", str(text))
+    return m.group(1) if m else ""
+
+
+def clean_company_core_name(raw_title):
+    if not raw_title:
+        return ""
+    clean = html.unescape(str(raw_title))
+    clean = re.sub(r"\(\d+\)", " ", clean)
+    clean = clean.split("|")[0].split(":")[0].split(" - ")[0].split(" – ")[0]
+    clean = re.sub(r"\b\d+(?:\.\d+)?%?\b", " ", clean)
+    clean = STOP_WORDS_REGEX.sub(" ", clean)
+    words = [re.sub(r"[^a-zA-Z]", "", w).lower() for w in clean.split()]
+    words = [w for w in words if len(w) >= 2]
+    if not words:
+        fallback = re.sub(r"[^a-zA-Z0-9]", "", str(raw_title).split()[0] if str(raw_title).split() else "").lower()
+        return fallback
+    return "".join(words[:2])
+
+
 def normalize_company_key(title, doc_type=""):
-    clean = re.sub(r"\(\d+\)", "", str(title))
-    clean = clean.split("|")[0].split(":")[0].split("-")[0]
-    clean = re.sub(
-        r"\b(q1|q2|q3|q4|fy\d+|h1|h2|results|result|order|orders|contract|ltd|limited|india|industries|pvt|private|corp|corporation)\b",
-        "",
-        clean,
-        flags=re.I,
-    )
-    clean = re.sub(r"[^a-zA-Z0-9]", "", clean).lower()
-    return f"{doc_type}_{clean}" if doc_type and clean else clean
+    core = clean_company_core_name(title)
+    if not core:
+        return ""
+    return f"{doc_type}_{core}" if doc_type else core
 
 
 def extract_file_key(url):
@@ -88,24 +121,22 @@ def init_db():
             CREATE TABLE IF NOT EXISTS posted (
                 item_id TEXT PRIMARY KEY,
                 company_key TEXT,
+                scrip_key TEXT,
                 file_key TEXT,
                 title TEXT,
                 source_url TEXT,
                 posted_at TEXT
             )
         """)
-        try:
-            conn.execute("ALTER TABLE posted ADD COLUMN company_key TEXT")
-        except sqlite3.OperationalError:
-            pass
-        try:
-            conn.execute("ALTER TABLE posted ADD COLUMN file_key TEXT")
-        except sqlite3.OperationalError:
-            pass
+        for col in ("company_key", "scrip_key", "file_key"):
+            try:
+                conn.execute(f"ALTER TABLE posted ADD COLUMN {col} TEXT")
+            except sqlite3.OperationalError:
+                pass
         conn.commit()
 
 
-def was_posted_in_db(item_id, comp_key, file_key):
+def was_posted_in_db(item_id, comp_key, scrip_key, file_key):
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
             """
@@ -113,20 +144,21 @@ def was_posted_in_db(item_id, comp_key, file_key):
             WHERE item_id = ? 
                OR (file_key != '' AND file_key = ?)
                OR (company_key != '' AND company_key = ?)
+               OR (scrip_key != '' AND scrip_key = ?)
             """,
-            (item_id, file_key, comp_key),
+            (item_id, file_key, comp_key, scrip_key),
         ).fetchone()
         return row is not None
 
 
-def mark_posted(item_id, comp_key, file_key, title, source_url):
+def mark_posted(item_id, comp_key, scrip_key, file_key, title, source_url):
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             """
-            INSERT OR IGNORE INTO posted(item_id, company_key, file_key, title, source_url, posted_at)
-            VALUES(?, ?, ?, ?, ?, ?)
+            INSERT OR IGNORE INTO posted(item_id, company_key, scrip_key, file_key, title, source_url, posted_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?)
             """,
-            (item_id, comp_key, file_key, title, source_url, datetime.now(timezone.utc).isoformat()),
+            (item_id, comp_key, scrip_key, file_key, title, source_url, datetime.now(timezone.utc).isoformat()),
         )
         conn.commit()
 
@@ -134,14 +166,15 @@ def mark_posted(item_id, comp_key, file_key, title, source_url):
 def get_url(url, extra_headers=None):
     last_error = None
     profiles = ["chrome120", "chrome110", "edge101", "chrome104"]
-    
+
     for attempt in range(3):
         try:
             profile = profiles[attempt % len(profiles)]
             headers = {
-                "Accept": "application/rss+xml, application/xml, text/xml, application/pdf, text/html, */*",
+                "Accept": "application/json, application/rss+xml, application/xml, text/xml, application/pdf, text/html, */*",
                 "Accept-Language": "en-US,en;q=0.9",
                 "Referer": "https://www.bseindia.com/",
+                "Origin": "https://www.bseindia.com",
             }
             if extra_headers:
                 headers.update(extra_headers)
@@ -187,7 +220,7 @@ def get_screener_fundamentals(comp_title):
     clean_name = clean_name.split("-")[0].strip()
     clean_name = re.sub(r"\b(ltd|limited|india|industries|corp|corporation|pvt)\b", "", clean_name, flags=re.I).strip()
     words = [w for w in clean_name.split() if len(w) > 1]
-    
+
     queries = [clean_name]
     if len(words) >= 2:
         queries.append(" ".join(words[:2]))
@@ -195,6 +228,7 @@ def get_screener_fundamentals(comp_title):
         queries.append(words[0])
 
     info = {
+        "screener_company_name": "",
         "price_str": "Live on BSE",
         "market_cap": "N/A",
         "pe_ratio": "N/A",
@@ -233,7 +267,9 @@ def get_screener_fundamentals(comp_title):
             search_url = f"https://www.screener.in/api/company/search/?q={urllib.parse.quote(q)}"
             res = c_requests.get(search_url, impersonate="chrome120", timeout=12)
             if res.status_code == 200 and isinstance(res.json(), list) and len(res.json()) > 0:
-                comp_url = "https://www.screener.in" + res.json()[0]["url"]
+                first_hit = res.json()[0]
+                info["screener_company_name"] = str(first_hit.get("name") or "").strip()
+                comp_url = "https://www.screener.in" + first_hit["url"]
                 c_res = c_requests.get(comp_url, impersonate="chrome120", timeout=15)
                 if c_res.status_code != 200:
                     continue
@@ -245,7 +281,7 @@ def get_screener_fundamentals(comp_title):
                         t = " ".join(li.get_text(" ", strip=True).split())
                         num_span = li.find("span", class_="number")
                         num_txt = num_span.get_text(strip=True) if num_span else ""
-                        
+
                         if "Current Price" in t and num_txt:
                             info["price_str"] = f"₹{num_txt}"
                         elif "Market Cap" in t and num_txt:
@@ -360,7 +396,7 @@ def get_screener_fundamentals(comp_title):
     return info
 
 
-# ---------------- BSE XML FEED PARSING ----------------
+# ---------------- BSE DIRECT JSON API + XML FEED PARSING ----------------
 def local_name(tag):
     return tag.rsplit("}", 1)[-1].lower()
 
@@ -386,13 +422,75 @@ def extract_links_from_xml_item(item):
 
 def is_mutual_fund_nav_spam(title, description, scripcode=""):
     t_low = (title + " " + description).lower()
-    if scripcode.startswith("90") and len(scripcode) >= 6:
+    if str(scripcode).startswith("90") and len(str(scripcode)) >= 6:
         return True
     spam_phrases = (
         "nav as on", "nav as of", "current expense ratio", "monthly portfolio",
         "idcw reinvest", "direct plan - growth", "regular plan - growth",
     )
     return any(p in t_low for p in spam_phrases)
+
+
+def fetch_bse_json_announcements():
+    """Fetches latest Results and Company Updates directly from BSE Official JSON API."""
+    ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    today_str = ist_now.strftime("%Y%m%d")
+    prev_str = (ist_now - timedelta(days=1)).strftime("%Y%m%d")
+
+    categories = [
+        ("result", "Result"),
+        ("announcement", "Company+Update"),
+    ]
+    output = []
+
+    for kind, cat in categories:
+        api_url = (
+            f"https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
+            f"?pageno=1&strCat={cat}&strPrevDate={prev_str}&strScrip=&strSearch=P&strToDate={today_str}&strType=C&subcategory=-1"
+        )
+        try:
+            res = get_url(api_url)
+            data = res.json()
+            rows = data.get("Table", []) if isinstance(data, dict) else []
+            count = 0
+            for r in rows:
+                comp = str(r.get("SLONGNAME") or "").strip()
+                scrip = str(r.get("SCRIP_CD") or "").strip()
+                sub = str(r.get("NEWSSUB") or "").strip()
+                head = str(r.get("HEADLINE") or "").strip()
+                more = str(r.get("MORE") or "").strip()
+                subcat = str(r.get("SUBCATNAME") or "").strip()
+                attach = str(r.get("ATTACHMENTNAME") or "").strip()
+                news_id = str(r.get("NEWSID") or "").strip()
+
+                title = f"{comp} ({scrip}) - {sub}" if comp else sub
+                desc = " | ".join(filter(None, [subcat, head, more]))
+
+                if not title or is_mutual_fund_nav_spam(title, desc, scrip):
+                    continue
+
+                pdf_link = f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{attach}" if attach else ""
+                item_kind = "result" if (kind == "result" or "result" in subcat.lower()) else "announcement"
+
+                output.append({
+                    "kind": item_kind,
+                    "title": html.unescape(re.sub(r"<[^>]+>", " ", title)).strip(),
+                    "company_raw": comp,
+                    "scrip_code": scrip,
+                    "description": html.unescape(re.sub(r"<[^>]+>", " ", desc)).strip(),
+                    "link": pdf_link,
+                    "attachment_name": attach,
+                    "guid": news_id or pdf_link or title,
+                    "published": str(r.get("DissemDT") or r.get("NEWS_DT") or ""),
+                })
+                count += 1
+                if count >= MAX_ITEMS_PER_FEED:
+                    break
+            log.info("BSE JSON API (%s): %d items fetched", cat, count)
+        except Exception as exc:
+            log.warning("BSE JSON API warning (%s): %s", cat, exc)
+
+    return output
 
 
 def parse_feed(feed_url, feed_kind):
@@ -404,7 +502,7 @@ def parse_feed(feed_url, feed_kind):
     for node in items:
         title = child_text(node, {"title"})
         description = child_text(node, {"description", "summary", "content", "encoded"})
-        scrip = child_text(node, {"scripcode"})
+        scrip = child_text(node, {"scripcode"}) or extract_scrip_code(title)
         guid = child_text(node, {"guid", "id"})
         links = extract_links_from_xml_item(node)
 
@@ -418,11 +516,17 @@ def parse_feed(feed_url, feed_kind):
         elif links:
             link = links[0]
 
+        clean_t = html.unescape(re.sub(r"<[^>]+>", " ", title)).strip()
+        comp_raw = clean_t.split("-")[0].split(":")[0].strip()
+
         output.append({
             "kind": feed_kind,
-            "title": html.unescape(re.sub(r"<[^>]+>", " ", title)).strip(),
+            "title": clean_t,
+            "company_raw": comp_raw,
+            "scrip_code": str(scrip).strip(),
             "description": html.unescape(re.sub(r"<[^>]+>", " ", description)).strip(),
             "link": urljoin(feed_url, link) if link else "",
+            "attachment_name": "",
             "guid": guid or link or title,
             "published": child_text(node, {"pubdate", "published", "updated", "date"}),
         })
@@ -462,11 +566,21 @@ def get_document_payload(item):
         parts.append("FEED DESCRIPTION:\n" + item["description"])
 
     url = item["link"]
+    attach_name = item.get("attachment_name", "")
+
     if url:
         path = urlparse(url).path.lower()
         try:
             if path.endswith(".pdf"):
-                response = get_url(url)
+                try:
+                    response = get_url(url)
+                except Exception:
+                    if attach_name and "AttachLive" in url:
+                        fallback_url = f"https://www.bseindia.com/xml-data/corpfiling/AttachHis/{attach_name}"
+                        response = get_url(fallback_url)
+                        item["link"] = fallback_url
+                    else:
+                        raise
                 pdf_bytes = response.content
                 text_parts = []
                 with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
@@ -508,17 +622,21 @@ ORDER_WORDS = (
     "order worth", "orders worth", "bagged an order", "secured an order",
     "arbitral award", "orders / contracts", "order / contract",
 )
+IGNORE_NON_RESULT_PHRASES = (
+    "analyst / investor meet", "investor meet", "earning call", "earnings call",
+    "conference call", "audio recording", "transcript of", "prior intimation",
+    "is scheduled on", "newspaper publication", "newspaper advertisement",
+    "closure of trading window", "trading window", "loss of share certificate",
+    "postal ballot", "scrutinizer report", "annual report", "related party transactions",
+)
 
 
 def classify_item(item):
-    if item["kind"] == "order":
-        return "order"
     title_desc = (item["title"] + " " + item["description"]).lower()
     if any(word in title_desc for word in ORDER_WORDS):
         return "order"
-    if "prior intimation" in title_desc or "is scheduled on" in title_desc or "newspaper publication" in title_desc:
-        if item["kind"] != "result":
-            return ""
+    if any(bad in title_desc for bad in IGNORE_NON_RESULT_PHRASES):
+        return ""
     if item["kind"] == "result" or any(word in title_desc for word in RESULT_WORDS):
         return "result"
     return ""
@@ -595,6 +713,54 @@ def ensure_valid_result_numbers(ai_data, screener_info):
     return ai_data
 
 
+# ---------------- DYNAMIC GEMINI MODEL DISCOVERY & FALLBACK ----------------
+_CACHED_WORKING_MODEL = None
+
+
+def get_candidate_gemini_models():
+    candidates = [
+        GEMINI_MODEL,
+        "gemini-3.8-flash",
+        "gemini-3.0-flash",
+        "gemini-3-flash-preview",
+        "gemini-3.1-flash-lite-preview",
+        "gemini-flash-latest",
+    ]
+    try:
+        for m in genai.list_models():
+            methods = getattr(m, "supported_generation_methods", []) or []
+            if "generateContent" in methods:
+                short_name = m.name.replace("models/", "")
+                if "gemini" in short_name.lower() and "tts" not in short_name.lower() and "image" not in short_name.lower():
+                    candidates.append(short_name)
+    except Exception as exc:
+        log.warning("Could not list Gemini models dynamically: %s", exc)
+
+    return list(dict.fromkeys(c for c in candidates if c))
+
+
+def call_gemini_with_fallback(contents):
+    global _CACHED_WORKING_MODEL
+    models_to_try = get_candidate_gemini_models()
+    if _CACHED_WORKING_MODEL and _CACHED_WORKING_MODEL in models_to_try:
+        models_to_try.remove(_CACHED_WORKING_MODEL)
+        models_to_try.insert(0, _CACHED_WORKING_MODEL)
+
+    last_err = None
+    for m_name in models_to_try:
+        try:
+            model = genai.GenerativeModel(m_name)
+            resp = model.generate_content(contents)
+            if _CACHED_WORKING_MODEL != m_name:
+                log.info("Using active Gemini model: %s", m_name)
+                _CACHED_WORKING_MODEL = m_name
+            return resp
+        except Exception as exc:
+            last_err = exc
+            log.warning("Model %s failed, trying next fallback: %s", m_name, exc)
+    raise RuntimeError(f"All Gemini models failed: {last_err}")
+
+
 def analyze_with_gemini_json(company_title, doc_type, source_text, pdf_bytes, screener_info):
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not configured")
@@ -603,10 +769,13 @@ def analyze_with_gemini_json(company_title, doc_type, source_text, pdf_bytes, sc
 You are the Chief Financial Analyst for 'MarketMunafa'.
 Analyze the attached BSE corporate filing ({doc_type.upper()}) and Screener fundamentals data.
 
-CRITICAL RULES:
-1. All English fields MUST be 100% in English (zero Gujarati words in English fields). Only 'gujarati_summary' and 'gujarati_intraday_view' must be in Gujarati.
-2. NEVER return "N/A" for Revenue, Gross Profit, or Net Profit in a 'result' filing!
-   - Read the financial table from the attached PDF carefully (even if it is a scanned image).
+STRICT RULES FOR CONSOLIDATED & YOY DATA EXTRACTION:
+1. EXCLUDE STANDALONE: Completely ignore any 'Standalone' financial figures if 'Consolidated' figures are present in the PDF. Always look for the 'Consolidated Financial Results' table first. Only use Standalone if the company has no subsidiaries and does not report Consolidated numbers at all.
+2. FOCUS ON CONSOLIDATED PAT: For 'net_profit', strictly extract Consolidated Net Profit / Profit After Tax (PAT) for the period.
+3. STRICTLY YOY GROWTH: Always compare the latest quarter ('curr') against the SAME QUARTER LAST YEAR ('prev' - Year-on-Year / YoY), NOT the preceding quarter (QoQ), so that numbers match major financial portals 100%.
+4. All English fields MUST be 100% in English (zero Gujarati words in English fields). Only 'gujarati_summary' and 'gujarati_intraday_view' must be in Gujarati.
+5. NEVER return "N/A" for Revenue, Gross Profit, or Net Profit in a 'result' filing!
+   - Read the Consolidated financial table from the attached PDF carefully (even if it is a scanned image).
    - UNIT CONVERSION: If the PDF table says "(Rs. in Lakhs)" or "(Rs. in Lacs)", divide every number by 100 to convert into Rs. Crores (e.g., 3,450 Lakhs = 34.50 Cr). If "(Rs. in Millions)", divide by 10. Keep up to 2 decimal places for figures under 100 Cr.
    - If "Gross Profit" is not explicitly labeled in the PDF statement, compute it as (Revenue from Operations minus Cost of Materials/Operating Expenses) OR use Operating Profit (EBITDA) / Profit Before Tax (PBT).
    - If no PDF is attached or it is unreadable, use the latest quarter and YoY quarter numbers from "Screener Historical Quarters" provided below!
@@ -635,14 +804,14 @@ Screener Annual YoY Data (in Rs. Cr.):
 
 Return ONLY a valid JSON object with this exact structure:
 {{
-  "seo_title": "Catchy Google News SEO Title in 100% English (under 110 chars)",
+  "seo_title": "Catchy Google News SEO Title in 100% English starting with Company Name and highlighting Consolidated PAT & YoY Growth (under 110 chars)",
   "company_short_name": "Clean Company Name in English",
-  "result_date": "Date of filing in English (e.g. November 10, 2026)",
+  "result_date": "Date of filing in English (e.g. November 11, 2026)",
   "price_display": "{screener_info['price_str']}",
   "quarter_label": "e.g. Q2 FY26-27",
   "curr_period_label": "e.g. Sep 26",
   "prev_period_label": "e.g. Sep 25",
-  "result_type": "Consolidated or Standalone",
+  "result_type": "Consolidated",
   "revenue": {{"curr": "36.76", "prev": "27.15", "growth": "+35.4%", "difference": "+9.61 Cr"}},
   "gross_profit": {{"curr": "14.24", "prev": "7.75", "growth": "+83.7%", "difference": "+6.49 Cr"}},
   "net_profit": {{"curr": "11.27", "prev": "6.89", "growth": "+63.6%", "difference": "+4.38 Cr"}},
@@ -672,10 +841,10 @@ Return ONLY a valid JSON object with this exact structure:
   "quarter_chart_gross_profit": [7.1, 7.75, 7.9, 8.6, 10.2, 14.24],
   "quarter_chart_net_profit": [5.45, 6.89, 5.83, 7.51, 9.02, 11.27],
   "seo_article_paragraphs": [
-    "Paragraph 1 (80-100 words in 100% English): Journalistic breakdown of the financial result OR new order receipt.",
+    "Paragraph 1 (80-100 words in 100% English): Journalistic breakdown of the Consolidated financial result (YoY comparison) OR new order receipt.",
     "Paragraph 2 (80-100 words in 100% English): Fundamental valuation analysis covering Market Cap, P/E, ROE, EPS, Book Value, Debt-to-Equity, and expected return."
   ],
-  "gujarati_summary": "2-3 sentences in natural Gujarati summarizing the result or new order.",
+  "gujarati_summary": "2-3 sentences in natural Gujarati summarizing the Consolidated result (YoY) or new order.",
   "gujarati_intraday_view": "1-2 sentences in natural Gujarati explaining debt, valuation, and expected return."
 }}
 
@@ -686,12 +855,12 @@ Extracted Text from Filing:
     if pdf_bytes and len(pdf_bytes) < 18 * 1024 * 1024:
         try:
             pdf_part = {"mime_type": "application/pdf", "data": pdf_bytes}
-            response = gemini_model.generate_content([prompt, pdf_part])
+            response = call_gemini_with_fallback([prompt, pdf_part])
         except Exception as exc:
             log.warning("Multimodal PDF OCR fallback to text prompt: %s", exc)
 
     if response is None:
-        response = gemini_model.generate_content(prompt)
+        response = call_gemini_with_fallback(prompt)
 
     raw = (response.text or "").strip()
     match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
@@ -800,7 +969,7 @@ def build_yoy_comparison_chart_url(comp_name, qtr_lbl, prev_lbl, curr_lbl, rev, 
             "layout": {"padding": {"top": 26, "right": 14, "left": 10, "bottom": 8}},
             "title": {
                 "display": True,
-                "text": f"{comp_name} - {qtr_lbl} (Rs.Cr.)",
+                "text": f"{comp_name} - {qtr_lbl} YoY (Rs.Cr.)",
                 "fontSize": 17,
                 "fontColor": "#475569",
                 "padding": 14,
@@ -831,14 +1000,14 @@ def build_yoy_comparison_chart_url(comp_name, qtr_lbl, prev_lbl, curr_lbl, rev, 
     return f"https://quickchart.io/chart?w=750&h=420&bkg=white&c={encoded}"
 
 
-def build_post_html(data, doc_type, screener_info, source_url):
+def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scrip_key="", file_key=""):
     comp_name = html.escape(str(data.get("company_short_name", "Company")))
     res_date = html.escape(str(data.get("result_date", datetime.now().strftime("%B %d, %Y"))))
     price_disp = html.escape(str(data.get("price_display", screener_info["price_str"])))
     qtr_lbl = html.escape(str(data.get("quarter_label", "Q2 FY26-27")))
     curr_lbl = html.escape(str(data.get("curr_period_label", "Sep 26")))
     prev_lbl = html.escape(str(data.get("prev_period_label", "Sep 25")))
-    res_type = html.escape(str(data.get("result_type", "Standalone")))
+    res_type = html.escape(str(data.get("result_type", "Consolidated")))
 
     mkt_cap = html.escape(str(data.get("market_cap") or screener_info["market_cap"]))
     pe_ratio = html.escape(str(data.get("pe_ratio") or screener_info["pe_ratio"]))
@@ -899,7 +1068,7 @@ def build_post_html(data, doc_type, screener_info, source_url):
         q_rev = data.get("quarter_chart_revenue") or screener_info["q_rev"] or [to_float(rev.get("prev")), to_float(rev.get("curr"))]
         q_gp = data.get("quarter_chart_gross_profit") or screener_info["q_gp"] or [to_float(gp.get("prev")), to_float(gp.get("curr"))]
         q_np = data.get("quarter_chart_net_profit") or screener_info["q_np"] or [to_float(np_d.get("prev")), to_float(np_d.get("curr"))]
-        
+
         quarter_chart_url = build_quarterly_column_chart_url(comp_name, q_labels, q_rev, q_gp, q_np)
         yoy_chart_url = build_yoy_comparison_chart_url(comp_name, qtr_lbl, prev_lbl, curr_lbl, rev, gp, np_d, debt_comp)
 
@@ -923,7 +1092,7 @@ def build_post_html(data, doc_type, screener_info, source_url):
                 <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">{curr_lbl}</th>
                 <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">{prev_lbl}</th>
                 <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">Diff</th>
-                <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">Growth</th>
+                <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">YoY Growth</th>
               </tr>
             </thead>
             <tbody>
@@ -942,7 +1111,7 @@ def build_post_html(data, doc_type, screener_info, source_url):
                 <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap; color: {growth_color(gp.get('growth', ''))};">{html.escape(str(gp.get('growth', '0%')))}</td>
               </tr>
               <tr>
-                <td style="padding: 12px 4px; color: #1e293b; font-weight: 500; white-space: nowrap;">Net Profit</td>
+                <td style="padding: 12px 4px; color: #1e293b; font-weight: 500; white-space: nowrap;">Net Profit (PAT)</td>
                 <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap;">{html.escape(str(np_d.get('curr', '0')))}</td>
                 <td style="padding: 12px 4px; text-align: right; color: #475569; white-space: nowrap;">{html.escape(str(np_d.get('prev', '0')))}</td>
                 <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: #0f172a; white-space: nowrap;">{html.escape(str(np_d.get('difference', '0')))}</td>
@@ -958,7 +1127,7 @@ def build_post_html(data, doc_type, screener_info, source_url):
         </div>
         
         <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 18px; margin-bottom: 24px; text-align: center; box-shadow: 0 4px 14px rgba(0,0,0,0.04);">
-          <h3 style="margin: 0 0 12px 0; font-size: 19px; color: #0f172a;">📈 Previous vs Current Year Result & Debt Chart</h3>
+          <h3 style="margin: 0 0 12px 0; font-size: 19px; color: #0f172a;">📈 Previous vs Current Year Result & Debt Chart (YoY)</h3>
           <img src="{yoy_chart_url}" alt="YoY Column Chart" style="max-width: 100%; height: auto; border-radius: 8px;" />
         </div>
         <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 18px; margin-bottom: 24px; text-align: center; box-shadow: 0 4px 14px rgba(0,0,0,0.04);">
@@ -1018,7 +1187,12 @@ def build_post_html(data, doc_type, screener_info, source_url):
     """
     content_blocks.append(fundamentals_card)
 
+    meta_comment = (
+        f"<!-- MM_META:type={doc_type}|comp_key={comp_key}|scrip={scrip_key}|file={file_key}|comp_name={comp_name} -->"
+    )
+
     html_body = f"""
+    {meta_comment}
     <article style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 680px; margin: 0 auto; color: #1e293b;">
       <figure style="margin: 0 0 22px 0; text-align: center;">
         <img src="{thumb_url}" alt="{comp_name} Corporate Update" style="width: 100%; max-height: 360px; object-fit: cover; border-radius: 12px;" />
@@ -1077,15 +1251,15 @@ def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, 
             f"• <b>કામની વિગત:</b> {html.escape(str(ord_info.get('scope_of_work', '-')))}\n\n"
         )
     else:
-        header_title = f"📊 <b>{comp_name} - {qtr_lbl} રિઝલ્ટ અપડેટ</b>"
+        header_title = f"📊 <b>{comp_name} - {qtr_lbl} Consolidated રિઝલ્ટ અપડેટ</b>"
         rev = data.get("revenue", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
         gp = data.get("gross_profit", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
         np_d = data.get("net_profit", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
         dynamic_block_gu = (
-            f"📈 <b>નાણાકીય કામગીરી ({curr_lbl} vs {prev_lbl}):</b>\n"
-            f"• <b>આવક (Revenue):</b> ₹{html.escape(str(rev.get('curr', '0')))} Cr (તફાવત: {html.escape(str(rev.get('difference', '0')))}) | ગ્રોથ: <b>{html.escape(str(rev.get('growth', '0%')))}</b>\n"
-            f"• <b>કુલ નફો (Gross Profit):</b> ₹{html.escape(str(gp.get('curr', '0')))} Cr (તફાવત: {html.escape(str(gp.get('difference', '0')))}) | ગ્રોથ: <b>{html.escape(str(gp.get('growth', '0%')))}</b>\n"
-            f"• <b>ચોખ્ખો નફો (Net Profit):</b> ₹{html.escape(str(np_d.get('curr', '0')))} Cr (તફાવત: {html.escape(str(np_d.get('difference', '0')))}) | ગ્રોથ: <b>{html.escape(str(np_d.get('growth', '0%')))}</b>\n\n"
+            f"📈 <b>નાણાકીય કામગીરી - YoY ({curr_lbl} vs {prev_lbl}):</b>\n"
+            f"• <b>આવક (Revenue):</b> ₹{html.escape(str(rev.get('curr', '0')))} Cr (તફાવત: {html.escape(str(rev.get('difference', '0')))}) | YoY ગ્રોથ: <b>{html.escape(str(rev.get('growth', '0%')))}</b>\n"
+            f"• <b>કુલ નફો (Gross Profit):</b> ₹{html.escape(str(gp.get('curr', '0')))} Cr (તફાવત: {html.escape(str(gp.get('difference', '0')))}) | YoY ગ્રોથ: <b>{html.escape(str(gp.get('growth', '0%')))}</b>\n"
+            f"• <b>ચોખ્ખો નફો (Consolidated PAT):</b> ₹{html.escape(str(np_d.get('curr', '0')))} Cr (તફાવત: {html.escape(str(np_d.get('difference', '0')))}) | YoY ગ્રોથ: <b>{html.escape(str(np_d.get('growth', '0%')))}</b>\n\n"
         )
 
     msg_html = (
@@ -1117,7 +1291,7 @@ def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, 
                 data={
                     "chat_id": TELEGRAM_CHAT_ID,
                     "photo": chart_url,
-                    "caption": f"📊 {comp_name} - પરિણામ અને ગ્રોથ ચાર્ટ",
+                    "caption": f"📊 {comp_name} - Consolidated YoY પરિણામ અને ગ્રોથ ચાર્ટ",
                 },
                 timeout=15,
             )
@@ -1137,7 +1311,7 @@ def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, 
         log.warning("Telegram send warning: %s", exc)
 
 
-# ---------------- PUBLISHING & BLOGGER LIVE DEDUP ----------------
+# ---------------- FULL BLOGGER SCANNER & DEDUPLICATION ----------------
 def blogger_access_token():
     required = (GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN)
     if not all(required):
@@ -1156,41 +1330,164 @@ def blogger_access_token():
     return response.json()["access_token"]
 
 
-def get_existing_blogger_posts():
-    existing_comp_keys = set()
-    existing_file_keys = set()
-    if not BLOG_ID:
-        return existing_comp_keys, existing_file_keys
+def _parse_single_blog_post_for_dedup(title_str, content_html, labels_list, state):
+    t_low = title_str.lower()
+    lbl_low = " ".join(str(x).lower() for x in (labels_list or []))
 
+    if "share order" in lbl_low or any(w in t_low for w in ("order", "contract", "award", "loa", "work order")):
+        p_type = "order"
+    else:
+        p_type = "result"
+
+    # 1. Extract hidden MM_META comment if present
+    meta_match = re.search(r"<!--\s*MM_META:([^>]+?)\s*-->", content_html)
+    if meta_match:
+        meta_parts = dict(
+            kv.split("=", 1) for kv in meta_match.group(1).split("|") if "=" in kv
+        )
+        m_type = meta_parts.get("type") or p_type
+        if meta_parts.get("comp_key"):
+            state["comp_keys"].add(meta_parts["comp_key"].strip())
+        if meta_parts.get("scrip"):
+            state["scrip_keys"].add(meta_parts["scrip"].strip())
+        if meta_parts.get("file"):
+            state["file_keys"].add(meta_parts["file"].strip().lower())
+        if meta_parts.get("comp_name"):
+            ck = normalize_company_key(meta_parts["comp_name"], m_type)
+            if ck:
+                state["comp_keys"].add(ck)
+
+    # 2. Extract exact company name from <figcaption>{comp_name} Corporate Filing | MarketMunafa</figcaption>
+    fig_match = re.search(r"<figcaption[^>]*>\s*([^<|]+?)\s+Corporate Filing", content_html, flags=re.I)
+    if fig_match:
+        comp_from_fig = html.unescape(fig_match.group(1)).strip()
+        ck = normalize_company_key(comp_from_fig, p_type)
+        if ck:
+            state["comp_keys"].add(ck)
+
+    # 3. Extract exact company name from Result Card <strong style="font-size: 21px...">{comp_name}</strong>
+    strong_match = re.search(r"<strong[^>]*font-size:\s*21px[^>]*>\s*([^<]+?)\s*</strong>", content_html, flags=re.I)
+    if strong_match:
+        comp_from_strong = html.unescape(strong_match.group(1)).strip()
+        ck = normalize_company_key(comp_from_strong, p_type)
+        if ck:
+            state["comp_keys"].add(ck)
+
+    # 4. Extract exact company name from Order Card <strong>Company Name:</strong> {comp_name}
+    ord_comp_match = re.search(r"<strong>\s*Company Name:\s*</strong>\s*([^<(]+)", content_html, flags=re.I)
+    if ord_comp_match:
+        comp_from_ord = html.unescape(ord_comp_match.group(1)).strip()
+        ck = normalize_company_key(comp_from_ord, p_type)
+        if ck:
+            state["comp_keys"].add(ck)
+
+    # 5. Extract normalized key from post title
+    title_ck = normalize_company_key(title_str, p_type)
+    if title_ck:
+        state["comp_keys"].add(title_ck)
+
+    # 6. Extract all PDF / XML / XBRL filenames from post body
+    for match in re.findall(r"[a-zA-Z0-9_-]{8,}\.(?:pdf|xml|xbrl|html)", content_html, flags=re.I):
+        state["file_keys"].add(match.lower())
+
+    # 7. Extract any 6-digit BSE scrip code from title or content
+    for sc in re.findall(r"\b(5\d{5})\b", title_str + " " + content_html):
+        state["scrip_keys"].add(f"{p_type}_{sc}")
+
+
+def get_existing_blogger_posts():
+    """
+    Thoroughly scans the entire MarketMunafa blog (paginating through Blogger v3 API
+    + public Blogger JSON feed fallback) so no post is ever repeated.
+    """
+    state = {
+        "comp_keys": set(),
+        "scrip_keys": set(),
+        "file_keys": set(),
+    }
+    if not BLOG_ID:
+        return state
+
+    total_scanned = 0
+
+    # Method A: Full pagination through Blogger API v3
     try:
         token = blogger_access_token()
-        res = requests.get(
-            f"https://www.googleapis.com/blogger/v3/blogs/{BLOG_ID}/posts",
-            headers={"Authorization": f"Bearer {token}"},
-            params={"maxResults": 50, "fetchBodies": "true"},
-            timeout=20,
-        )
-        if res.status_code == 200:
-            for post in res.json().get("items", []):
-                title_str = post.get("title", "")
-                p_type = "order" if "order" in title_str.lower() or "contract" in title_str.lower() or "award" in title_str.lower() else "result"
-                c_key = normalize_company_key(title_str, p_type)
-                if c_key:
-                    existing_comp_keys.add(c_key)
-                content = post.get("content", "")
-                for match in re.findall(r"[a-zA-Z0-9_-]{10,}\.(?:pdf|xml|xbrl|html)", content, flags=re.I):
-                    existing_file_keys.add(match.lower())
+        page_token = None
+        while total_scanned < MAX_BLOG_POSTS_TO_SCAN:
+            params = {"maxResults": 100, "fetchBodies": "true"}
+            if page_token:
+                params["pageToken"] = page_token
+            res = requests.get(
+                f"https://www.googleapis.com/blogger/v3/blogs/{BLOG_ID}/posts",
+                headers={"Authorization": f"Bearer {token}"},
+                params=params,
+                timeout=25,
+            )
+            if res.status_code != 200:
+                log.warning("Blogger API scan status %s: %s", res.status_code, res.text[:200])
+                break
+            data = res.json()
+            items = data.get("items", [])
+            if not items:
+                break
+            for post in items:
+                _parse_single_blog_post_for_dedup(
+                    post.get("title", ""),
+                    post.get("content", ""),
+                    post.get("labels", []),
+                    state,
+                )
+                total_scanned += 1
+            page_token = data.get("nextPageToken")
+            if not page_token:
+                break
     except Exception as exc:
-        log.warning("Could not fetch existing Blogger posts: %s", exc)
+        log.warning("Blogger API full scan warning: %s", exc)
 
-    return existing_comp_keys, existing_file_keys
+    # Method B: Public Blogger JSON Feed (scans up to 500 posts without needing OAuth)
+    try:
+        feed_url = f"https://www.blogger.com/feeds/{BLOG_ID}/posts/default?alt=json&max-results=500"
+        res = c_requests.get(feed_url, impersonate="chrome120", timeout=25)
+        if res.status_code == 200:
+            entries = res.json().get("feed", {}).get("entry", [])
+            for entry in entries:
+                title_str = entry.get("title", {}).get("$t", "")
+                content_html = entry.get("content", {}).get("$t", "")
+                labels_list = [cat.get("term", "") for cat in entry.get("category", [])]
+                _parse_single_blog_post_for_dedup(title_str, content_html, labels_list, state)
+            if len(entries) > total_scanned:
+                total_scanned = len(entries)
+    except Exception as exc:
+        log.warning("Public Blogger feed scan warning: %s", exc)
+
+    log.info(
+        "Full Blog Scan Complete: %d posts scanned | %d company keys | %d file keys | %d scrip keys",
+        total_scanned,
+        len(state["comp_keys"]),
+        len(state["file_keys"]),
+        len(state["scrip_keys"]),
+    )
+    return state
+
+
+def is_already_on_blog_or_db(item_id, comp_key, scrip_key, file_key, blog_state):
+    if file_key and file_key in blog_state["file_keys"]:
+        return True, f"file_key={file_key}"
+    if scrip_key and scrip_key in blog_state["scrip_keys"]:
+        return True, f"scrip_key={scrip_key}"
+    if comp_key and comp_key in blog_state["comp_keys"]:
+        return True, f"comp_key={comp_key}"
+    if was_posted_in_db(item_id, comp_key, scrip_key, file_key):
+        return True, "local_sqlite_db"
+    return False, ""
 
 
 def blogger_publish(title, content_html, doc_type):
     if not BLOG_ID:
         raise RuntimeError("BLOG_ID is missing")
     token = blogger_access_token()
-    
+
     clean_title = re.sub(r"<[^>]+>", "", str(title))
     clean_title = re.sub(r"[\r\n\t]+", " ", clean_title).strip()[:140]
     if not clean_title:
@@ -1201,9 +1498,9 @@ def blogger_publish(title, content_html, doc_type):
     payload = {
         "title": clean_title,
         "content": content_html,
-        "labels": labels
+        "labels": labels,
     }
-    
+
     response = requests.post(
         f"https://www.googleapis.com/blogger/v3/blogs/{BLOG_ID}/posts/",
         headers={
@@ -1217,15 +1514,17 @@ def blogger_publish(title, content_html, doc_type):
     return response.json().get("url", "")
 
 
-def publish_item(item, doc_type, ai_data, screener_info, item_id, comp_key, file_key):
+def publish_item(item, doc_type, ai_data, screener_info, item_id, comp_key, scrip_key, file_key):
     source_url = item["link"]
-    raw_title = ai_data.get("seo_title") or f"{item['title']} Corporate Update & Valuation | MarketMunafa"
-    blog_html, yoy_chart_url = build_post_html(ai_data, doc_type, screener_info, source_url)
+    raw_title = ai_data.get("seo_title") or f"{item['title']} Consolidated Results & Valuation | MarketMunafa"
+    blog_html, yoy_chart_url = build_post_html(
+        ai_data, doc_type, screener_info, source_url, comp_key=comp_key, scrip_key=scrip_key, file_key=file_key
+    )
 
     blog_url = ""
     if POST_TO_BLOGGER:
         blog_url = blogger_publish(raw_title, blog_html, doc_type)
-        mark_posted(item_id, comp_key, file_key, item["title"], source_url)
+        mark_posted(item_id, comp_key, scrip_key, file_key, item["title"], source_url)
         log.info("Blogger post successful (%s): %s", doc_type, blog_url)
 
     send_telegram_gujarati(ai_data, doc_type, screener_info, blog_url, source_url, yoy_chart_url)
@@ -1234,12 +1533,22 @@ def publish_item(item, doc_type, ai_data, screener_info, item_id, comp_key, file
 # ---------------- MAIN ----------------
 def run():
     init_db()
+
+    # STEP 1: સૌથી પહેલાં આખો MarketMunafa બ્લોગ સ્કેન કરો
+    log.info("Scanning existing posts on MarketMunafa blog before processing feeds...")
+    blog_state = get_existing_blogger_posts()
+
     all_items = []
 
+    # STEP 2: Fetch from BSE Direct JSON API (Results + Company Updates)
+    json_items = fetch_bse_json_announcements()
+    all_items.extend(json_items)
+
+    # STEP 3: Also check BSE XML Feeds as backup
     for kind, feed_url in FEEDS.items():
         try:
             items = parse_feed(feed_url, kind)
-            log.info("%s feed (filtered): %d items", kind, len(items))
+            log.info("%s XML feed (filtered): %d items", kind, len(items))
             all_items.extend(items)
         except Exception:
             log.exception("Feed failed: %s", feed_url)
@@ -1248,40 +1557,60 @@ def run():
         log.warning("No feed items retrieved.")
         return
 
-    live_comp_keys, live_file_keys = get_existing_blogger_posts()
-
-    seen_comp_in_run = set()
-    seen_file_in_run = set()
-
     for item in all_items:
         doc_type = classify_item(item)
         if not doc_type:
             continue
 
-        comp_key = normalize_company_key(item["title"], doc_type)
+        comp_basis = item.get("company_raw") or item["title"]
+        comp_key = normalize_company_key(comp_basis, doc_type)
+        scrip_code = item.get("scrip_code") or extract_scrip_code(item["title"])
+        scrip_key = f"{doc_type}_{scrip_code}" if scrip_code else ""
         file_key = extract_file_key(item["link"])
         item_id = make_item_id(comp_key, file_key, item)
 
-        if (
-            (comp_key and comp_key in seen_comp_in_run)
-            or (file_key and file_key in seen_file_in_run)
-            or (comp_key and comp_key in live_comp_keys)
-            or (file_key and file_key in live_file_keys)
-            or was_posted_in_db(item_id, comp_key, file_key)
-        ):
-            log.info("Skipping duplicate (%s): %s", doc_type, item["title"])
+        # STAGE 1 CHECK: PDF ડાઉનલોડ કે AI કોલ કરતા પહેલાં જ બ્લોગ સાથે ચેક કરો
+        is_dup, dup_reason = is_already_on_blog_or_db(item_id, comp_key, scrip_key, file_key, blog_state)
+        if is_dup:
+            log.info("Skipping duplicate [Stage 1 - %s] (%s): %s", dup_reason, doc_type, item["title"])
             continue
 
         log.info("Processing %s: %s", doc_type, item["title"])
         try:
             source_text, pdf_bytes = get_document_payload(item)
+            file_key = extract_file_key(item["link"]) or file_key
+
             screener_info = get_screener_fundamentals(item["title"])
+
+            # Check Screener company name against blog before calling Gemini
+            if screener_info.get("screener_company_name"):
+                scr_comp_key = normalize_company_key(screener_info["screener_company_name"], doc_type)
+                if scr_comp_key and scr_comp_key in blog_state["comp_keys"]:
+                    log.info(
+                        "Skipping duplicate [Screener Name Match: %s] (%s): %s",
+                        scr_comp_key,
+                        doc_type,
+                        item["title"],
+                    )
+                    continue
 
             if doc_type == "result" and not pdf_bytes and not screener_info["q_all_rev"] and len(source_text) < 120:
                 log.warning("Skipped: no PDF and no Screener quarterly data for %s", item["title"])
                 continue
 
             ai_data = analyze_with_gemini_json(item["title"], doc_type, source_text, pdf_bytes, screener_info)
+
+            # STAGE 2 CHECK: AI પાસેથી મળેલા સાચા કંપનીના નામ (company_short_name) ને ફરીથી બ્લોગ સાથે મેચ કરો
+            ai_comp_name = str(ai_data.get("company_short_name") or "").strip()
+            ai_comp_key = normalize_company_key(ai_comp_name, doc_type) if ai_comp_name else ""
+            if ai_comp_key and ai_comp_key in blog_state["comp_keys"]:
+                log.info(
+                    "Skipping duplicate [Stage 2 AI Name Match: %s] (%s): %s",
+                    ai_comp_key,
+                    doc_type,
+                    item["title"],
+                )
+                continue
 
             if doc_type == "result":
                 r_curr = to_float(ai_data.get("revenue", {}).get("curr"))
@@ -1290,17 +1619,19 @@ def run():
                     log.warning("Skipping result post with 0/empty financial figures: %s", item["title"])
                     continue
 
-            if comp_key:
-                seen_comp_in_run.add(comp_key)
-            if file_key:
-                seen_file_in_run.add(file_key)
+            final_comp_key = ai_comp_key or comp_key
+            publish_item(item, doc_type, ai_data, screener_info, item_id, final_comp_key, scrip_key, file_key)
 
-            publish_item(item, doc_type, ai_data, screener_info, item_id, comp_key, file_key)
-            
+            # તરત જ મેમરીમાં ઉમેરી દો જેથી એક જ રનમાં પણ બીજી વાર પોસ્ટ ન થાય
             if comp_key:
-                live_comp_keys.add(comp_key)
+                blog_state["comp_keys"].add(comp_key)
+            if ai_comp_key:
+                blog_state["comp_keys"].add(ai_comp_key)
+            if scrip_key:
+                blog_state["scrip_keys"].add(scrip_key)
             if file_key:
-                live_file_keys.add(file_key)
+                blog_state["file_keys"].add(file_key)
+
             time.sleep(5)
         except Exception:
             log.exception("Item processing failed: %s", item["title"])
