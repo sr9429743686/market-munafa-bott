@@ -32,11 +32,21 @@ GOOGLE_REFRESH_TOKEN = (os.getenv("GOOGLE_REFRESH_TOKEN") or os.getenv("REFRESH_
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9086072964:AAEUyn-GAyJLdsYR4YS5l6Xy6HJsOOoA8HM").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "430834857").strip()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+# નવી Gemini API Key (Fallback સાથે)
+GEMINI_API_KEY = os.getenv(
+    "GEMINI_API_KEY",
+    "AQ.Ab8RN6LN1nOA8WdrAt134ZljUcPbpgpvGo9K6duZoVcndZxGkQ"
+).strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
+
+# ---------------- RATE LIMIT & COOLDOWN SETTINGS ----------------
+# પ્રતિ મિનિટ મહત્તમ 8 પોસ્ટ અને ત્યારબાદ 2 મિનિટ (120 સેકન્ડ) નો વિરામ
+MAX_POSTS_PER_BATCH = int(os.getenv("MAX_POSTS_PER_BATCH", "8"))
+BATCH_WAIT_SECONDS = int(os.getenv("BATCH_WAIT_SECONDS", "120"))       # 2 મિનિટ રાહ જુઓ
+PER_POST_DELAY_SECONDS = int(os.getenv("PER_POST_DELAY_SECONDS", "8")) # દરેક પોસ્ટ વચ્ચે 8 સેકન્ડનો ગેપ (60s / 8 = ~7.5s)
 
 FEEDS = {
     "result": "https://www.bseindia.com/Data/XML/FinancialResultsFeed.aspx",
@@ -714,29 +724,18 @@ def ensure_valid_result_numbers(ai_data, screener_info):
     return ai_data
 
 
-# ---------------- DYNAMIC GEMINI MODEL DISCOVERY & FALLBACK ----------------
+# ---------------- SAFE GEMINI MODEL FALLBACK (NO RANDOM EXPERIMENTAL MODELS) ----------------
 _CACHED_WORKING_MODEL = None
 
 
 def get_candidate_gemini_models():
+    """ફક્ત પ્રમાણિત અને સ્થિર Flash મોડેલ્સ જ વાપરશે જેથી બિનજરૂરી 429 એરર ન આવે."""
     candidates = [
         GEMINI_MODEL,
         "gemini-2.5-flash",
         "gemini-2.0-flash",
-        "gemini-3-flash-preview",
-        "gemini-3.1-flash-lite-preview",
         "gemini-flash-latest",
     ]
-    try:
-        for m in genai.list_models():
-            methods = getattr(m, "supported_generation_methods", []) or []
-            if "generateContent" in methods:
-                short_name = m.name.replace("models/", "")
-                if "gemini" in short_name.lower() and "tts" not in short_name.lower() and "image" not in short_name.lower():
-                    candidates.append(short_name)
-    except Exception as exc:
-        log.warning("Could not list Gemini models dynamically: %s", exc)
-
     return list(dict.fromkeys(c for c in candidates if c))
 
 
@@ -758,7 +757,12 @@ def call_gemini_with_fallback(contents):
             return resp
         except Exception as exc:
             last_err = exc
-            log.warning("Model %s failed, trying next fallback: %s", m_name, exc)
+            err_str = str(exc).lower()
+            log.warning("Model %s warning: %s", m_name, exc)
+            # જો મિનિટની લિમિટ (429 / Quota) આવે તો તરત બીજા મોડેલ પર જતા પહેલાં 15 સેકન્ડ રાહ જુઓ
+            if "429" in err_str or "quota" in err_str or "rate" in err_str:
+                log.info("Rate limit notice on %s. Pausing 15 seconds before fallback...", m_name)
+                time.sleep(15)
     raise RuntimeError(f"All Gemini models failed: {last_err}")
 
 
@@ -1056,7 +1060,6 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
     est_return = html.escape(str(data.get("estimated_stock_return", "N/A")))
     intraday_sig = html.escape(str(data.get("intraday_signal", "")))
 
-    # 1. SEO Lead Summary at the very top (for Google Search Snippet & Blogger Search Description)
     raw_lead = str(data.get("seo_lead_summary") or "").strip()
     if not raw_lead:
         if doc_type == "order":
@@ -1076,7 +1079,6 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
             )
     lead_html = html.escape(raw_lead)
 
-    # 2. 100% Copyright-Free 1200x675 (16:9) Google Discover Optimized Image with deterministic unique seed
     seed_int = int(hashlib.md5((comp_name + res_date).encode("utf-8")).hexdigest()[:6], 16)
     thumb_prompt = (
         f"modern 3d financial stock market analytics chart infographic upward trend corporate building india {comp_name}"
@@ -1188,7 +1190,6 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
         """
         content_blocks.append(result_card)
 
-    # 3. Key Takeaways Bullet Box
     highlights = data.get("key_highlights") or []
     if highlights and isinstance(highlights, list):
         li_items = "".join(
@@ -1205,7 +1206,6 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
         """
         content_blocks.append(highlights_card)
 
-    # 4. All 10 Fundamental Indicators Card
     fundamentals_card = f"""
     <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 20px; box-shadow: 0 4px 14px rgba(0,0,0,0.05); margin-bottom: 24px;">
       <h2 style="margin: 0 0 16px 0; font-size: 20px; color: #0f172a;">🔍 {comp_name} Fundamentals &amp; Valuation Ratios</h2>
@@ -1256,7 +1256,6 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
     """
     content_blocks.append(fundamentals_card)
 
-    # 5. Deep-Dive Structured SEO Article Sections (400-500 words total)
     sections = data.get("seo_article_sections") or []
     article_html_parts = []
     if sections and isinstance(sections, list):
@@ -1279,7 +1278,6 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
                 f"<p style='color:#334155; font-size:16px; line-height:1.75; margin-bottom:14px;'>{html.escape(str(p))}</p>"
             )
 
-    # 6. Visible FAQ Section + JSON-LD FAQPage Schema for Google Rich Snippets
     faqs = data.get("faqs") or []
     if not faqs or not isinstance(faqs, list):
         faqs = [
@@ -1333,7 +1331,6 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
         "mainEntity": faq_schema_entities,
     })
 
-    # 7. Internal Linking Block (Boosts Google Crawl Depth & Organic Indexing)
     internal_links_html = f"""
     <div style="background: #eff6ff; border: 1px dashed #60a5fa; border-radius: 10px; padding: 14px 18px; margin: 22px 0; font-size: 14px; color: #1e3a8a;">
       <strong>🔗 Explore More on MarketMunafa:</strong>
@@ -1356,8 +1353,6 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
         f"<!-- MM_META:type={doc_type}|comp_key={comp_key}|scrip={scrip_key}|file={file_key}|comp_name={comp_name} -->"
     )
 
-    # Note: Placing the SEO Lead Summary paragraph FIRST before the image and <!--more--> ensures
-    # Blogger's automatic meta description and Google Search snippets capture clean, high-CTR text.
     html_body = f"""
     {meta_comment}
     <article style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 720px; margin: 0 auto; color: #1e293b;">
@@ -1517,7 +1512,6 @@ def _parse_single_blog_post_for_dedup(title_str, content_html, labels_list, stat
     else:
         p_type = "result"
 
-    # 1. Extract hidden MM_META comment if present
     meta_match = re.search(r"<!--\s*MM_META:([^>]+?)\s*-->", content_html)
     if meta_match:
         meta_parts = dict(
@@ -1535,7 +1529,6 @@ def _parse_single_blog_post_for_dedup(title_str, content_html, labels_list, stat
             if ck:
                 state["comp_keys"].add(ck)
 
-    # 2. Extract exact company name from <figcaption>{comp_name} ...
     fig_match = re.search(r"<figcaption[^>]*>\s*([^<|(]+?)\s+(?:Corporate Filing|\(BSE)", content_html, flags=re.I)
     if fig_match:
         comp_from_fig = html.unescape(fig_match.group(1)).strip()
@@ -1543,7 +1536,6 @@ def _parse_single_blog_post_for_dedup(title_str, content_html, labels_list, stat
         if ck:
             state["comp_keys"].add(ck)
 
-    # 3. Extract exact company name from Result Card <strong style="font-size: 21px...">{comp_name}</strong>
     strong_match = re.search(r"<strong[^>]*font-size:\s*21px[^>]*>\s*([^<]+?)\s*</strong>", content_html, flags=re.I)
     if strong_match:
         comp_from_strong = html.unescape(strong_match.group(1)).strip()
@@ -1551,7 +1543,6 @@ def _parse_single_blog_post_for_dedup(title_str, content_html, labels_list, stat
         if ck:
             state["comp_keys"].add(ck)
 
-    # 4. Extract exact company name from Order Card <strong>Company Name:</strong> {comp_name}
     ord_comp_match = re.search(r"<strong>\s*Company Name:\s*</strong>\s*([^<(]+)", content_html, flags=re.I)
     if ord_comp_match:
         comp_from_ord = html.unescape(ord_comp_match.group(1)).strip()
@@ -1559,25 +1550,18 @@ def _parse_single_blog_post_for_dedup(title_str, content_html, labels_list, stat
         if ck:
             state["comp_keys"].add(ck)
 
-    # 5. Extract normalized key from post title
     title_ck = normalize_company_key(title_str, p_type)
     if title_ck:
         state["comp_keys"].add(title_ck)
 
-    # 6. Extract all PDF / XML / XBRL filenames from post body
     for match in re.findall(r"[a-zA-Z0-9_-]{8,}\.(?:pdf|xml|xbrl|html)", content_html, flags=re.I):
         state["file_keys"].add(match.lower())
 
-    # 7. Extract any 6-digit BSE scrip code from title or content
     for sc in re.findall(r"\b(5\d{5})\b", title_str + " " + content_html):
         state["scrip_keys"].add(f"{p_type}_{sc}")
 
 
 def get_existing_blogger_posts():
-    """
-    Thoroughly scans the entire MarketMunafa blog (paginating through Blogger v3 API
-    + public Blogger JSON feed fallback) so no post is ever repeated.
-    """
     state = {
         "comp_keys": set(),
         "scrip_keys": set(),
@@ -1588,7 +1572,6 @@ def get_existing_blogger_posts():
 
     total_scanned = 0
 
-    # Method A: Full pagination through Blogger API v3
     try:
         token = blogger_access_token()
         page_token = None
@@ -1623,7 +1606,6 @@ def get_existing_blogger_posts():
     except Exception as exc:
         log.warning("Blogger API full scan warning: %s", exc)
 
-    # Method B: Public Blogger JSON Feed (scans up to 500 posts without needing OAuth)
     try:
         feed_url = f"https://www.blogger.com/feeds/{BLOG_ID}/posts/default?alt=json&max-results=500"
         res = c_requests.get(feed_url, impersonate="chrome120", timeout=25)
@@ -1715,7 +1697,7 @@ def publish_item(item, doc_type, ai_data, screener_info, item_id, comp_key, scri
     send_telegram_gujarati(ai_data, doc_type, screener_info, blog_url, source_url, yoy_chart_url)
 
 
-# ---------------- MAIN ----------------
+# ---------------- MAIN (WITH 8 POSTS PER MINUTE + 2-MINUTE COOLDOWN) ----------------
 def run():
     init_db()
 
@@ -1741,6 +1723,9 @@ def run():
     if not all_items:
         log.warning("No feed items retrieved.")
         return
+
+    posts_in_current_batch = 0
+    total_posted_count = 0
 
     for item in all_items:
         doc_type = classify_item(item)
@@ -1829,9 +1814,31 @@ def run():
             if file_key:
                 blog_state["file_keys"].add(file_key)
 
-            time.sleep(5)
+            posts_in_current_batch += 1
+            total_posted_count += 1
+
+            # --- 8 પોસ્ટ પૂર્ણ થાય એટલે 2 મિનિટ (120 સેકન્ડ) રાહ જુઓ ---
+            if posts_in_current_batch >= MAX_POSTS_PER_BATCH:
+                log.info(
+                    "Batch limit reached (%d posts completed, Total: %d). Waiting for %d seconds (2 minutes) before next batch...",
+                    posts_in_current_batch,
+                    total_posted_count,
+                    BATCH_WAIT_SECONDS,
+                )
+                time.sleep(BATCH_WAIT_SECONDS)
+                posts_in_current_batch = 0
+            else:
+                log.info(
+                    "Post %d/%d in current batch done. Waiting %d seconds before next post...",
+                    posts_in_current_batch,
+                    MAX_POSTS_PER_BATCH,
+                    PER_POST_DELAY_SECONDS,
+                )
+                time.sleep(PER_POST_DELAY_SECONDS)
+
         except Exception:
             log.exception("Item processing failed: %s", item["title"])
+            time.sleep(5)
 
 
 if __name__ == "__main__":
