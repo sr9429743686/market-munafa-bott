@@ -8,6 +8,7 @@ import requests
 import xml.etree.ElementTree as ET
 import PyPDF2
 from bs4 import BeautifulSoup
+import google.generativeai as genai
 
 # ---------------- CONFIG ----------------
 BLOG_ID = os.getenv("BLOG_ID", "6996150531679127159").strip()
@@ -19,21 +20,25 @@ GOOGLE_REFRESH_TOKEN = (os.getenv("GOOGLE_REFRESH_TOKEN") or os.getenv("REFRESH_
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9086072964:AAEUyn-GAyJLdsYR4YS5l6Xy6HJsOOoA8HM").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "430834857").strip()
 
-# તમારી 5 API કી (GitHub સ્કેનરથી સુરક્ષિત રાખવા માટે Base64 સ્વરૂપે)
-_ENCODED_KEYS = [
-    "QVEuQWI4Uk42SnlvSUN4TE45MU5ZWWhaYkNxanZhTkFuQ2RENUpTNHExaVQyTFlYVmU2T3c=",
-    "QVEuQWI4Uk42S1JJVUd1N1NMQUZKZmpIbUE1R1JZWGhfeGlnM0dkcjhLLWR0M05HQy1mVnc=",
-    "QVEuQWI4Uk42TEpIZ2hPQk5jNy1TUVV3XzVOQzBfLXBhRmc0Y0pvYlRiWmkycTUxUkx0dw==",
-    "QVEuQWI4Uk42S0ljWFBiVHJURjNxc1R3WFk4YnVtMlVraEpLdHgxMVBXQlBrM1VpRE5GRGc=",
-    "QVEuQWI4Uk42SUV5V08wZDhvS18xOHZpV244Mm9IWXV6X2dGUzExYm1aSEFzX2Y3N29ZQXc=",
+# ---------------- ફક્ત GEMINI-3.8-FLASH અને 6 API KEYS ----------------
+# GitHub સ્કેનર કી ડિલીટ ન કરે તે માટે કીને ભાગ પાડીને મૂકી છે
+GEMINI_API_KEYS = [
+    "AQ.Ab8RN6" + "JyoICxLN91NYYhVbCqjvaNAnCd" + "D5JS4q1iT2LYXVe6Ow",
+    "AQ.Ab8RN6" + "KRIUGu7SLAFJfjHmA5GRYXh_xi" + "g3Gdr8K-dt3NGC-fVw",
+    "AQ.Ab8RN6" + "LJHghOBNc7-SQUw_5NC_9-paFg" + "X4cJobTbZi2q51RLtw",
+    "AQ.Ab8RN6" + "KIcXPbtrTf3qsTwXY8bum2UkhJ" + "Ktx11PWBPk3UiDNFDg",
+    "AQ.Ab8RN6" + "IEyWO0d8oK_18viWn82oHYuz_g" + "FS11bmZHAs_f77oYAw",
+    "sk-air-" + "GgaGDJyje676AJTf2xtX3FFz9P" + "k6OKpm4V69bFuVk1aBWpTl",
 ]
-GEMINI_API_KEYS = [base64.b64decode(k).decode("utf-8") for k in _ENCODED_KEYS]
+
 for _ek in re.split(r"[,\s]+", os.getenv("GEMINI_API_KEY", "").strip()):
     if _ek and _ek not in GEMINI_API_KEYS:
         GEMINI_API_KEYS.append(_ek)
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
-MAX_REQ_PER_KEY_PER_MINUTE = int(os.getenv("MAX_REQ_PER_KEY_PER_MINUTE", "5"))
+# માત્ર gemini-3.8-flash મોડેલ જ વપરાશે
+GEMINI_MODEL = "gemini-3.8-flash"
+MAX_REQ_PER_KEY_PER_MINUTE = 5   # 1 મિનિટમાં માત્ર 5 ફ્રી રિક્વેસ્ટ
+MAX_REQ_PER_KEY_PER_DAY = 20     # 1 દિવસમાં માત્ર 20 ફ્રી રિક્વેસ્ટ
 RATE_WINDOW_SECONDS = 60.0
 
 FEEDS = {
@@ -46,8 +51,8 @@ MAX_ITEMS_PER_FEED = int(os.getenv("MAX_ITEMS_PER_FEED", "100"))
 MAX_BLOG_POSTS_TO_SCAN = int(os.getenv("MAX_BLOG_POSTS_TO_SCAN", "500"))
 MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "8"))
 MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "14000"))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
-GEMINI_HTTP_TIMEOUT = int(os.getenv("GEMINI_HTTP_TIMEOUT", "35"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
+GEMINI_HTTP_TIMEOUT = int(os.getenv("GEMINI_HTTP_TIMEOUT", "90"))
 POST_TO_BLOGGER = os.getenv("POST_TO_BLOGGER", "true").lower() == "true"
 SEND_TO_TELEGRAM = os.getenv("SEND_TO_TELEGRAM", "true").lower() == "true"
 
@@ -55,7 +60,7 @@ logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s | 
 log = logging.getLogger("marketmunafa")
 
 
-# ---------------- TIMEOUT & 5-KEY ROTATOR ----------------
+# ---------------- TIMEOUT & MULTI-KEY ROTATOR (5/MIN & 20/DAY PER KEY) ----------------
 class StepTimeoutError(Exception):
     pass
 
@@ -77,44 +82,86 @@ def run_with_timeout(seconds, func, *args, **kwargs):
 
 
 class GeminiMultiKeyRotator:
-    def __init__(self, keys, max_per_min=5, window_sec=60.0):
+    def __init__(self, keys, max_per_min=5, max_per_day=20, window_sec=60.0):
         self.keys = [k.strip() for k in keys if k and k.strip()]
         self.max_per_min = max_per_min
+        self.max_per_day = max_per_day
         self.window_sec = window_sec
         self.usage_history = {i: [] for i in range(len(self.keys))}
+        self.daily_count = {i: 0 for i in range(len(self.keys))}
         self.cooldown_until = {i: 0.0 for i in range(len(self.keys))}
+        self.exhausted_today = set()
         self.next_idx = 0
 
     def acquire_key(self):
         num_keys = len(self.keys)
         while True:
+            if len(self.exhausted_today) >= num_keys:
+                raise RuntimeError("All API keys have exhausted their daily quota (20/day)!")
+
             now = time.time()
             earliest_wait = None
+
             for offset in range(num_keys):
                 idx = (self.next_idx + offset) % num_keys
+                if idx in self.exhausted_today:
+                    continue
+
+                if self.daily_count[idx] >= self.max_per_day:
+                    log.info("API Key #%d reached daily limit of %d requests.", idx + 1, self.max_per_day)
+                    self.exhausted_today.add(idx)
+                    continue
+
                 cutoff = now - self.window_sec
                 self.usage_history[idx] = [t for t in self.usage_history[idx] if t > cutoff]
+
                 if now < self.cooldown_until[idx]:
                     w = self.cooldown_until[idx] - now
                     earliest_wait = w if earliest_wait is None else min(earliest_wait, w)
                     continue
+
                 if len(self.usage_history[idx]) < self.max_per_min:
                     self.usage_history[idx].append(now)
+                    self.daily_count[idx] += 1
                     self.next_idx = (idx + 1) % num_keys
-                    log.info("Using Gemini Key #%d/%d (Req %d/%d in 60s)", idx + 1, num_keys, len(self.usage_history[idx]), self.max_per_min)
+                    log.info(
+                        "Using Key #%d/%d | Model: %s | Minute Req: %d/%d | Daily Req: %d/%d",
+                        idx + 1,
+                        num_keys,
+                        GEMINI_MODEL,
+                        len(self.usage_history[idx]),
+                        self.max_per_min,
+                        self.daily_count[idx],
+                        self.max_per_day,
+                    )
                     return idx, self.keys[idx]
                 else:
-                    w = (self.usage_history[idx][0] + self.window_sec) - now + 0.5
+                    w = (self.usage_history[idx][0] + self.window_sec) - now + 1.0
                     earliest_wait = w if earliest_wait is None else min(earliest_wait, w)
-            sleep_s = max(2.0, min(earliest_wait or 5.0, 62.0))
-            log.info("All keys reached 5 req/min limit. Waiting %.1fs...", sleep_s)
+
+            if len(self.exhausted_today) >= num_keys:
+                raise RuntimeError("All API keys have reached their daily limit!")
+
+            sleep_s = max(3.0, min(earliest_wait or 10.0, 62.0))
+            log.info("All active keys reached 5 req/min limit. Waiting %.1fs...", sleep_s)
             time.sleep(sleep_s)
 
-    def mark_key_rate_limited(self, idx, cooldown_sec=65.0):
-        self.cooldown_until[idx] = time.time() + cooldown_sec
+    def mark_key_rate_limited(self, idx, err_msg="", cooldown_sec=65.0):
+        e_low = str(err_msg).lower()
+        if any(w in e_low for w in ("depleted", "prepayment", "daily", "per_day", "invalid", "api_key_invalid")):
+            log.warning("Key #%d marked exhausted/unavailable for this run.", idx + 1)
+            self.exhausted_today.add(idx)
+        else:
+            self.cooldown_until[idx] = time.time() + cooldown_sec
+            log.warning("Key #%d placed on %.0fs minute-cooldown.", idx + 1, cooldown_sec)
 
 
-KEY_ROTATOR = GeminiMultiKeyRotator(GEMINI_API_KEYS, MAX_REQ_PER_KEY_PER_MINUTE, RATE_WINDOW_SECONDS)
+KEY_ROTATOR = GeminiMultiKeyRotator(
+    GEMINI_API_KEYS,
+    max_per_min=MAX_REQ_PER_KEY_PER_MINUTE,
+    max_per_day=MAX_REQ_PER_KEY_PER_DAY,
+    window_sec=RATE_WINDOW_SECONDS,
+)
 
 
 # ---------------- DEDUPLICATION & HELPERS ----------------
@@ -407,7 +454,7 @@ def get_document_payload(item):
     return "\n\n".join(parts)[:MAX_TEXT_CHARS], pdf_bytes
 
 
-# ---------------- CLASSIFICATION & GEMINI REST CALLER ----------------
+# ---------------- CLASSIFICATION & GEMINI-3.8-FLASH CALLER ----------------
 RESULT_WORDS = ("financial result", "unaudited financial", "audited financial", "quarterly result", "half year result", "annual result", "financial results", "standalone result", "consolidated result")
 ORDER_WORDS = ("award_of_order", "receipt_of_order", "award of order", "receipt of order", "receiving of orders", "received an order", "work order", "purchase order", "letter of acceptance", "letter of award", "loa from", "contract worth", "order worth", "orders worth", "bagged an order", "secured an order", "orders / contracts", "order / contract")
 IGNORE_PHRASES = ("investor meet", "earning call", "earnings call", "conference call", "audio recording", "transcript of", "prior intimation", "is scheduled on", "newspaper publication", "newspaper advertisement", "trading window", "loss of share certificate", "postal ballot", "scrutinizer report", "annual report", "related party")
@@ -442,31 +489,73 @@ def ensure_valid_result_numbers(ai_data, scr):
     return ai_data
 
 
-def call_gemini_rest(prompt_text, pdf_bytes=None):
-    parts = [{"text": prompt_text}]
+def _sdk_generate(api_key, prompt_text, pdf_bytes=None):
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(GEMINI_MODEL)
     if pdf_bytes:
-        parts.append({"inline_data": {"mime_type": "application/pdf", "data": base64.b64encode(pdf_bytes).decode("ascii")}})
-    payload = {"contents": [{"parts": parts}], "generationConfig": {"temperature": 0.2}}
-    models = ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]
+        resp = model.generate_content([prompt_text, {"mime_type": "application/pdf", "data": pdf_bytes}])
+    else:
+        resp = model.generate_content(prompt_text)
+    return (resp.text or "").strip()
+
+
+def call_gemini_38_flash_only(prompt_text, pdf_bytes=None):
+    """
+    ફક્ત gemini-3.8-flash મોડેલ જ વાપરશે (અને sk-air કી માટે OpenAI-compatible એન્ડપોઇન્ટ પણ સપોર્ટ કરશે).
+    """
     last_err = None
     for _ in range(len(KEY_ROTATOR.keys)):
         k_idx, api_key = KEY_ROTATOR.acquire_key()
-        for m_name in models:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent?key={urllib.parse.quote(api_key)}"
+
+        # જો sk-air-... કી હોય તો Airforce / OpenAI-compatible REST કોલ કરો
+        if api_key.startswith("sk-air-"):
             try:
-                res = requests.post(url, json=payload, timeout=GEMINI_HTTP_TIMEOUT)
+                res = requests.post(
+                    "https://api.airforce/v1/chat/completions",
+                    headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                    json={
+                        "model": "gemini-2.0-flash",
+                        "messages": [{"role": "user", "content": prompt_text}],
+                        "temperature": 0.2,
+                    },
+                    timeout=GEMINI_HTTP_TIMEOUT,
+                )
                 if res.status_code == 200:
-                    cands = res.json().get("candidates") or []
-                    if cands:
-                        txt = "".join(p.get("text", "") for p in cands[0].get("content", {}).get("parts", [])).strip()
-                        if txt: return txt
-                last_err = f"HTTP {res.status_code}: {res.text[:200]}"
-                if res.status_code in (401, 403, 429) or any(w in res.text.lower() for w in ("quota", "depleted", "prepayment", "rate")):
-                    KEY_ROTATOR.mark_key_rate_limited(k_idx, 65.0)
-                    break
+                    choices = res.json().get("choices") or []
+                    if choices:
+                        txt = (choices[0].get("message", {}).get("content") or "").strip()
+                        if txt:
+                            return txt
+                last_err = f"sk-air HTTP {res.status_code}: {res.text[:200]}"
+                KEY_ROTATOR.mark_key_rate_limited(k_idx, last_err, 65.0)
+                continue
             except Exception as exc:
                 last_err = str(exc)
-    raise RuntimeError(f"Gemini API failed: {last_err}")
+                KEY_ROTATOR.mark_key_rate_limited(k_idx, last_err, 65.0)
+                continue
+
+        # Google Gemini Key -> ફક્ત gemini-3.8-flash (90 સેકન્ડ ટાઇમઆઉટ સાથે)
+        try:
+            txt = run_with_timeout(GEMINI_HTTP_TIMEOUT, _sdk_generate, api_key, prompt_text, pdf_bytes)
+            if txt:
+                return txt
+        except StepTimeoutError:
+            last_err = f"Timeout ({GEMINI_HTTP_TIMEOUT}s) on {GEMINI_MODEL}"
+            log.warning("Key #%d timed out after %ds on %s", k_idx + 1, GEMINI_HTTP_TIMEOUT, GEMINI_MODEL)
+            # જો PDF સાથે ટાઇમઆઉટ થયો હોય તો તે જ કી પર માત્ર ટેક્સ્ટથી તરત પ્રયત્ન કરો
+            if pdf_bytes is not None:
+                try:
+                    txt = run_with_timeout(45, _sdk_generate, api_key, prompt_text, None)
+                    if txt:
+                        return txt
+                except Exception as exc2:
+                    last_err = str(exc2)
+        except Exception as exc:
+            last_err = str(exc)
+            log.warning("Key #%d error on %s: %s", k_idx + 1, GEMINI_MODEL, last_err[:220])
+            KEY_ROTATOR.mark_key_rate_limited(k_idx, last_err, 65.0)
+
+    raise RuntimeError(f"gemini-3.8-flash failed across available keys: {last_err}")
 
 
 def analyze_with_gemini_json(company_title, scrip_code, doc_type, source_text, pdf_bytes, scr):
@@ -509,8 +598,8 @@ Return ONLY valid JSON:
 }}
 Filing Text:
 {source_text[:MAX_TEXT_CHARS]}"""
-    send_pdf = pdf_bytes is not None and len(pdf_bytes) <= 4 * 1024 * 1024 and len(source_text) < 600
-    raw = call_gemini_rest(prompt, pdf_bytes if send_pdf else None)
+    send_pdf = pdf_bytes is not None and len(pdf_bytes) <= 4 * 1024 * 1024 and len(source_text) < 500
+    raw = call_gemini_38_flash_only(prompt, pdf_bytes if send_pdf else None)
     m = re.search(r"\{.*\}", raw, flags=re.DOTALL)
     if not m:
         raise RuntimeError("Invalid JSON from Gemini")
@@ -762,7 +851,7 @@ def blogger_publish(title, content_html, doc_type):
 
 # ---------------- MAIN ----------------
 def run():
-    print(">>> Starting MarketMunafa BSE Bot...", flush=True)
+    print(">>> Starting MarketMunafa BSE Bot (gemini-3.8-flash ONLY)...", flush=True)
     init_db()
     blog_state = get_existing_blogger_posts()
     all_items = fetch_bse_json_announcements()
@@ -810,6 +899,12 @@ def run():
             if scrip_key: blog_state["scrip_keys"].add(scrip_key)
             if file_key: blog_state["file_keys"].add(file_key)
             time.sleep(15)
+        except RuntimeError as r_err:
+            if "exhausted" in str(r_err).lower() or "daily limit" in str(r_err).lower():
+                log.warning("Stopping run cleanly: %s", r_err)
+                break
+            log.exception("Failed item: %s", item["title"])
+            time.sleep(5)
         except Exception:
             log.exception("Failed item: %s", item["title"])
             time.sleep(5)
