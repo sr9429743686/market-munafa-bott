@@ -9,7 +9,7 @@ import sqlite3
 import tempfile
 import warnings
 import urllib.parse
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
 
 warnings.filterwarnings("ignore")
@@ -32,11 +32,10 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9086072964:AAEUyn-GAyJLdsY
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "430834857").strip()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash") # Updated to valid model name if needed, or keep your env variable
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
-    gemini_model = genai.GenerativeModel(GEMINI_MODEL)
 
 FEEDS = {
     "result": "https://www.bseindia.com/Data/XML/FinancialResultsFeed.aspx",
@@ -134,14 +133,15 @@ def mark_posted(item_id, comp_key, file_key, title, source_url):
 def get_url(url, extra_headers=None):
     last_error = None
     profiles = ["chrome120", "chrome110", "edge101", "chrome104"]
-    
+
     for attempt in range(3):
         try:
             profile = profiles[attempt % len(profiles)]
             headers = {
-                "Accept": "application/rss+xml, application/xml, text/xml, application/pdf, text/html, */*",
+                "Accept": "application/json, application/rss+xml, application/xml, text/xml, application/pdf, text/html, */*",
                 "Accept-Language": "en-US,en;q=0.9",
                 "Referer": "https://www.bseindia.com/",
+                "Origin": "https://www.bseindia.com",
             }
             if extra_headers:
                 headers.update(extra_headers)
@@ -187,7 +187,7 @@ def get_screener_fundamentals(comp_title):
     clean_name = clean_name.split("-")[0].strip()
     clean_name = re.sub(r"\b(ltd|limited|india|industries|corp|corporation|pvt)\b", "", clean_name, flags=re.I).strip()
     words = [w for w in clean_name.split() if len(w) > 1]
-    
+
     queries = [clean_name]
     if len(words) >= 2:
         queries.append(" ".join(words[:2]))
@@ -245,7 +245,7 @@ def get_screener_fundamentals(comp_title):
                         t = " ".join(li.get_text(" ", strip=True).split())
                         num_span = li.find("span", class_="number")
                         num_txt = num_span.get_text(strip=True) if num_span else ""
-                        
+
                         if "Current Price" in t and num_txt:
                             info["price_str"] = f"₹{num_txt}"
                         elif "Market Cap" in t and num_txt:
@@ -360,7 +360,7 @@ def get_screener_fundamentals(comp_title):
     return info
 
 
-# ---------------- BSE XML FEED PARSING ----------------
+# ---------------- BSE DIRECT JSON API + XML FEED PARSING ----------------
 def local_name(tag):
     return tag.rsplit("}", 1)[-1].lower()
 
@@ -386,13 +386,73 @@ def extract_links_from_xml_item(item):
 
 def is_mutual_fund_nav_spam(title, description, scripcode=""):
     t_low = (title + " " + description).lower()
-    if scripcode.startswith("90") and len(scripcode) >= 6:
+    if str(scripcode).startswith("90") and len(str(scripcode)) >= 6:
         return True
     spam_phrases = (
         "nav as on", "nav as of", "current expense ratio", "monthly portfolio",
         "idcw reinvest", "direct plan - growth", "regular plan - growth",
     )
     return any(p in t_low for p in spam_phrases)
+
+
+def fetch_bse_json_announcements():
+    """Fetches latest Results and Company Updates directly from BSE Official JSON API."""
+    ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    today_str = ist_now.strftime("%Y%m%d")
+    prev_str = (ist_now - timedelta(days=1)).strftime("%Y%m%d")
+
+    categories = [
+        ("result", "Result"),
+        ("announcement", "Company+Update"),
+    ]
+    output = []
+
+    for kind, cat in categories:
+        api_url = (
+            f"https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
+            f"?pageno=1&strCat={cat}&strPrevDate={prev_str}&strScrip=&strSearch=P&strToDate={today_str}&strType=C&subcategory=-1"
+        )
+        try:
+            res = get_url(api_url)
+            data = res.json()
+            rows = data.get("Table", []) if isinstance(data, dict) else []
+            count = 0
+            for r in rows:
+                comp = str(r.get("SLONGNAME") or "").strip()
+                scrip = str(r.get("SCRIP_CD") or "").strip()
+                sub = str(r.get("NEWSSUB") or "").strip()
+                head = str(r.get("HEADLINE") or "").strip()
+                more = str(r.get("MORE") or "").strip()
+                subcat = str(r.get("SUBCATNAME") or "").strip()
+                attach = str(r.get("ATTACHMENTNAME") or "").strip()
+                news_id = str(r.get("NEWSID") or "").strip()
+
+                title = f"{comp} ({scrip}) - {sub}" if comp else sub
+                desc = " | ".join(filter(None, [subcat, head, more]))
+
+                if not title or is_mutual_fund_nav_spam(title, desc, scrip):
+                    continue
+
+                pdf_link = f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{attach}" if attach else ""
+                item_kind = "result" if (kind == "result" or "result" in subcat.lower()) else "announcement"
+
+                output.append({
+                    "kind": item_kind,
+                    "title": html.unescape(re.sub(r"<[^>]+>", " ", title)).strip(),
+                    "description": html.unescape(re.sub(r"<[^>]+>", " ", desc)).strip(),
+                    "link": pdf_link,
+                    "attachment_name": attach,
+                    "guid": news_id or pdf_link or title,
+                    "published": str(r.get("DissemDT") or r.get("NEWS_DT") or ""),
+                })
+                count += 1
+                if count >= MAX_ITEMS_PER_FEED:
+                    break
+            log.info("BSE JSON API (%s): %d items fetched", cat, count)
+        except Exception as exc:
+            log.warning("BSE JSON API warning (%s): %s", cat, exc)
+
+    return output
 
 
 def parse_feed(feed_url, feed_kind):
@@ -423,6 +483,7 @@ def parse_feed(feed_url, feed_kind):
             "title": html.unescape(re.sub(r"<[^>]+>", " ", title)).strip(),
             "description": html.unescape(re.sub(r"<[^>]+>", " ", description)).strip(),
             "link": urljoin(feed_url, link) if link else "",
+            "attachment_name": "",
             "guid": guid or link or title,
             "published": child_text(node, {"pubdate", "published", "updated", "date"}),
         })
@@ -462,11 +523,21 @@ def get_document_payload(item):
         parts.append("FEED DESCRIPTION:\n" + item["description"])
 
     url = item["link"]
+    attach_name = item.get("attachment_name", "")
+
     if url:
         path = urlparse(url).path.lower()
         try:
             if path.endswith(".pdf"):
-                response = get_url(url)
+                try:
+                    response = get_url(url)
+                except Exception:
+                    if attach_name and "AttachLive" in url:
+                        fallback_url = f"https://www.bseindia.com/xml-data/corpfiling/AttachHis/{attach_name}"
+                        response = get_url(fallback_url)
+                        item["link"] = fallback_url
+                    else:
+                        raise
                 pdf_bytes = response.content
                 text_parts = []
                 with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
@@ -500,6 +571,7 @@ RESULT_WORDS = (
     "financial result", "unaudited financial", "audited financial",
     "quarterly result", "half year result", "annual result", "financial results",
     "standalone result", "consolidated result", "standalone and consolidated",
+    "outcome of board meeting",
 )
 ORDER_WORDS = (
     "award_of_order", "receipt_of_order", "award of order", "receipt of order",
@@ -594,7 +666,27 @@ def ensure_valid_result_numbers(ai_data, screener_info):
 
     return ai_data
 
-# ---------------- આ ફંક્શનમાં કડક નિયમો (Prompt) ઉમેર્યા છે ----------------
+
+def call_gemini_with_fallback(contents):
+    models_to_try = list(dict.fromkeys([
+        GEMINI_MODEL,
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-1.5-flash",
+    ]))
+    last_err = None
+    for m_name in models_to_try:
+        if not m_name:
+            continue
+        try:
+            model = genai.GenerativeModel(m_name)
+            return model.generate_content(contents)
+        except Exception as exc:
+            last_err = exc
+            log.warning("Model %s failed, trying next fallback: %s", m_name, exc)
+    raise RuntimeError(f"All Gemini models failed: {last_err}")
+
+
 def analyze_with_gemini_json(company_title, doc_type, source_text, pdf_bytes, screener_info):
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not configured")
@@ -603,13 +695,13 @@ def analyze_with_gemini_json(company_title, doc_type, source_text, pdf_bytes, sc
 You are the Chief Financial Analyst for 'MarketMunafa'.
 Analyze the attached BSE corporate filing ({doc_type.upper()}) and Screener fundamentals data.
 
-CRITICAL RULES:
-1. EXCLUDE STANDALONE: Completely ignore any 'Standalone' financial figures. Do not even mention them.
-2. USE CONSOLIDATED ONLY: You must extract data ONLY from the 'Consolidated' financial results table.
-3. YOY GROWTH: Calculate and highlight the Year-on-Year (YoY) growth percentage. Do not focus on QoQ unless YoY is unavailable.
+STRICT RULES FOR CONSOLIDATED & YOY DATA EXTRACTION:
+1. EXCLUDE STANDALONE: Completely ignore any 'Standalone' financial figures if 'Consolidated' figures are present in the PDF. Always look for the 'Consolidated Financial Results' table first. Only use Standalone if the company has no subsidiaries and does not report Consolidated numbers at all.
+2. FOCUS ON CONSOLIDATED PAT: For 'net_profit', strictly extract Consolidated Net Profit / Profit After Tax (PAT) for the period.
+3. STRICTLY YOY GROWTH: Always compare the latest quarter ('curr') against the SAME QUARTER LAST YEAR ('prev' - Year-on-Year / YoY), NOT the preceding quarter (QoQ), so that numbers match major financial portals 100%.
 4. All English fields MUST be 100% in English (zero Gujarati words in English fields). Only 'gujarati_summary' and 'gujarati_intraday_view' must be in Gujarati.
 5. NEVER return "N/A" for Revenue, Gross Profit, or Net Profit in a 'result' filing!
-   - Read the financial table from the attached PDF carefully (even if it is a scanned image).
+   - Read the Consolidated financial table from the attached PDF carefully (even if it is a scanned image).
    - UNIT CONVERSION: If the PDF table says "(Rs. in Lakhs)" or "(Rs. in Lacs)", divide every number by 100 to convert into Rs. Crores (e.g., 3,450 Lakhs = 34.50 Cr). If "(Rs. in Millions)", divide by 10. Keep up to 2 decimal places for figures under 100 Cr.
    - If "Gross Profit" is not explicitly labeled in the PDF statement, compute it as (Revenue from Operations minus Cost of Materials/Operating Expenses) OR use Operating Profit (EBITDA) / Profit Before Tax (PBT).
    - If no PDF is attached or it is unreadable, use the latest quarter and YoY quarter numbers from "Screener Historical Quarters" provided below!
@@ -638,14 +730,14 @@ Screener Annual YoY Data (in Rs. Cr.):
 
 Return ONLY a valid JSON object with this exact structure:
 {{
-  "seo_title": "Catchy Google News SEO Title in 100% English (under 110 chars)",
+  "seo_title": "Catchy Google News SEO Title in 100% English highlighting Consolidated PAT & YoY Growth (under 110 chars)",
   "company_short_name": "Clean Company Name in English",
-  "result_date": "Date of filing in English (e.g. November 10, 2026)",
+  "result_date": "Date of filing in English (e.g. November 11, 2026)",
   "price_display": "{screener_info['price_str']}",
   "quarter_label": "e.g. Q2 FY26-27",
   "curr_period_label": "e.g. Sep 26",
   "prev_period_label": "e.g. Sep 25",
-  "result_type": "Consolidated or Standalone",
+  "result_type": "Consolidated",
   "revenue": {{"curr": "36.76", "prev": "27.15", "growth": "+35.4%", "difference": "+9.61 Cr"}},
   "gross_profit": {{"curr": "14.24", "prev": "7.75", "growth": "+83.7%", "difference": "+6.49 Cr"}},
   "net_profit": {{"curr": "11.27", "prev": "6.89", "growth": "+63.6%", "difference": "+4.38 Cr"}},
@@ -675,10 +767,10 @@ Return ONLY a valid JSON object with this exact structure:
   "quarter_chart_gross_profit": [7.1, 7.75, 7.9, 8.6, 10.2, 14.24],
   "quarter_chart_net_profit": [5.45, 6.89, 5.83, 7.51, 9.02, 11.27],
   "seo_article_paragraphs": [
-    "Paragraph 1 (80-100 words in 100% English): Journalistic breakdown of the financial result OR new order receipt.",
+    "Paragraph 1 (80-100 words in 100% English): Journalistic breakdown of the Consolidated financial result (YoY comparison) OR new order receipt.",
     "Paragraph 2 (80-100 words in 100% English): Fundamental valuation analysis covering Market Cap, P/E, ROE, EPS, Book Value, Debt-to-Equity, and expected return."
   ],
-  "gujarati_summary": "2-3 sentences in natural Gujarati summarizing the result or new order.",
+  "gujarati_summary": "2-3 sentences in natural Gujarati summarizing the Consolidated result (YoY) or new order.",
   "gujarati_intraday_view": "1-2 sentences in natural Gujarati explaining debt, valuation, and expected return."
 }}
 
@@ -689,12 +781,12 @@ Extracted Text from Filing:
     if pdf_bytes and len(pdf_bytes) < 18 * 1024 * 1024:
         try:
             pdf_part = {"mime_type": "application/pdf", "data": pdf_bytes}
-            response = gemini_model.generate_content([prompt, pdf_part])
+            response = call_gemini_with_fallback([prompt, pdf_part])
         except Exception as exc:
             log.warning("Multimodal PDF OCR fallback to text prompt: %s", exc)
 
     if response is None:
-        response = gemini_model.generate_content(prompt)
+        response = call_gemini_with_fallback(prompt)
 
     raw = (response.text or "").strip()
     match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
@@ -803,7 +895,7 @@ def build_yoy_comparison_chart_url(comp_name, qtr_lbl, prev_lbl, curr_lbl, rev, 
             "layout": {"padding": {"top": 26, "right": 14, "left": 10, "bottom": 8}},
             "title": {
                 "display": True,
-                "text": f"{comp_name} - {qtr_lbl} (Rs.Cr.)",
+                "text": f"{comp_name} - {qtr_lbl} YoY (Rs.Cr.)",
                 "fontSize": 17,
                 "fontColor": "#475569",
                 "padding": 14,
@@ -841,7 +933,7 @@ def build_post_html(data, doc_type, screener_info, source_url):
     qtr_lbl = html.escape(str(data.get("quarter_label", "Q2 FY26-27")))
     curr_lbl = html.escape(str(data.get("curr_period_label", "Sep 26")))
     prev_lbl = html.escape(str(data.get("prev_period_label", "Sep 25")))
-    res_type = html.escape(str(data.get("result_type", "Standalone")))
+    res_type = html.escape(str(data.get("result_type", "Consolidated")))
 
     mkt_cap = html.escape(str(data.get("market_cap") or screener_info["market_cap"]))
     pe_ratio = html.escape(str(data.get("pe_ratio") or screener_info["pe_ratio"]))
@@ -902,7 +994,7 @@ def build_post_html(data, doc_type, screener_info, source_url):
         q_rev = data.get("quarter_chart_revenue") or screener_info["q_rev"] or [to_float(rev.get("prev")), to_float(rev.get("curr"))]
         q_gp = data.get("quarter_chart_gross_profit") or screener_info["q_gp"] or [to_float(gp.get("prev")), to_float(gp.get("curr"))]
         q_np = data.get("quarter_chart_net_profit") or screener_info["q_np"] or [to_float(np_d.get("prev")), to_float(np_d.get("curr"))]
-        
+
         quarter_chart_url = build_quarterly_column_chart_url(comp_name, q_labels, q_rev, q_gp, q_np)
         yoy_chart_url = build_yoy_comparison_chart_url(comp_name, qtr_lbl, prev_lbl, curr_lbl, rev, gp, np_d, debt_comp)
 
@@ -926,7 +1018,7 @@ def build_post_html(data, doc_type, screener_info, source_url):
                 <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">{curr_lbl}</th>
                 <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">{prev_lbl}</th>
                 <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">Diff</th>
-                <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">Growth</th>
+                <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">YoY Growth</th>
               </tr>
             </thead>
             <tbody>
@@ -945,7 +1037,7 @@ def build_post_html(data, doc_type, screener_info, source_url):
                 <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap; color: {growth_color(gp.get('growth', ''))};">{html.escape(str(gp.get('growth', '0%')))}</td>
               </tr>
               <tr>
-                <td style="padding: 12px 4px; color: #1e293b; font-weight: 500; white-space: nowrap;">Net Profit</td>
+                <td style="padding: 12px 4px; color: #1e293b; font-weight: 500; white-space: nowrap;">Net Profit (PAT)</td>
                 <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap;">{html.escape(str(np_d.get('curr', '0')))}</td>
                 <td style="padding: 12px 4px; text-align: right; color: #475569; white-space: nowrap;">{html.escape(str(np_d.get('prev', '0')))}</td>
                 <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: #0f172a; white-space: nowrap;">{html.escape(str(np_d.get('difference', '0')))}</td>
@@ -961,7 +1053,7 @@ def build_post_html(data, doc_type, screener_info, source_url):
         </div>
         
         <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 18px; margin-bottom: 24px; text-align: center; box-shadow: 0 4px 14px rgba(0,0,0,0.04);">
-          <h3 style="margin: 0 0 12px 0; font-size: 19px; color: #0f172a;">📈 Previous vs Current Year Result & Debt Chart</h3>
+          <h3 style="margin: 0 0 12px 0; font-size: 19px; color: #0f172a;">📈 Previous vs Current Year Result & Debt Chart (YoY)</h3>
           <img src="{yoy_chart_url}" alt="YoY Column Chart" style="max-width: 100%; height: auto; border-radius: 8px;" />
         </div>
         <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 18px; margin-bottom: 24px; text-align: center; box-shadow: 0 4px 14px rgba(0,0,0,0.04);">
@@ -1080,15 +1172,15 @@ def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, 
             f"• <b>કામની વિગત:</b> {html.escape(str(ord_info.get('scope_of_work', '-')))}\n\n"
         )
     else:
-        header_title = f"📊 <b>{comp_name} - {qtr_lbl} રિઝલ્ટ અપડેટ</b>"
+        header_title = f"📊 <b>{comp_name} - {qtr_lbl} Consolidated રિઝલ્ટ અપડેટ</b>"
         rev = data.get("revenue", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
         gp = data.get("gross_profit", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
         np_d = data.get("net_profit", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
         dynamic_block_gu = (
-            f"📈 <b>નાણાકીય કામગીરી ({curr_lbl} vs {prev_lbl}):</b>\n"
-            f"• <b>આવક (Revenue):</b> ₹{html.escape(str(rev.get('curr', '0')))} Cr (તફાવત: {html.escape(str(rev.get('difference', '0')))}) | ગ્રોથ: <b>{html.escape(str(rev.get('growth', '0%')))}</b>\n"
-            f"• <b>કુલ નફો (Gross Profit):</b> ₹{html.escape(str(gp.get('curr', '0')))} Cr (તફાવત: {html.escape(str(gp.get('difference', '0')))}) | ગ્રોથ: <b>{html.escape(str(gp.get('growth', '0%')))}</b>\n"
-            f"• <b>ચોખ્ખો નફો (Net Profit):</b> ₹{html.escape(str(np_d.get('curr', '0')))} Cr (તફાવત: {html.escape(str(np_d.get('difference', '0')))}) | ગ્રોથ: <b>{html.escape(str(np_d.get('growth', '0%')))}</b>\n\n"
+            f"📈 <b>નાણાકીય કામગીરી - YoY ({curr_lbl} vs {prev_lbl}):</b>\n"
+            f"• <b>આવક (Revenue):</b> ₹{html.escape(str(rev.get('curr', '0')))} Cr (તફાવત: {html.escape(str(rev.get('difference', '0')))}) | YoY ગ્રોથ: <b>{html.escape(str(rev.get('growth', '0%')))}</b>\n"
+            f"• <b>કુલ નફો (Gross Profit):</b> ₹{html.escape(str(gp.get('curr', '0')))} Cr (તફાવત: {html.escape(str(gp.get('difference', '0')))}) | YoY ગ્રોથ: <b>{html.escape(str(gp.get('growth', '0%')))}</b>\n"
+            f"• <b>ચોખ્ખો નફો (Consolidated PAT):</b> ₹{html.escape(str(np_d.get('curr', '0')))} Cr (તફાવત: {html.escape(str(np_d.get('difference', '0')))}) | YoY ગ્રોથ: <b>{html.escape(str(np_d.get('growth', '0%')))}</b>\n\n"
         )
 
     msg_html = (
@@ -1120,7 +1212,7 @@ def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, 
                 data={
                     "chat_id": TELEGRAM_CHAT_ID,
                     "photo": chart_url,
-                    "caption": f"📊 {comp_name} - પરિણામ અને ગ્રોથ ચાર્ટ",
+                    "caption": f"📊 {comp_name} - Consolidated YoY પરિણામ અને ગ્રોથ ચાર્ટ",
                 },
                 timeout=15,
             )
@@ -1193,7 +1285,7 @@ def blogger_publish(title, content_html, doc_type):
     if not BLOG_ID:
         raise RuntimeError("BLOG_ID is missing")
     token = blogger_access_token()
-    
+
     clean_title = re.sub(r"<[^>]+>", "", str(title))
     clean_title = re.sub(r"[\r\n\t]+", " ", clean_title).strip()[:140]
     if not clean_title:
@@ -1204,9 +1296,9 @@ def blogger_publish(title, content_html, doc_type):
     payload = {
         "title": clean_title,
         "content": content_html,
-        "labels": labels
+        "labels": labels,
     }
-    
+
     response = requests.post(
         f"https://www.googleapis.com/blogger/v3/blogs/{BLOG_ID}/posts/",
         headers={
@@ -1222,7 +1314,7 @@ def blogger_publish(title, content_html, doc_type):
 
 def publish_item(item, doc_type, ai_data, screener_info, item_id, comp_key, file_key):
     source_url = item["link"]
-    raw_title = ai_data.get("seo_title") or f"{item['title']} Corporate Update & Valuation | MarketMunafa"
+    raw_title = ai_data.get("seo_title") or f"{item['title']} Consolidated Results & Valuation | MarketMunafa"
     blog_html, yoy_chart_url = build_post_html(ai_data, doc_type, screener_info, source_url)
 
     blog_url = ""
@@ -1239,10 +1331,15 @@ def run():
     init_db()
     all_items = []
 
+    # 1. Fetch from BSE Direct JSON API (Results + Company Updates)
+    json_items = fetch_bse_json_announcements()
+    all_items.extend(json_items)
+
+    # 2. Also check BSE XML Feeds as backup
     for kind, feed_url in FEEDS.items():
         try:
             items = parse_feed(feed_url, kind)
-            log.info("%s feed (filtered): %d items", kind, len(items))
+            log.info("%s XML feed (filtered): %d items", kind, len(items))
             all_items.extend(items)
         except Exception:
             log.exception("Feed failed: %s", feed_url)
@@ -1259,6 +1356,7 @@ def run():
     for item in all_items:
         doc_type = classify_item(item)
         if not doc_type:
+            log.info("Skipping non-result/order announcement: %s", item["title"])
             continue
 
         comp_key = normalize_company_key(item["title"], doc_type)
@@ -1299,7 +1397,7 @@ def run():
                 seen_file_in_run.add(file_key)
 
             publish_item(item, doc_type, ai_data, screener_info, item_id, comp_key, file_key)
-            
+
             if comp_key:
                 live_comp_keys.add(comp_key)
             if file_key:
