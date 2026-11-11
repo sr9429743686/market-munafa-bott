@@ -23,6 +23,7 @@ import google.generativeai as genai
 
 # ---------------- CONFIG ----------------
 BLOG_ID = os.getenv("BLOG_ID", "6996150531679127159").strip()
+BLOG_BASE_URL = os.getenv("BLOG_BASE_URL", "https://marketmunafa.blogspot.com").rstrip("/")
 GOOGLE_CLIENT_ID = (os.getenv("GOOGLE_CLIENT_ID") or os.getenv("CLIENT_ID") or "").strip()
 GOOGLE_CLIENT_SECRET = (os.getenv("GOOGLE_CLIENT_SECRET") or os.getenv("CLIENT_SECRET") or "").strip()
 GOOGLE_REFRESH_TOKEN = (os.getenv("GOOGLE_REFRESH_TOKEN") or os.getenv("REFRESH_TOKEN") or "").strip()
@@ -32,7 +33,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9086072964:AAEUyn-GAyJLdsY
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "430834857").strip()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -720,8 +721,8 @@ _CACHED_WORKING_MODEL = None
 def get_candidate_gemini_models():
     candidates = [
         GEMINI_MODEL,
-        "gemini-3.8-flash",
-        "gemini-3.0-flash",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
         "gemini-3-flash-preview",
         "gemini-3.1-flash-lite-preview",
         "gemini-flash-latest",
@@ -761,26 +762,24 @@ def call_gemini_with_fallback(contents):
     raise RuntimeError(f"All Gemini models failed: {last_err}")
 
 
-def analyze_with_gemini_json(company_title, doc_type, source_text, pdf_bytes, screener_info):
+def analyze_with_gemini_json(company_title, scrip_code, doc_type, source_text, pdf_bytes, screener_info):
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not configured")
 
     prompt = f"""
-You are the Chief Financial Analyst for 'MarketMunafa'.
+You are the Chief Equity Research Analyst and SEO Editor for 'MarketMunafa' (https://marketmunafa.blogspot.com).
 Analyze the attached BSE corporate filing ({doc_type.upper()}) and Screener fundamentals data.
 
-STRICT RULES FOR CONSOLIDATED & YOY DATA EXTRACTION:
-1. EXCLUDE STANDALONE: Completely ignore any 'Standalone' financial figures if 'Consolidated' figures are present in the PDF. Always look for the 'Consolidated Financial Results' table first. Only use Standalone if the company has no subsidiaries and does not report Consolidated numbers at all.
-2. FOCUS ON CONSOLIDATED PAT: For 'net_profit', strictly extract Consolidated Net Profit / Profit After Tax (PAT) for the period.
-3. STRICTLY YOY GROWTH: Always compare the latest quarter ('curr') against the SAME QUARTER LAST YEAR ('prev' - Year-on-Year / YoY), NOT the preceding quarter (QoQ), so that numbers match major financial portals 100%.
-4. All English fields MUST be 100% in English (zero Gujarati words in English fields). Only 'gujarati_summary' and 'gujarati_intraday_view' must be in Gujarati.
-5. NEVER return "N/A" for Revenue, Gross Profit, or Net Profit in a 'result' filing!
-   - Read the Consolidated financial table from the attached PDF carefully (even if it is a scanned image).
-   - UNIT CONVERSION: If the PDF table says "(Rs. in Lakhs)" or "(Rs. in Lacs)", divide every number by 100 to convert into Rs. Crores (e.g., 3,450 Lakhs = 34.50 Cr). If "(Rs. in Millions)", divide by 10. Keep up to 2 decimal places for figures under 100 Cr.
-   - If "Gross Profit" is not explicitly labeled in the PDF statement, compute it as (Revenue from Operations minus Cost of Materials/Operating Expenses) OR use Operating Profit (EBITDA) / Profit Before Tax (PBT).
-   - If no PDF is attached or it is unreadable, use the latest quarter and YoY quarter numbers from "Screener Historical Quarters" provided below!
+STRICT RULES FOR 100% COPYRIGHT-FREE SEO CONTENT & CONSOLIDATED YOY DATA:
+1. 100% ORIGINAL & COPYRIGHT-FREE WRITING: Write all analysis in your own original equity-research voice. Never copy sentences verbatim from the filing. Transform raw numbers into insightful financial commentary that passes Google's Helpful Content and E-E-A-T guidelines.
+2. EXCLUDE STANDALONE: Completely ignore 'Standalone' figures if 'Consolidated' figures exist in the PDF. Always prioritize 'Consolidated Financial Results'. Only use Standalone if the company has no subsidiaries.
+3. FOCUS ON CONSOLIDATED PAT & YOY GROWTH: For 'net_profit', strictly extract Consolidated Profit After Tax (PAT). Compare the latest quarter ('curr') against the SAME QUARTER LAST YEAR ('prev' - Year-on-Year / YoY).
+4. UNIT CONVERSION: If the PDF table reports in "(Rs. in Lakhs)" or "(Rs. in Lacs)", divide every number by 100 to convert into Rs. Crores (e.g., 3,450 Lakhs = 34.50 Cr). If "(Rs. in Millions)", divide by 10.
+5. NEVER return "N/A" for Revenue, Gross Profit, or Net Profit in a 'result' filing. If Gross Profit is not explicitly labeled, compute (Revenue minus Cost of Materials/Operating Expenses) or use EBITDA / PBT. If the PDF is unreadable, use the "Screener Historical Quarters" below.
+6. All English fields MUST be 100% in English. Only 'gujarati_summary' and 'gujarati_intraday_view' must be in natural Gujarati.
 
 Company Headline: {company_title}
+BSE Scrip Code: {scrip_code or 'Listed on BSE'}
 Document Type: {doc_type}
 Screener Fundamentals:
 - Market Cap: {screener_info['market_cap']}
@@ -796,7 +795,7 @@ Screener Fundamentals:
 - Debt-to-Equity: {screener_info['debt_to_equity']}
 - Face Value: {screener_info['face_value']}
 
-Screener Historical Quarters (Fallback & Multi-Quarter Trend in Rs. Cr.):
+Screener Historical Quarters (in Rs. Cr.):
 {screener_info['quarters_text']}
 
 Screener Annual YoY Data (in Rs. Cr.):
@@ -804,7 +803,8 @@ Screener Annual YoY Data (in Rs. Cr.):
 
 Return ONLY a valid JSON object with this exact structure:
 {{
-  "seo_title": "Catchy Google News SEO Title in 100% English starting with Company Name and highlighting Consolidated PAT & YoY Growth (under 110 chars)",
+  "seo_title": "High-CTR Google Search & Discover Title in 100% English starting with Company Name + Share Price/Order/Q2 Consolidated PAT YoY Growth (70 to 105 chars)",
+  "seo_lead_summary": "A 45-60 word SEO meta summary paragraph in 100% English starting with Company Name (BSE: {scrip_code}) that summarizes the exact Consolidated PAT/Revenue YoY growth OR New Order value, current share price ({screener_info['price_str']}), and valuation impact.",
   "company_short_name": "Clean Company Name in English",
   "result_date": "Date of filing in English (e.g. November 11, 2026)",
   "price_display": "{screener_info['price_str']}",
@@ -817,9 +817,10 @@ Return ONLY a valid JSON object with this exact structure:
   "net_profit": {{"curr": "11.27", "prev": "6.89", "growth": "+63.6%", "difference": "+4.38 Cr"}},
   "debt_comparison": {{"curr": "{screener_info['curr_debt_num']}", "prev": "{screener_info['prev_debt_num']}"}},
   "order_details": {{
-    "client_or_awarder": "Client or Subsidiary Name (for order filings)",
-    "order_value": "Order / Award Value in Rs. Cr.",
-    "scope_of_work": "Brief description of order in English",
+    "client_or_awarder": "Client or Authority Name (for order filings)",
+    "order_value": "Order / Contract Value in Rs. Cr.",
+    "order_to_mcap_ratio": "Calculate Order Value as % of Market Cap ({screener_info['market_cap']}) in English",
+    "scope_of_work": "Clear description of project scope in English",
     "execution_timeline": "Execution timeline in English"
   }},
   "market_cap": "{screener_info['market_cap']}",
@@ -834,15 +835,45 @@ Return ONLY a valid JSON object with this exact structure:
   "debt_to_equity": "{screener_info['debt_to_equity']}",
   "face_value": "{screener_info['face_value']}",
   "fundamental_impact_note": "1-2 sentences in 100% English explaining what changed in the fundamentals.",
-  "estimated_stock_return": "Estimated % return in 100% English (e.g. +8.0% to +12.5% Short-Term Bullish)",
-  "intraday_signal": "1-2 sentences in 100% English explaining intraday/positional sentiment.",
+  "estimated_stock_return": "Estimated % return / outlook in 100% English (e.g. +8.0% to +12.5% Bullish Momentum)",
+  "intraday_signal": "1-2 sentences in 100% English explaining technical/positional sentiment.",
   "quarter_chart_labels": ["Jun 25", "Sep 25", "Dec 25", "Mar 26", "Jun 26", "Sep 26"],
   "quarter_chart_revenue": [24.1, 27.15, 26.04, 28.31, 30.8, 36.76],
   "quarter_chart_gross_profit": [7.1, 7.75, 7.9, 8.6, 10.2, 14.24],
   "quarter_chart_net_profit": [5.45, 6.89, 5.83, 7.51, 9.02, 11.27],
-  "seo_article_paragraphs": [
-    "Paragraph 1 (80-100 words in 100% English): Journalistic breakdown of the Consolidated financial result (YoY comparison) OR new order receipt.",
-    "Paragraph 2 (80-100 words in 100% English): Fundamental valuation analysis covering Market Cap, P/E, ROE, EPS, Book Value, Debt-to-Equity, and expected return."
+  "key_highlights": [
+    "Bullet 1 in 100% English: Core top-line revenue or order book milestone with exact figures.",
+    "Bullet 2 in 100% English: Operating margin and Consolidated PAT expansion/contraction.",
+    "Bullet 3 in 100% English: Balance sheet strength, Total Debt ({screener_info['total_debt']}), and Debt-to-Equity ({screener_info['debt_to_equity']}).",
+    "Bullet 4 in 100% English: Valuation comparison between Stock P/E ({screener_info['pe_ratio']}) and Industry P/E ({screener_info['industry_pe']})."
+  ],
+  "seo_article_sections": [
+    {{
+      "heading": "Operational Performance & YoY Earnings Breakdown (or Order Execution Visibility)",
+      "body": "130-150 words of 100% original, copyright-free financial journalism in English analyzing the exact numbers from the filing, YoY trajectory, and operational efficiency."
+    }},
+    {{
+      "heading": "Fundamental Valuation, ROE & Balance Sheet Health",
+      "body": "130-150 words in 100% English analyzing Market Cap, Stock P/E vs Industry P/E, ROE, EPS, Book Value, Debt-to-Equity, and whether the stock looks undervalued or richly priced."
+    }},
+    {{
+      "heading": "Market Outlook & Key Triggers for Investors",
+      "body": "100-120 words in 100% English discussing medium-term growth catalysts, execution risks, and what retail investors should track next."
+    }}
+  ],
+  "faqs": [
+    {{
+      "q": "What are the latest {doc_type} highlights of [Company Name]?",
+      "a": "Direct 2-sentence answer in 100% English with exact Rs. Cr. numbers and YoY growth."
+    }},
+    {{
+      "q": "What is the current P/E ratio, ROE, and Book Value of [Company Name] share?",
+      "a": "Direct 2-sentence answer in 100% English citing Stock P/E, Industry P/E, ROE, and Book Value."
+    }},
+    {{
+      "q": "Is [Company Name] a debt-free or low-debt company?",
+      "a": "Direct 2-sentence answer in 100% English citing Total Debt and Debt-to-Equity ratio."
+    }}
   ],
   "gujarati_summary": "2-3 sentences in natural Gujarati summarizing the Consolidated result (YoY) or new order.",
   "gujarati_intraday_view": "1-2 sentences in natural Gujarati explaining debt, valuation, and expected return."
@@ -1000,7 +1031,8 @@ def build_yoy_comparison_chart_url(comp_name, qtr_lbl, prev_lbl, curr_lbl, rev, 
     return f"https://quickchart.io/chart?w=750&h=420&bkg=white&c={encoded}"
 
 
-def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scrip_key="", file_key=""):
+# ---------------- SEO + COPYRIGHT-FREE HTML BUILDER ----------------
+def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scrip_key="", file_key="", scrip_code=""):
     comp_name = html.escape(str(data.get("company_short_name", "Company")))
     res_date = html.escape(str(data.get("result_date", datetime.now().strftime("%B %d, %Y"))))
     price_disp = html.escape(str(data.get("price_display", screener_info["price_str"])))
@@ -1024,17 +1056,34 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
     est_return = html.escape(str(data.get("estimated_stock_return", "N/A")))
     intraday_sig = html.escape(str(data.get("intraday_signal", "")))
 
-    thumb_prompt = f"{comp_name} corporate financial update stock market india"
-    thumb_url = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(thumb_prompt)}?width=800&height=450&nologo=true"
+    # 1. SEO Lead Summary at the very top (for Google Search Snippet & Blogger Search Description)
+    raw_lead = str(data.get("seo_lead_summary") or "").strip()
+    if not raw_lead:
+        if doc_type == "order":
+            ord_val = (data.get("order_details") or {}).get("order_value", "a new contract")
+            raw_lead = (
+                f"{data.get('company_short_name', 'The company')} (BSE: {scrip_code or 'Listed'}) has announced the receipt "
+                f"of a new order worth {ord_val}. Trading near {screener_info['price_str']} with a Market Cap of "
+                f"{screener_info['market_cap']} and ROE of {screener_info['roe']}, here is the complete order book and fundamental analysis."
+            )
+        else:
+            np_info = data.get("net_profit") or {}
+            rev_info = data.get("revenue") or {}
+            raw_lead = (
+                f"{data.get('company_short_name', 'The company')} (BSE: {scrip_code or 'Listed'}) declared its {data.get('quarter_label', 'quarterly')} "
+                f"Consolidated financial results, reporting a Net Profit (PAT) of Rs. {np_info.get('curr', '0')} Cr ({np_info.get('growth', '0%')} YoY) "
+                f"and Revenue of Rs. {rev_info.get('curr', '0')} Cr ({rev_info.get('growth', '0%')} YoY)."
+            )
+    lead_html = html.escape(raw_lead)
 
-    paragraphs = data.get("seo_article_paragraphs", [])
-    para_html = "".join(f"<p style='color:#334155; font-size:16px; line-height:1.7; margin-bottom:14px;'>{html.escape(p)}</p>" for p in paragraphs)
-
-    source_link_html = (
-        f'<p style="margin-top:16px;"><a href="{html.escape(source_url, quote=True)}" '
-        f'target="_blank" rel="nofollow noopener" style="color:#2563eb; font-weight:600; text-decoration:none;">'
-        f'📄 View Official BSE Filing PDF</a></p>'
-        if source_url else ""
+    # 2. 100% Copyright-Free 1200x675 (16:9) Google Discover Optimized Image with deterministic unique seed
+    seed_int = int(hashlib.md5((comp_name + res_date).encode("utf-8")).hexdigest()[:6], 16)
+    thumb_prompt = (
+        f"modern 3d financial stock market analytics chart infographic upward trend corporate building india {comp_name}"
+    )
+    thumb_url = (
+        f"https://image.pollinations.ai/prompt/{urllib.parse.quote(thumb_prompt)}"
+        f"?width=1200&height=675&seed={seed_int}&nologo=true"
     )
 
     content_blocks = []
@@ -1043,16 +1092,18 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
         ord_info = data.get("order_details", {}) or {}
         client_str = html.escape(str(ord_info.get("client_or_awarder", "Disclosed in Filing")))
         val_str = html.escape(str(ord_info.get("order_value", "As per BSE Filing")))
-        scope_str = html.escape(str(ord_info.get("scope_of_work", "Receipt of new commercial order/contract")))
+        mcap_pct_str = html.escape(str(ord_info.get("order_to_mcap_ratio", "Significant Revenue Visibility")))
+        scope_str = html.escape(str(ord_info.get("scope_of_work", "Execution of commercial order/contract")))
         time_str = html.escape(str(ord_info.get("execution_timeline", "As per contract terms")))
 
         order_card = f"""
         <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 16px; padding: 22px; margin-bottom: 24px;">
-          <h3 style="margin: 0 0 16px 0; font-size: 20px; color: #1e3a8a;">🏆 New Order / Contract Receipt</h3>
+          <h2 style="margin: 0 0 16px 0; font-size: 20px; color: #1e3a8a;">🏆 {comp_name} New Order &amp; Contract Details</h2>
           <p style="margin: 8px 0; font-size: 16px;"><strong>Company Name:</strong> {comp_name} ({price_disp})</p>
-          <p style="margin: 8px 0; font-size: 16px;"><strong>Client / Awarding Entity:</strong> {client_str}</p>
-          <p style="margin: 8px 0; font-size: 16px;"><strong>Order / Award Value:</strong> <span style="color:#16a34a; font-weight:700;">{val_str}</span></p>
-          <p style="margin: 8px 0; font-size: 16px;"><strong>Nature of Order / Scope:</strong> {scope_str}</p>
+          <p style="margin: 8px 0; font-size: 16px;"><strong>Client / Awarding Authority:</strong> {client_str}</p>
+          <p style="margin: 8px 0; font-size: 16px;"><strong>Order / Contract Value:</strong> <span style="color:#16a34a; font-weight:700;">{val_str}</span></p>
+          <p style="margin: 8px 0; font-size: 16px;"><strong>Order Size vs Market Cap:</strong> {mcap_pct_str}</p>
+          <p style="margin: 8px 0; font-size: 16px;"><strong>Nature of Work / Scope:</strong> {scope_str}</p>
           <p style="margin: 8px 0; font-size: 16px;"><strong>Execution Timeline:</strong> {time_str}</p>
         </div>
         """
@@ -1127,19 +1178,37 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
         </div>
         
         <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 18px; margin-bottom: 24px; text-align: center; box-shadow: 0 4px 14px rgba(0,0,0,0.04);">
-          <h3 style="margin: 0 0 12px 0; font-size: 19px; color: #0f172a;">📈 Previous vs Current Year Result & Debt Chart (YoY)</h3>
-          <img src="{yoy_chart_url}" alt="YoY Column Chart" style="max-width: 100%; height: auto; border-radius: 8px;" />
+          <h2 style="margin: 0 0 12px 0; font-size: 19px; color: #0f172a;">📈 {comp_name} YoY Financial &amp; Debt Comparison Chart</h2>
+          <img src="{yoy_chart_url}" alt="{comp_name} {qtr_lbl} YoY Revenue Profit Chart" width="750" height="420" loading="lazy" style="max-width: 100%; height: auto; border-radius: 8px;" />
         </div>
         <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 18px; margin-bottom: 24px; text-align: center; box-shadow: 0 4px 14px rgba(0,0,0,0.04);">
-          <h3 style="margin: 0 0 12px 0; font-size: 19px; color: #0f172a;">📊 Multi-Quarter Performance Column Chart</h3>
-          <img src="{quarter_chart_url}" alt="Quarterly Column Chart" style="max-width: 100%; height: auto; border-radius: 8px;" />
+          <h2 style="margin: 0 0 12px 0; font-size: 19px; color: #0f172a;">📊 {comp_name} Multi-Quarter Performance Trend</h2>
+          <img src="{quarter_chart_url}" alt="{comp_name} Multi Quarter Revenue Net Profit Trend" width="750" height="420" loading="lazy" style="max-width: 100%; height: auto; border-radius: 8px;" />
         </div>
         """
         content_blocks.append(result_card)
 
+    # 3. Key Takeaways Bullet Box
+    highlights = data.get("key_highlights") or []
+    if highlights and isinstance(highlights, list):
+        li_items = "".join(
+            f"<li style='margin-bottom: 8px; color: #1e293b; line-height: 1.6;'>{html.escape(str(h))}</li>"
+            for h in highlights if h
+        )
+        highlights_card = f"""
+        <div style="background: #f8fafc; border-left: 4px solid #2563eb; border-radius: 8px; padding: 16px 20px; margin-bottom: 24px;">
+          <h2 style="margin: 0 0 10px 0; font-size: 18px; color: #0f172a;">📌 Key Financial Highlights for Investors</h2>
+          <ul style="margin: 0; padding-left: 20px; font-size: 15px;">
+            {li_items}
+          </ul>
+        </div>
+        """
+        content_blocks.append(highlights_card)
+
+    # 4. All 10 Fundamental Indicators Card
     fundamentals_card = f"""
     <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 20px; box-shadow: 0 4px 14px rgba(0,0,0,0.05); margin-bottom: 24px;">
-      <h3 style="margin: 0 0 16px 0; font-size: 20px; color: #0f172a;">Fundamentals (All 10 Indicators)</h3>
+      <h2 style="margin: 0 0 16px 0; font-size: 20px; color: #0f172a;">🔍 {comp_name} Fundamentals &amp; Valuation Ratios</h2>
       <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
         <tbody>
           <tr style="border-bottom: 1px solid #f1f5f9;">
@@ -1176,38 +1245,147 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
       </table>
 
       <p style="margin: 12px 0 6px 0; font-size: 14px; color: #475569;">
-        <strong>Total Company Debt:</strong> {total_debt} | <strong>Post-Filing Impact:</strong> {fund_impact}
+        <strong>Total Company Debt:</strong> {total_debt} | <strong>Fundamental Impact:</strong> {fund_impact}
       </p>
 
       <div style="background: #d1fae5; border: 1px solid #10b981; padding: 12px 14px; border-radius: 8px; font-size: 16px; margin-top: 12px;">
-        🎯 <strong>Estimated Stock Return / Target Boost:</strong> <span style="color: #065f46; font-weight: 700;">{est_return}</span>
+        🎯 <strong>Estimated Stock Return / Outlook:</strong> <span style="color: #065f46; font-weight: 700;">{est_return}</span>
       </div>
-      <p style="margin: 10px 0 0 0; font-size: 14px; color: #334155;"><strong>Intraday & Positional View:</strong> {intraday_sig}</p>
+      <p style="margin: 10px 0 0 0; font-size: 14px; color: #334155;"><strong>Technical &amp; Positional View:</strong> {intraday_sig}</p>
     </div>
     """
     content_blocks.append(fundamentals_card)
+
+    # 5. Deep-Dive Structured SEO Article Sections (400-500 words total)
+    sections = data.get("seo_article_sections") or []
+    article_html_parts = []
+    if sections and isinstance(sections, list):
+        for sec in sections:
+            if isinstance(sec, dict):
+                h_txt = html.escape(str(sec.get("heading", "Financial & Valuation Analysis")))
+                b_txt = html.escape(str(sec.get("body", "")))
+                if b_txt:
+                    article_html_parts.append(
+                        f"<h2 style='font-size: 19px; color: #0f172a; margin: 22px 0 10px 0;'>📝 {h_txt}</h2>"
+                        f"<p style='color:#334155; font-size:16px; line-height:1.75; margin-bottom:16px;'>{b_txt}</p>"
+                    )
+    else:
+        paragraphs = data.get("seo_article_paragraphs", [])
+        article_html_parts.append(
+            "<h2 style='font-size: 19px; color: #0f172a; margin: 22px 0 10px 0;'>📝 Detailed Corporate &amp; Valuation Analysis</h2>"
+        )
+        for p in paragraphs:
+            article_html_parts.append(
+                f"<p style='color:#334155; font-size:16px; line-height:1.75; margin-bottom:14px;'>{html.escape(str(p))}</p>"
+            )
+
+    # 6. Visible FAQ Section + JSON-LD FAQPage Schema for Google Rich Snippets
+    faqs = data.get("faqs") or []
+    if not faqs or not isinstance(faqs, list):
+        faqs = [
+            {
+                "q": f"What is the current share price and Market Cap of {data.get('company_short_name', 'the company')}?",
+                "a": f"{data.get('company_short_name', 'The company')} currently trades near {screener_info['price_str']} on the BSE with a total Market Capitalization of {screener_info['market_cap']}.",
+            },
+            {
+                "q": f"What is the P/E ratio and ROE of {data.get('company_short_name', 'the company')}?",
+                "a": f"The stock trades at a TTM P/E multiple of {screener_info['pe_ratio']} compared to the Industry P/E of {screener_info['industry_pe']}, with a Return on Equity (ROE) of {screener_info['roe']}.",
+            },
+            {
+                "q": f"How much debt does {data.get('company_short_name', 'the company')} have?",
+                "a": f"The company reports total borrowings of {screener_info['total_debt']} with a Debt-to-Equity ratio of {screener_info['debt_to_equity']}.",
+            },
+        ]
+
+    faq_html_items = []
+    faq_schema_entities = []
+    for f_item in faqs:
+        if isinstance(f_item, dict) and f_item.get("q") and f_item.get("a"):
+            q_clean = str(f_item["q"]).strip()
+            a_clean = str(f_item["a"]).strip()
+            faq_html_items.append(
+                f"<details style='background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:12px 16px; margin-bottom:10px;'>"
+                f"<summary style='font-weight:600; color:#0f172a; cursor:pointer; font-size:15px;'>{html.escape(q_clean)}</summary>"
+                f"<p style='margin:10px 0 0 0; color:#334155; font-size:15px; line-height:1.6;'>{html.escape(a_clean)}</p>"
+                f"</details>"
+            )
+            faq_schema_entities.append({
+                "@type": "Question",
+                "name": q_clean,
+                "acceptedAnswer": {
+                    "@type": "Answer",
+                    "text": a_clean,
+                },
+            })
+
+    faq_block_html = ""
+    if faq_html_items:
+        faq_block_html = (
+            f"<div style='margin: 26px 0;'>"
+            f"<h2 style='font-size: 19px; color: #0f172a; margin-bottom: 14px;'>❓ Frequently Asked Questions (FAQs)</h2>"
+            f"{''.join(faq_html_items)}"
+            f"</div>"
+        )
+
+    faq_schema_json = json.dumps({
+        "@context": "https://schema.org",
+        "@type": "FAQPage",
+        "mainEntity": faq_schema_entities,
+    })
+
+    # 7. Internal Linking Block (Boosts Google Crawl Depth & Organic Indexing)
+    internal_links_html = f"""
+    <div style="background: #eff6ff; border: 1px dashed #60a5fa; border-radius: 10px; padding: 14px 18px; margin: 22px 0; font-size: 14px; color: #1e3a8a;">
+      <strong>🔗 Explore More on MarketMunafa:</strong>
+      <ul style="margin: 8px 0 0 0; padding-left: 18px; line-height: 1.8;">
+        <li><a href="{BLOG_BASE_URL}/search/label/STOCK%20RESULT" style="color:#1d4ed8; font-weight:600; text-decoration:none;">📊 Latest Q2 &amp; Quarterly Stock Results Analysis</a></li>
+        <li><a href="{BLOG_BASE_URL}/search/label/SHARE%20ORDER" style="color:#1d4ed8; font-weight:600; text-decoration:none;">🏆 New Corporate Order Wins &amp; Contract Updates</a></li>
+        <li><a href="{BLOG_BASE_URL}/search/label/MARKET%20NEWS" style="color:#1d4ed8; font-weight:600; text-decoration:none;">📰 Daily Indian Stock Market Fundamental Picks</a></li>
+      </ul>
+    </div>
+    """
+
+    source_link_html = (
+        f'<p style="margin-top:16px;"><a href="{html.escape(source_url, quote=True)}" '
+        f'target="_blank" rel="nofollow noopener" style="color:#2563eb; font-weight:600; text-decoration:none;">'
+        f'📄 Verify Official BSE Exchange Filing PDF</a></p>'
+        if source_url else ""
+    )
 
     meta_comment = (
         f"<!-- MM_META:type={doc_type}|comp_key={comp_key}|scrip={scrip_key}|file={file_key}|comp_name={comp_name} -->"
     )
 
+    # Note: Placing the SEO Lead Summary paragraph FIRST before the image and <!--more--> ensures
+    # Blogger's automatic meta description and Google Search snippets capture clean, high-CTR text.
     html_body = f"""
     {meta_comment}
-    <article style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 680px; margin: 0 auto; color: #1e293b;">
+    <article style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 720px; margin: 0 auto; color: #1e293b;">
+      <p style="font-size: 16px; line-height: 1.75; color: #0f172a; background: #f8fafc; padding: 14px 16px; border-radius: 10px; border: 1px solid #e2e8f0; margin-bottom: 18px;">
+        <strong>Executive Summary:</strong> {lead_html}
+      </p>
+
       <figure style="margin: 0 0 22px 0; text-align: center;">
-        <img src="{thumb_url}" alt="{comp_name} Corporate Update" style="width: 100%; max-height: 360px; object-fit: cover; border-radius: 12px;" />
-        <figcaption style="font-size: 13px; color: #64748b; margin-top: 6px;">{comp_name} Corporate Filing | MarketMunafa</figcaption>
+        <img src="{thumb_url}" alt="{comp_name} Share Price Target and {qtr_lbl} Financial Analysis" width="1200" height="675" fetchpriority="high" style="width: 100%; height: auto; aspect-ratio: 16/9; object-fit: cover; border-radius: 12px;" />
+        <figcaption style="font-size: 13px; color: #64748b; margin-top: 6px;">{comp_name} (BSE: {html.escape(str(scrip_code or 'Listed'))}) Equity Research | MarketMunafa</figcaption>
       </figure>
+      <!--more-->
 
       {"".join(content_blocks)}
 
-      <h3 style="font-size: 19px; color: #0f172a; margin-bottom: 10px;">📝 Detailed Corporate & Valuation Analysis</h3>
-      {para_html}
+      {"".join(article_html_parts)}
+
+      {faq_block_html}
+
+      {internal_links_html}
+
       {source_link_html}
+
+      <script type="application/ld+json">{faq_schema_json}</script>
 
       <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 22px 0;" />
       <p style="font-size: 12px; color: #64748b; line-height: 1.5;">
-        <strong>Disclaimer:</strong> This report on MarketMunafa is prepared automatically from official BSE corporate filings and Screener data for educational and informational purposes only. It is not investment advice.
+        <strong>Disclaimer:</strong> This independent equity research article on MarketMunafa is originally authored using publicly disclosed BSE corporate filings and fundamental ratios for educational purposes only. We are not SEBI-registered investment advisors. Please consult a certified financial planner before making any investment decisions.
       </p>
     </article>
     """
@@ -1357,8 +1535,8 @@ def _parse_single_blog_post_for_dedup(title_str, content_html, labels_list, stat
             if ck:
                 state["comp_keys"].add(ck)
 
-    # 2. Extract exact company name from <figcaption>{comp_name} Corporate Filing | MarketMunafa</figcaption>
-    fig_match = re.search(r"<figcaption[^>]*>\s*([^<|]+?)\s+Corporate Filing", content_html, flags=re.I)
+    # 2. Extract exact company name from <figcaption>{comp_name} ...
+    fig_match = re.search(r"<figcaption[^>]*>\s*([^<|(]+?)\s+(?:Corporate Filing|\(BSE)", content_html, flags=re.I)
     if fig_match:
         comp_from_fig = html.unescape(fig_match.group(1)).strip()
         ck = normalize_company_key(comp_from_fig, p_type)
@@ -1514,11 +1692,18 @@ def blogger_publish(title, content_html, doc_type):
     return response.json().get("url", "")
 
 
-def publish_item(item, doc_type, ai_data, screener_info, item_id, comp_key, scrip_key, file_key):
+def publish_item(item, doc_type, ai_data, screener_info, item_id, comp_key, scrip_key, file_key, scrip_code=""):
     source_url = item["link"]
     raw_title = ai_data.get("seo_title") or f"{item['title']} Consolidated Results & Valuation | MarketMunafa"
     blog_html, yoy_chart_url = build_post_html(
-        ai_data, doc_type, screener_info, source_url, comp_key=comp_key, scrip_key=scrip_key, file_key=file_key
+        ai_data,
+        doc_type,
+        screener_info,
+        source_url,
+        comp_key=comp_key,
+        scrip_key=scrip_key,
+        file_key=file_key,
+        scrip_code=scrip_code,
     )
 
     blog_url = ""
@@ -1598,7 +1783,9 @@ def run():
                 log.warning("Skipped: no PDF and no Screener quarterly data for %s", item["title"])
                 continue
 
-            ai_data = analyze_with_gemini_json(item["title"], doc_type, source_text, pdf_bytes, screener_info)
+            ai_data = analyze_with_gemini_json(
+                item["title"], scrip_code, doc_type, source_text, pdf_bytes, screener_info
+            )
 
             # STAGE 2 CHECK: AI પાસેથી મળેલા સાચા કંપનીના નામ (company_short_name) ને ફરીથી બ્લોગ સાથે મેચ કરો
             ai_comp_name = str(ai_data.get("company_short_name") or "").strip()
@@ -1620,7 +1807,17 @@ def run():
                     continue
 
             final_comp_key = ai_comp_key or comp_key
-            publish_item(item, doc_type, ai_data, screener_info, item_id, final_comp_key, scrip_key, file_key)
+            publish_item(
+                item,
+                doc_type,
+                ai_data,
+                screener_info,
+                item_id,
+                final_comp_key,
+                scrip_key,
+                file_key,
+                scrip_code=scrip_code,
+            )
 
             # તરત જ મેમરીમાં ઉમેરી દો જેથી એક જ રનમાં પણ બીજી વાર પોસ્ટ ન થાય
             if comp_key:
