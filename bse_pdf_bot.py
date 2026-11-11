@@ -32,7 +32,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9086072964:AAEUyn-GAyJLdsY
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "430834857").strip()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash") # Updated to valid model name if needed, or keep your env variable
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -594,7 +594,7 @@ def ensure_valid_result_numbers(ai_data, screener_info):
 
     return ai_data
 
-
+# ---------------- આ ફંક્શનમાં કડક નિયમો (Prompt) ઉમેર્યા છે ----------------
 def analyze_with_gemini_json(company_title, doc_type, source_text, pdf_bytes, screener_info):
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY is not configured")
@@ -604,8 +604,11 @@ You are the Chief Financial Analyst for 'MarketMunafa'.
 Analyze the attached BSE corporate filing ({doc_type.upper()}) and Screener fundamentals data.
 
 CRITICAL RULES:
-1. All English fields MUST be 100% in English (zero Gujarati words in English fields). Only 'gujarati_summary' and 'gujarati_intraday_view' must be in Gujarati.
-2. NEVER return "N/A" for Revenue, Gross Profit, or Net Profit in a 'result' filing!
+1. EXCLUDE STANDALONE: Completely ignore any 'Standalone' financial figures. Do not even mention them.
+2. USE CONSOLIDATED ONLY: You must extract data ONLY from the 'Consolidated' financial results table.
+3. YOY GROWTH: Calculate and highlight the Year-on-Year (YoY) growth percentage. Do not focus on QoQ unless YoY is unavailable.
+4. All English fields MUST be 100% in English (zero Gujarati words in English fields). Only 'gujarati_summary' and 'gujarati_intraday_view' must be in Gujarati.
+5. NEVER return "N/A" for Revenue, Gross Profit, or Net Profit in a 'result' filing!
    - Read the financial table from the attached PDF carefully (even if it is a scanned image).
    - UNIT CONVERSION: If the PDF table says "(Rs. in Lakhs)" or "(Rs. in Lacs)", divide every number by 100 to convert into Rs. Crores (e.g., 3,450 Lakhs = 34.50 Cr). If "(Rs. in Millions)", divide by 10. Keep up to 2 decimal places for figures under 100 Cr.
    - If "Gross Profit" is not explicitly labeled in the PDF statement, compute it as (Revenue from Operations minus Cost of Materials/Operating Expenses) OR use Operating Profit (EBITDA) / Profit Before Tax (PBT).
