@@ -32,7 +32,7 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9086072964:AAEUyn-GAyJLdsY
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "430834857").strip()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
 
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
@@ -90,8 +90,8 @@ def clean_company_core_name(raw_title):
     clean = clean.split("|")[0].split(":")[0].split(" - ")[0].split(" – ")[0]
     clean = re.sub(r"\b\d+(?:\.\d+)?%?\b", " ", clean)
     clean = STOP_WORDS_REGEX.sub(" ", clean)
-    words = [ re.sub(r"[^a-zA-Z]", "", w).lower() for w in clean.split() ]
-    words = [ w for w in words if len(w) >= 2 ]
+    words = [re.sub(r"[^a-zA-Z]", "", w).lower() for w in clean.split()]
+    words = [w for w in words if len(w) >= 2]
     if not words:
         fallback = re.sub(r"[^a-zA-Z0-9]", "", str(raw_title).split()[0] if str(raw_title).split() else "").lower()
         return fallback
@@ -614,7 +614,6 @@ RESULT_WORDS = (
     "financial result", "unaudited financial", "audited financial",
     "quarterly result", "half year result", "annual result", "financial results",
     "standalone result", "consolidated result", "standalone and consolidated",
-    "outcome of board meeting",
 )
 ORDER_WORDS = (
     "award_of_order", "receipt_of_order", "award of order", "receipt of order",
@@ -623,17 +622,21 @@ ORDER_WORDS = (
     "order worth", "orders worth", "bagged an order", "secured an order",
     "arbitral award", "orders / contracts", "order / contract",
 )
+IGNORE_NON_RESULT_PHRASES = (
+    "analyst / investor meet", "investor meet", "earning call", "earnings call",
+    "conference call", "audio recording", "transcript of", "prior intimation",
+    "is scheduled on", "newspaper publication", "newspaper advertisement",
+    "closure of trading window", "trading window", "loss of share certificate",
+    "postal ballot", "scrutinizer report", "annual report", "related party transactions",
+)
 
 
 def classify_item(item):
-    if item["kind"] == "order":
-        return "order"
     title_desc = (item["title"] + " " + item["description"]).lower()
     if any(word in title_desc for word in ORDER_WORDS):
         return "order"
-    if "prior intimation" in title_desc or "is scheduled on" in title_desc or "newspaper publication" in title_desc:
-        if item["kind"] != "result":
-            return ""
+    if any(bad in title_desc for bad in IGNORE_NON_RESULT_PHRASES):
+        return ""
     if item["kind"] == "result" or any(word in title_desc for word in RESULT_WORDS):
         return "result"
     return ""
@@ -710,20 +713,48 @@ def ensure_valid_result_numbers(ai_data, screener_info):
     return ai_data
 
 
-def call_gemini_with_fallback(contents):
-    models_to_try = list(dict.fromkeys([
+# ---------------- DYNAMIC GEMINI MODEL DISCOVERY & FALLBACK ----------------
+_CACHED_WORKING_MODEL = None
+
+
+def get_candidate_gemini_models():
+    candidates = [
         GEMINI_MODEL,
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-1.5-flash",
-    ]))
+        "gemini-3.8-flash",
+        "gemini-3.0-flash",
+        "gemini-3-flash-preview",
+        "gemini-3.1-flash-lite-preview",
+        "gemini-flash-latest",
+    ]
+    try:
+        for m in genai.list_models():
+            methods = getattr(m, "supported_generation_methods", []) or []
+            if "generateContent" in methods:
+                short_name = m.name.replace("models/", "")
+                if "gemini" in short_name.lower() and "tts" not in short_name.lower() and "image" not in short_name.lower():
+                    candidates.append(short_name)
+    except Exception as exc:
+        log.warning("Could not list Gemini models dynamically: %s", exc)
+
+    return list(dict.fromkeys(c for c in candidates if c))
+
+
+def call_gemini_with_fallback(contents):
+    global _CACHED_WORKING_MODEL
+    models_to_try = get_candidate_gemini_models()
+    if _CACHED_WORKING_MODEL and _CACHED_WORKING_MODEL in models_to_try:
+        models_to_try.remove(_CACHED_WORKING_MODEL)
+        models_to_try.insert(0, _CACHED_WORKING_MODEL)
+
     last_err = None
     for m_name in models_to_try:
-        if not m_name:
-            continue
         try:
             model = genai.GenerativeModel(m_name)
-            return model.generate_content(contents)
+            resp = model.generate_content(contents)
+            if _CACHED_WORKING_MODEL != m_name:
+                log.info("Using active Gemini model: %s", m_name)
+                _CACHED_WORKING_MODEL = m_name
+            return resp
         except Exception as exc:
             last_err = exc
             log.warning("Model %s failed, trying next fallback: %s", m_name, exc)
@@ -1547,7 +1578,6 @@ def run():
         log.info("Processing %s: %s", doc_type, item["title"])
         try:
             source_text, pdf_bytes = get_document_payload(item)
-            # Re-extract file_key in case fallback URL was used
             file_key = extract_file_key(item["link"]) or file_key
 
             screener_info = get_screener_fundamentals(item["title"])
