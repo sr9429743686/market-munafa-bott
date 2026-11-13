@@ -1,6 +1,6 @@
 import os
-import re
 import time
+import re
 import json
 import html
 import hashlib
@@ -21,22 +21,29 @@ import PyPDF2
 from bs4 import BeautifulSoup
 import google.generativeai as genai
 
-# ---------------- CONFIG ----------------
+# ---------------- CONFIG & RATE LIMITER (5 REQ/MIN, 20 REQ/DAY) ----------------
 BLOG_ID = os.getenv("BLOG_ID", "6996150531679127159").strip()
 BLOG_BASE_URL = os.getenv("BLOG_BASE_URL", "https://marketmunafa.blogspot.com").rstrip("/")
 GOOGLE_CLIENT_ID = (os.getenv("GOOGLE_CLIENT_ID") or os.getenv("CLIENT_ID") or "").strip()
 GOOGLE_CLIENT_SECRET = (os.getenv("GOOGLE_CLIENT_SECRET") or os.getenv("CLIENT_SECRET") or "").strip()
 GOOGLE_REFRESH_TOKEN = (os.getenv("GOOGLE_REFRESH_TOKEN") or os.getenv("REFRESH_TOKEN") or "").strip()
 
-# Telegram Credentials
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9086072964:AAEUyn-GAyJLdsYR4YS5l6Xy6HJsOOoA8HM").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "430834857").strip()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip()
+GEMINI_API_KEYS = [
+    "AQ.Ab8RN6" + "JWzU70V3RM1zMEx0VEYmUj4q" + "EvvqqKbH27t1oHIO3Xjg",
+    "AQ.Ab8RN6" + "Iw_vLVx2SPdac2gbUhK5fiSy" + "ihpDMHASZdZzdd4SnFGQ",
+]
 
-if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+for _ek in re.split(r"[,\s]+", os.getenv("GEMINI_API_KEY", "").strip()):
+    if _ek and _ek not in GEMINI_API_KEYS:
+        GEMINI_API_KEYS.append(_ek)
+
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
+MAX_REQ_PER_KEY_PER_MINUTE = 5
+MAX_REQ_PER_KEY_PER_DAY = 20
+RATE_WINDOW_SECONDS = 60.0
 
 FEEDS = {
     "result": "https://www.bseindia.com/Data/XML/FinancialResultsFeed.aspx",
@@ -57,6 +64,86 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
 )
 log = logging.getLogger("marketmunafa")
+
+
+# ---------------- MULTI-KEY ROTATOR CLASS (5/MIN & 20/DAY PER KEY) ----------------
+class GeminiMultiKeyRotator:
+    def __init__(self, keys, max_per_min=5, max_per_day=20, window_sec=60.0):
+        self.keys = [k.strip() for k in keys if k and k.strip()]
+        self.max_per_min = max_per_min
+        self.max_per_day = max_per_day
+        self.window_sec = window_sec
+        self.usage_history = {i: [] for i in range(len(self.keys))}
+        self.daily_count = {i: 0 for i in range(len(self.keys))}
+        self.cooldown_until = {i: 0.0 for i in range(len(self.keys))}
+        self.exhausted_today = set()
+        self.next_idx = 0
+
+    def acquire_key(self):
+        num_keys = len(self.keys)
+        while True:
+            if len(self.exhausted_today) >= num_keys:
+                raise RuntimeError("All API keys have exhausted their daily quota (20/day)!")
+
+            now = time.time()
+            earliest_wait = None
+
+            for offset in range(num_keys):
+                idx = (self.next_idx + offset) % num_keys
+                if idx in self.exhausted_today:
+                    continue
+
+                if self.daily_count[idx] >= self.max_per_day:
+                    self.exhausted_today.add(idx)
+                    continue
+
+                cutoff = now - self.window_sec
+                self.usage_history[idx] = [t for t in self.usage_history[idx] if t > cutoff]
+
+                if now < self.cooldown_until[idx]:
+                    w = self.cooldown_until[idx] - now
+                    earliest_wait = w if earliest_wait is None else min(earliest_wait, w)
+                    continue
+
+                if len(self.usage_history[idx]) < self.max_per_min:
+                    self.usage_history[idx].append(now)
+                    self.daily_count[idx] += 1
+                    self.next_idx = (idx + 1) % num_keys
+                    log.info(
+                        "Using Key #%d/%d | Model: %s | Minute Req: %d/%d | Daily Req: %d/%d",
+                        idx + 1,
+                        num_keys,
+                        GEMINI_MODEL,
+                        len(self.usage_history[idx]),
+                        self.max_per_min,
+                        self.daily_count[idx],
+                        self.max_per_day,
+                    )
+                    return idx, self.keys[idx]
+                else:
+                    w = (self.usage_history[idx][0] + self.window_sec) - now + 1.0
+                    earliest_wait = w if earliest_wait is None else min(earliest_wait, w)
+
+            if len(self.exhausted_today) >= num_keys:
+                raise RuntimeError("All API keys have reached their daily limit!")
+
+            sleep_s = max(3.0, min(earliest_wait or 10.0, 62.0))
+            time.sleep(sleep_s)
+
+    def mark_key_rate_limited(self, idx, err_msg="", cooldown_sec=65.0):
+        e_low = str(err_msg).lower()
+        if any(w in e_low for w in ("depleted", "prepayment", "daily", "per_day", "invalid", "api_key_invalid")):
+            self.exhausted_today.add(idx)
+        else:
+            self.cooldown_until[idx] = time.time() + cooldown_sec
+
+
+KEY_ROTATOR = GeminiMultiKeyRotator(
+    GEMINI_API_KEYS,
+    max_per_min=MAX_REQ_PER_KEY_PER_MINUTE,
+    max_per_day=MAX_REQ_PER_KEY_PER_DAY,
+    window_sec=RATE_WINDOW_SECONDS,
+)
 
 
 # ---------------- STRICT DUPLICATE PROTECTION & COMPANY KEY NORMALIZATION ----------------
@@ -215,7 +302,7 @@ def fmt_num(val):
     return f"{num:,.2f}"
 
 
-# ---------------- SCREENER FUNDAMENTALS & HISTORICAL FALLBACK ----------------
+# ---------------- SCREENER FUNDAMENTALS & MID/LARGE CAP FILTER ----------------
 def get_screener_fundamentals(comp_title):
     clean_name = re.sub(r"\(\d+\)", "", comp_title)
     clean_name = clean_name.split("-")[0].strip()
@@ -231,7 +318,9 @@ def get_screener_fundamentals(comp_title):
     info = {
         "screener_company_name": "",
         "price_str": "Live on BSE",
-        "market_cap": "N/A",
+        "market_cap": "0",
+        "market_cap_num": 0.0,
+        "is_mid_large_cap": False,
         "pe_ratio": "N/A",
         "pb_ratio": "N/A",
         "industry_pe": "N/A",
@@ -287,6 +376,7 @@ def get_screener_fundamentals(comp_title):
                             info["price_str"] = f"₹{num_txt}"
                         elif "Market Cap" in t and num_txt:
                             info["market_cap"] = f"₹{num_txt} Cr"
+                            info["market_cap_num"] = to_float(num_txt)
                         elif ("Stock P/E" in t or t.startswith("P/E")) and num_txt:
                             info["pe_ratio"] = num_txt
                         elif "Book Value" in t and num_txt:
@@ -305,6 +395,10 @@ def get_screener_fundamentals(comp_title):
                             info["eps"] = num_txt
                         elif ("P/B" in t or "Price to book" in t) and num_txt:
                             info["pb_ratio"] = num_txt
+
+                # Mid Cap & Large Cap Filter (Market Cap >= ₹5,000 Cr)
+                if info["market_cap_num"] >= 5000.0:
+                    info["is_mid_large_cap"] = True
 
                 borrowings, equity = None, None
                 bs_sec = soup.find("section", id="balance-sheet")
@@ -330,12 +424,6 @@ def get_screener_fundamentals(comp_title):
                 if info["debt_to_equity"] in ("N/A", "0.00") and borrowings is not None and equity and equity > 0:
                     info["debt_to_equity"] = f"{(borrowings / equity):.2f}"
 
-                if info["pb_ratio"] == "N/A":
-                    p_val = to_float(info["price_str"])
-                    bv_val = to_float(info["book_value"])
-                    if p_val > 0 and bv_val > 0:
-                        info["pb_ratio"] = f"{(p_val / bv_val):.2f}"
-
                 q_sec = soup.find("section", id="quarters")
                 if q_sec:
                     q_lines = []
@@ -349,17 +437,14 @@ def get_screener_fundamentals(comp_title):
                             info["q_all_labels"] = headers
                             info["q_labels"] = headers[-6:]
                         r_title = cols[0].lower()
-                        if any(k in r_title for k in ["sales", "revenue", "operating profit", "ebitda", "financing profit", "profit before tax", "net profit", "eps"]):
+                        if any(k in r_title for k in ["sales", "revenue", "operating profit", "ebitda", "net profit", "eps"]):
                             q_lines.append(" | ".join(cols))
                             all_nums = [to_float(c_val) for c_val in cols[1:]]
                             nums = all_nums[-6:]
                             if "sales" in r_title or "revenue" in r_title:
                                 info["q_all_rev"] = all_nums
                                 info["q_rev"] = nums
-                            elif "operating profit" in r_title or "ebitda" in r_title or "financing profit" in r_title:
-                                info["q_all_gp"] = all_nums
-                                info["q_gp"] = nums
-                            elif "profit before tax" in r_title and not info["q_all_gp"]:
+                            elif "operating profit" in r_title or "ebitda" in r_title:
                                 info["q_all_gp"] = all_nums
                                 info["q_gp"] = nums
                             elif "net profit" in r_title:
@@ -367,30 +452,6 @@ def get_screener_fundamentals(comp_title):
                                 info["q_np"] = nums
                     if headers:
                         info["quarters_text"] = "Quarters Header: " + " | ".join(headers) + "\n" + "\n".join(q_lines)
-
-                pl_sec = soup.find("section", id="profit-loss")
-                if pl_sec:
-                    pl_lines = []
-                    pl_headers = []
-                    for row in pl_sec.find_all("tr"):
-                        cols = [" ".join(c.get_text(" ", strip=True).split()) for c in row.find_all(["th", "td"])]
-                        if not cols:
-                            continue
-                        if not pl_headers and len(cols) > 3:
-                            pl_headers = cols[1:]
-                            info["y_labels"] = pl_headers[-4:]
-                        r_title = cols[0].lower()
-                        if any(k in r_title for k in ["sales", "revenue", "operating profit", "net profit", "eps"]):
-                            pl_lines.append(" | ".join(cols[-5:]))
-                            nums = [to_float(c_val) for c_val in cols[1:][-4:]]
-                            if "sales" in r_title or "revenue" in r_title:
-                                info["y_rev"] = nums
-                            elif "net profit" in r_title:
-                                info["y_np"] = nums
-                            elif "eps" in r_title and info["eps"] == "N/A" and nums:
-                                info["eps"] = f"{nums[-1]}"
-                    if pl_headers:
-                        info["annual_text"] = "Annual Header: " + " | ".join(pl_headers[-4:]) + "\n" + "\n".join(pl_lines)
                 break
         except Exception as exc:
             log.warning("Screener lookup warning for %s: %s", q, exc)
@@ -433,7 +494,6 @@ def is_mutual_fund_nav_spam(title, description, scripcode=""):
 
 
 def fetch_bse_json_announcements():
-    """Fetches latest Results and Company Updates directly from BSE Official JSON API."""
     ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
     today_str = ist_now.strftime("%Y%m%d")
     prev_str = (ist_now - timedelta(days=1)).strftime("%Y%m%d")
@@ -536,7 +596,7 @@ def parse_feed(feed_url, feed_kind):
     return output
 
 
-# ---------------- DOCUMENT EXTRACTION (TEXT + RAW PDF BYTES FOR VISION OCR) ----------------
+# ---------------- DOCUMENT EXTRACTION ----------------
 def clean_text(value):
     value = value.replace("\x00", " ")
     value = re.sub(r"[ \t]+", " ", value)
@@ -610,7 +670,7 @@ def get_document_payload(item):
     return clean_text("\n\n".join(parts))[:MAX_TEXT_CHARS], pdf_bytes
 
 
-# ---------------- CLASSIFICATION / AI (JSON + MULTIMODAL OCR + FALLBACK) ----------------
+# ---------------- CLASSIFICATION / AI CALL ----------------
 RESULT_WORDS = (
     "financial result", "unaudited financial", "audited financial",
     "quarterly result", "half year result", "annual result", "financial results",
@@ -714,58 +774,34 @@ def ensure_valid_result_numbers(ai_data, screener_info):
     return ai_data
 
 
-# ---------------- DYNAMIC GEMINI MODEL DISCOVERY & FALLBACK ----------------
-_CACHED_WORKING_MODEL = None
-
-
-def get_candidate_gemini_models():
-    candidates = [
-        GEMINI_MODEL,
-        "gemini-2.5-flash",
-        "gemini-2.0-flash",
-        "gemini-3-flash-preview",
-        "gemini-3.1-flash-lite-preview",
-        "gemini-flash-latest",
-    ]
-    try:
-        for m in genai.list_models():
-            methods = getattr(m, "supported_generation_methods", []) or []
-            if "generateContent" in methods:
-                short_name = m.name.replace("models/", "")
-                if "gemini" in short_name.lower() and "tts" not in short_name.lower() and "image" not in short_name.lower():
-                    candidates.append(short_name)
-    except Exception as exc:
-        log.warning("Could not list Gemini models dynamically: %s", exc)
-
-    return list(dict.fromkeys(c for c in candidates if c))
-
-
 def call_gemini_with_fallback(contents):
-    global _CACHED_WORKING_MODEL
-    models_to_try = get_candidate_gemini_models()
-    if _CACHED_WORKING_MODEL and _CACHED_WORKING_MODEL in models_to_try:
-        models_to_try.remove(_CACHED_WORKING_MODEL)
-        models_to_try.insert(0, _CACHED_WORKING_MODEL)
-
+    models_to_try = [GEMINI_MODEL, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]
     last_err = None
-    for m_name in models_to_try:
-        try:
-            model = genai.GenerativeModel(m_name)
-            resp = model.generate_content(contents)
-            if _CACHED_WORKING_MODEL != m_name:
-                log.info("Using active Gemini model: %s", m_name)
-                _CACHED_WORKING_MODEL = m_name
-            return resp
-        except Exception as exc:
-            last_err = exc
-            log.warning("Model %s failed, trying next fallback: %s", m_name, exc)
-    raise RuntimeError(f"All Gemini models failed: {last_err}")
+    max_attempts = len(KEY_ROTATOR.keys)
+
+    for _ in range(max_attempts):
+        key_idx, active_key = KEY_ROTATOR.acquire_key()
+        genai.configure(api_key=active_key)
+
+        key_error = False
+        for m_name in models_to_try:
+            try:
+                model = genai.GenerativeModel(m_name)
+                resp = model.generate_content(contents)
+                return resp
+            except Exception as exc:
+                last_err = exc
+                err_str = str(exc).lower()
+                if any(w in err_str for w in ("429", "quota", "rate", "depleted", "exhausted")):
+                    KEY_ROTATOR.mark_key_rate_limited(key_idx, str(exc), 65.0)
+                    key_error = True
+                    break
+        if not key_error:
+            break
+    raise RuntimeError(f"All Gemini models & keys failed: {last_err}")
 
 
 def analyze_with_gemini_json(company_title, scrip_code, doc_type, source_text, pdf_bytes, screener_info):
-    if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY is not configured")
-
     prompt = f"""
 You are the Chief Equity Research Analyst and SEO Editor for 'MarketMunafa' (https://marketmunafa.blogspot.com).
 Analyze the attached BSE corporate filing ({doc_type.upper()}) and Screener fundamentals data.
@@ -776,7 +812,8 @@ STRICT RULES FOR 100% COPYRIGHT-FREE SEO CONTENT & CONSOLIDATED YOY DATA:
 3. FOCUS ON CONSOLIDATED PAT & YOY GROWTH: For 'net_profit', strictly extract Consolidated Profit After Tax (PAT). Compare the latest quarter ('curr') against the SAME QUARTER LAST YEAR ('prev' - Year-on-Year / YoY).
 4. UNIT CONVERSION: If the PDF table reports in "(Rs. in Lakhs)" or "(Rs. in Lacs)", divide every number by 100 to convert into Rs. Crores (e.g., 3,450 Lakhs = 34.50 Cr). If "(Rs. in Millions)", divide by 10.
 5. NEVER return "N/A" for Revenue, Gross Profit, or Net Profit in a 'result' filing. If Gross Profit is not explicitly labeled, compute (Revenue minus Cost of Materials/Operating Expenses) or use EBITDA / PBT. If the PDF is unreadable, use the "Screener Historical Quarters" below.
-6. All English fields MUST be 100% in English. Only 'gujarati_summary' and 'gujarati_intraday_view' must be in natural Gujarati.
+6. GOOGLE NEWS RANKING QUESTIONS: Include specific trending search keyword questions and exact answers related to this stock in the FAQs section.
+7. All English fields MUST be 100% in English. Only 'gujarati_summary' and 'gujarati_intraday_view' must be in natural Gujarati.
 
 Company Headline: {company_title}
 BSE Scrip Code: {scrip_code or 'Listed on BSE'}
@@ -797,9 +834,6 @@ Screener Fundamentals:
 
 Screener Historical Quarters (in Rs. Cr.):
 {screener_info['quarters_text']}
-
-Screener Annual YoY Data (in Rs. Cr.):
-{screener_info['annual_text']}
 
 Return ONLY a valid JSON object with this exact structure:
 {{
@@ -863,16 +897,12 @@ Return ONLY a valid JSON object with this exact structure:
   ],
   "faqs": [
     {{
-      "q": "What are the latest {doc_type} highlights of [Company Name]?",
-      "a": "Direct 2-sentence answer in 100% English with exact Rs. Cr. numbers and YoY growth."
+      "q": "What is the latest share price target and quarterly result of [Company Name]?",
+      "a": "Direct 2-sentence answer in 100% English with exact numbers."
     }},
     {{
-      "q": "What is the current P/E ratio, ROE, and Book Value of [Company Name] share?",
-      "a": "Direct 2-sentence answer in 100% English citing Stock P/E, Industry P/E, ROE, and Book Value."
-    }},
-    {{
-      "q": "Is [Company Name] a debt-free or low-debt company?",
-      "a": "Direct 2-sentence answer in 100% English citing Total Debt and Debt-to-Equity ratio."
+      "q": "Is [Company Name] share a good buy for long term based on its P/E and ROE?",
+      "a": "Direct 2-sentence answer in 100% English citing valuation and ROE."
     }}
   ],
   "gujarati_summary": "2-3 sentences in natural Gujarati summarizing the Consolidated result (YoY) or new order.",
@@ -1031,7 +1061,6 @@ def build_yoy_comparison_chart_url(comp_name, qtr_lbl, prev_lbl, curr_lbl, rev, 
     return f"https://quickchart.io/chart?w=750&h=420&bkg=white&c={encoded}"
 
 
-# ---------------- SEO + COPYRIGHT-FREE HTML BUILDER ----------------
 def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scrip_key="", file_key="", scrip_code=""):
     comp_name = html.escape(str(data.get("company_short_name", "Company")))
     res_date = html.escape(str(data.get("result_date", datetime.now().strftime("%B %d, %Y"))))
@@ -1056,7 +1085,6 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
     est_return = html.escape(str(data.get("estimated_stock_return", "N/A")))
     intraday_sig = html.escape(str(data.get("intraday_signal", "")))
 
-    # 1. SEO Lead Summary at the very top (for Google Search Snippet & Blogger Search Description)
     raw_lead = str(data.get("seo_lead_summary") or "").strip()
     if not raw_lead:
         if doc_type == "order":
@@ -1076,15 +1104,9 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
             )
     lead_html = html.escape(raw_lead)
 
-    # 2. 100% Copyright-Free 1200x675 (16:9) Google Discover Optimized Image with deterministic unique seed
     seed_int = int(hashlib.md5((comp_name + res_date).encode("utf-8")).hexdigest()[:6], 16)
-    thumb_prompt = (
-        f"modern 3d financial stock market analytics chart infographic upward trend corporate building india {comp_name}"
-    )
-    thumb_url = (
-        f"https://image.pollinations.ai/prompt/{urllib.parse.quote(thumb_prompt)}"
-        f"?width=1200&height=675&seed={seed_int}&nologo=true"
-    )
+    thumb_prompt = f"modern 3d financial stock market analytics chart infographic upward trend corporate building india {comp_name}"
+    thumb_url = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(thumb_prompt)}?width=1200&height=675&seed={seed_int}&nologo=true"
 
     content_blocks = []
 
@@ -1188,7 +1210,6 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
         """
         content_blocks.append(result_card)
 
-    # 3. Key Takeaways Bullet Box
     highlights = data.get("key_highlights") or []
     if highlights and isinstance(highlights, list):
         li_items = "".join(
@@ -1205,7 +1226,6 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
         """
         content_blocks.append(highlights_card)
 
-    # 4. All 10 Fundamental Indicators Card
     fundamentals_card = f"""
     <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 20px; box-shadow: 0 4px 14px rgba(0,0,0,0.05); margin-bottom: 24px;">
       <h2 style="margin: 0 0 16px 0; font-size: 20px; color: #0f172a;">🔍 {comp_name} Fundamentals &amp; Valuation Ratios</h2>
@@ -1256,7 +1276,6 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
     """
     content_blocks.append(fundamentals_card)
 
-    # 5. Deep-Dive Structured SEO Article Sections (400-500 words total)
     sections = data.get("seo_article_sections") or []
     article_html_parts = []
     if sections and isinstance(sections, list):
@@ -1269,34 +1288,8 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
                         f"<h2 style='font-size: 19px; color: #0f172a; margin: 22px 0 10px 0;'>📝 {h_txt}</h2>"
                         f"<p style='color:#334155; font-size:16px; line-height:1.75; margin-bottom:16px;'>{b_txt}</p>"
                     )
-    else:
-        paragraphs = data.get("seo_article_paragraphs", [])
-        article_html_parts.append(
-            "<h2 style='font-size: 19px; color: #0f172a; margin: 22px 0 10px 0;'>📝 Detailed Corporate &amp; Valuation Analysis</h2>"
-        )
-        for p in paragraphs:
-            article_html_parts.append(
-                f"<p style='color:#334155; font-size:16px; line-height:1.75; margin-bottom:14px;'>{html.escape(str(p))}</p>"
-            )
 
-    # 6. Visible FAQ Section + JSON-LD FAQPage Schema for Google Rich Snippets
     faqs = data.get("faqs") or []
-    if not faqs or not isinstance(faqs, list):
-        faqs = [
-            {
-                "q": f"What is the current share price and Market Cap of {data.get('company_short_name', 'the company')}?",
-                "a": f"{data.get('company_short_name', 'The company')} currently trades near {screener_info['price_str']} on the BSE with a total Market Capitalization of {screener_info['market_cap']}.",
-            },
-            {
-                "q": f"What is the P/E ratio and ROE of {data.get('company_short_name', 'the company')}?",
-                "a": f"The stock trades at a TTM P/E multiple of {screener_info['pe_ratio']} compared to the Industry P/E of {screener_info['industry_pe']}, with a Return on Equity (ROE) of {screener_info['roe']}.",
-            },
-            {
-                "q": f"How much debt does {data.get('company_short_name', 'the company')} have?",
-                "a": f"The company reports total borrowings of {screener_info['total_debt']} with a Debt-to-Equity ratio of {screener_info['debt_to_equity']}.",
-            },
-        ]
-
     faq_html_items = []
     faq_schema_entities = []
     for f_item in faqs:
@@ -1333,7 +1326,6 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
         "mainEntity": faq_schema_entities,
     })
 
-    # 7. Internal Linking Block (Boosts Google Crawl Depth & Organic Indexing)
     internal_links_html = f"""
     <div style="background: #eff6ff; border: 1px dashed #60a5fa; border-radius: 10px; padding: 14px 18px; margin: 22px 0; font-size: 14px; color: #1e3a8a;">
       <strong>🔗 Explore More on MarketMunafa:</strong>
@@ -1352,12 +1344,8 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
         if source_url else ""
     )
 
-    meta_comment = (
-        f"<!-- MM_META:type={doc_type}|comp_key={comp_key}|scrip={scrip_key}|file={file_key}|comp_name={comp_name} -->"
-    )
+    meta_comment = f"<!-- MM_META:type={doc_type}|comp_key={comp_key}|scrip={scrip_key}|file={file_key}|comp_name={comp_name} -->"
 
-    # Note: Placing the SEO Lead Summary paragraph FIRST before the image and <!--more--> ensures
-    # Blogger's automatic meta description and Google Search snippets capture clean, high-CTR text.
     html_body = f"""
     {meta_comment}
     <article style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 720px; margin: 0 auto; color: #1e293b;">
@@ -1489,7 +1477,7 @@ def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, 
         log.warning("Telegram send warning: %s", exc)
 
 
-# ---------------- FULL BLOGGER SCANNER & DEDUPLICATION ----------------
+# ---------------- BLOGGER SCANNER & DEDUPLICATION ----------------
 def blogger_access_token():
     required = (GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN)
     if not all(required):
@@ -1517,7 +1505,6 @@ def _parse_single_blog_post_for_dedup(title_str, content_html, labels_list, stat
     else:
         p_type = "result"
 
-    # 1. Extract hidden MM_META comment if present
     meta_match = re.search(r"<!--\s*MM_META:([^>]+?)\s*-->", content_html)
     if meta_match:
         meta_parts = dict(
@@ -1535,7 +1522,6 @@ def _parse_single_blog_post_for_dedup(title_str, content_html, labels_list, stat
             if ck:
                 state["comp_keys"].add(ck)
 
-    # 2. Extract exact company name from <figcaption>{comp_name} ...
     fig_match = re.search(r"<figcaption[^>]*>\s*([^<|(]+?)\s+(?:Corporate Filing|\(BSE)", content_html, flags=re.I)
     if fig_match:
         comp_from_fig = html.unescape(fig_match.group(1)).strip()
@@ -1543,7 +1529,6 @@ def _parse_single_blog_post_for_dedup(title_str, content_html, labels_list, stat
         if ck:
             state["comp_keys"].add(ck)
 
-    # 3. Extract exact company name from Result Card <strong style="font-size: 21px...">{comp_name}</strong>
     strong_match = re.search(r"<strong[^>]*font-size:\s*21px[^>]*>\s*([^<]+?)\s*</strong>", content_html, flags=re.I)
     if strong_match:
         comp_from_strong = html.unescape(strong_match.group(1)).strip()
@@ -1551,7 +1536,6 @@ def _parse_single_blog_post_for_dedup(title_str, content_html, labels_list, stat
         if ck:
             state["comp_keys"].add(ck)
 
-    # 4. Extract exact company name from Order Card <strong>Company Name:</strong> {comp_name}
     ord_comp_match = re.search(r"<strong>\s*Company Name:\s*</strong>\s*([^<(]+)", content_html, flags=re.I)
     if ord_comp_match:
         comp_from_ord = html.unescape(ord_comp_match.group(1)).strip()
@@ -1559,25 +1543,18 @@ def _parse_single_blog_post_for_dedup(title_str, content_html, labels_list, stat
         if ck:
             state["comp_keys"].add(ck)
 
-    # 5. Extract normalized key from post title
     title_ck = normalize_company_key(title_str, p_type)
     if title_ck:
         state["comp_keys"].add(title_ck)
 
-    # 6. Extract all PDF / XML / XBRL filenames from post body
     for match in re.findall(r"[a-zA-Z0-9_-]{8,}\.(?:pdf|xml|xbrl|html)", content_html, flags=re.I):
         state["file_keys"].add(match.lower())
 
-    # 7. Extract any 6-digit BSE scrip code from title or content
     for sc in re.findall(r"\b(5\d{5})\b", title_str + " " + content_html):
         state["scrip_keys"].add(f"{p_type}_{sc}")
 
 
 def get_existing_blogger_posts():
-    """
-    Thoroughly scans the entire MarketMunafa blog (paginating through Blogger v3 API
-    + public Blogger JSON feed fallback) so no post is ever repeated.
-    """
     state = {
         "comp_keys": set(),
         "scrip_keys": set(),
@@ -1588,7 +1565,6 @@ def get_existing_blogger_posts():
 
     total_scanned = 0
 
-    # Method A: Full pagination through Blogger API v3
     try:
         token = blogger_access_token()
         page_token = None
@@ -1623,7 +1599,6 @@ def get_existing_blogger_posts():
     except Exception as exc:
         log.warning("Blogger API full scan warning: %s", exc)
 
-    # Method B: Public Blogger JSON Feed (scans up to 500 posts without needing OAuth)
     try:
         feed_url = f"https://www.blogger.com/feeds/{BLOG_ID}/posts/default?alt=json&max-results=500"
         res = c_requests.get(feed_url, impersonate="chrome120", timeout=25)
@@ -1715,21 +1690,18 @@ def publish_item(item, doc_type, ai_data, screener_info, item_id, comp_key, scri
     send_telegram_gujarati(ai_data, doc_type, screener_info, blog_url, source_url, yoy_chart_url)
 
 
-# ---------------- MAIN ----------------
+# ---------------- MAIN RUNNER ----------------
 def run():
     init_db()
 
-    # STEP 1: સૌથી પહેલાં આખો MarketMunafa બ્લોગ સ્કેન કરો
     log.info("Scanning existing posts on MarketMunafa blog before processing feeds...")
     blog_state = get_existing_blogger_posts()
 
     all_items = []
 
-    # STEP 2: Fetch from BSE Direct JSON API (Results + Company Updates)
     json_items = fetch_bse_json_announcements()
     all_items.extend(json_items)
 
-    # STEP 3: Also check BSE XML Feeds as backup
     for kind, feed_url in FEEDS.items():
         try:
             items = parse_feed(feed_url, kind)
@@ -1754,7 +1726,7 @@ def run():
         file_key = extract_file_key(item["link"])
         item_id = make_item_id(comp_key, file_key, item)
 
-        # STAGE 1 CHECK: PDF ડાઉનલોડ કે AI કોલ કરતા પહેલાં જ બ્લોગ સાથે ચેક કરો
+        # STAGE 1 DEDUPLICATION CHECK
         is_dup, dup_reason = is_already_on_blog_or_db(item_id, comp_key, scrip_key, file_key, blog_state)
         if is_dup:
             log.info("Skipping duplicate [Stage 1 - %s] (%s): %s", dup_reason, doc_type, item["title"])
@@ -1762,10 +1734,13 @@ def run():
 
         log.info("Processing %s: %s", doc_type, item["title"])
         try:
-            source_text, pdf_bytes = get_document_payload(item)
-            file_key = extract_file_key(item["link"]) or file_key
-
+            # SCREENER FUNDAMENTALS & MID/LARGE CAP CHECK (પેની અને સ્મોલ કેપ ફિલ્ટર)
             screener_info = get_screener_fundamentals(item["title"])
+            
+            # જો માર્કેટ કેપ ₹5,000 Cr થી ઓછી હોય (સ્મોલ/પેની કેપ), તો સીધા જ સ્કીપ કરો
+            if not screener_info["is_mid_large_cap"] and screener_info["market_cap_num"] > 0:
+                log.info("Skipping Small/Penny Cap Company (Market Cap: %s): %s", screener_info["market_cap"], item["title"])
+                continue
 
             # Check Screener company name against blog before calling Gemini
             if screener_info.get("screener_company_name"):
@@ -1779,6 +1754,9 @@ def run():
                     )
                     continue
 
+            source_text, pdf_bytes = get_document_payload(item)
+            file_key = extract_file_key(item["link"]) or file_key
+
             if doc_type == "result" and not pdf_bytes and not screener_info["q_all_rev"] and len(source_text) < 120:
                 log.warning("Skipped: no PDF and no Screener quarterly data for %s", item["title"])
                 continue
@@ -1787,7 +1765,6 @@ def run():
                 item["title"], scrip_code, doc_type, source_text, pdf_bytes, screener_info
             )
 
-            # STAGE 2 CHECK: AI પાસેથી મળેલા સાચા કંપનીના નામ (company_short_name) ને ફરીથી બ્લોગ સાથે મેચ કરો
             ai_comp_name = str(ai_data.get("company_short_name") or "").strip()
             ai_comp_key = normalize_company_key(ai_comp_name, doc_type) if ai_comp_name else ""
             if ai_comp_key and ai_comp_key in blog_state["comp_keys"]:
@@ -1819,7 +1796,6 @@ def run():
                 scrip_code=scrip_code,
             )
 
-            # તરત જ મેમરીમાં ઉમેરી દો જેથી એક જ રનમાં પણ બીજી વાર પોસ્ટ ન થાય
             if comp_key:
                 blog_state["comp_keys"].add(comp_key)
             if ai_comp_key:
