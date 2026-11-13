@@ -1,9 +1,8 @@
-name: BSE PDF Analyzer Bot
+name: MarketMunafa 30 Stocks Bot
 
 on:
   schedule:
-    # માર્કેટના સમય દરમિયાન દર 2 કલાકે રન થશે (સોમ-શુક્ર)
-    - cron: '30 4-10/2 * * 1-5'
+    - cron: '0 13 * * *'
   workflow_dispatch:
 
 jobs:
@@ -11,22 +10,24 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: '3.11'
+          cache: 'pip'
 
       - name: Install Dependencies
         run: |
-          pip install requests beautifulsoup4 curl_cffi PyPDF2 google-generativeai fake-useragent
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Run BSE PDF Bot
+      - name: Run MarketMunafa Bot
         env:
+          BLOG_ID: ${{ secrets.BLOG_ID }}
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
           CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
           REFRESH_TOKEN: ${{ secrets.REFRESH_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: |
-          python bse_pdf_bot.py
+        run: python bse_pdf_bot_final.py
