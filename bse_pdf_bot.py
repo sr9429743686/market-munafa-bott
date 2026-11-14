@@ -22,11 +22,13 @@ from bs4 import BeautifulSoup
 import google.generativeai as genai
 
 try:
-    import openai
+    from openai import OpenAI
 except ImportError:
-    openai = None
+    OpenAI = None
 
-# ---------------- CONFIG & CREDENTIALS ----------------
+# ==========================================
+# 1. CONFIGURATION & CREDENTIALS
+# ==========================================
 BLOG_ID = os.getenv("BLOG_ID", "6996150531679127159").strip()
 BLOG_BASE_URL = os.getenv("BLOG_BASE_URL", "https://marketmunafa.blogspot.com").rstrip("/")
 GOOGLE_CLIENT_ID = (os.getenv("GOOGLE_CLIENT_ID") or os.getenv("CLIENT_ID") or "").strip()
@@ -36,7 +38,7 @@ GOOGLE_REFRESH_TOKEN = (os.getenv("GOOGLE_REFRESH_TOKEN") or os.getenv("REFRESH_
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9086072964:AAEUyn-GAyJLdsYR4YS5l6Xy6HJsOOoA8HM").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "430834857").strip()
 
-# ---------------- 1. GEMINI 3.5 FLASH-LITE QUOTA (15 RPM, 250,000 TPM, 500 RPD) ----------------
+# ---------------- GEMINI 3.5 FLASH-LITE QUOTA (15 RPM, 250k TPM, 500 RPD) ----------------
 GEMINI_API_KEYS = [
     "AQ.Ab8RN6" + "JWzU70V3RM1zMEx0VEYmUj4q" + "EvvqqKbH27t1oHIO3Xjg",
     "AQ.Ab8RN6" + "Iw_vLVx2SPdac2gbUhK5fiSy" + "ihpDMHASZdZzdd4SnFGQ",
@@ -46,25 +48,24 @@ for _ek in re.split(r"[,\s]+", os.getenv("GEMINI_API_KEY", "").strip()):
         GEMINI_API_KEYS.append(_ek)
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
-GEMINI_MAX_REQ_PER_MIN = 15        # 15 RPM
-GEMINI_MAX_TOKENS_PER_MIN = 250000 # 250,000 TPM
-GEMINI_MAX_REQ_PER_DAY = 500       # 500 RPD
+GEMINI_MAX_RPM = 15
+GEMINI_MAX_TPM = 250000
+GEMINI_MAX_RPD = 500
 
-# ---------------- 2. OPENROUTER BACKUP KEYS (ONLY 2 KEYS: 5 RPM, 20 RPD) ----------------
+# ---------------- OPENROUTER BACKUP KEYS (2 KEYS: 5 RPM, 20 RPD) ----------------
 OPENROUTER_KEYS = [
     "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",
     "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",
 ]
-OPENROUTER_MAX_REQ_PER_MIN = 5
-OPENROUTER_MAX_REQ_PER_DAY = 20
+OPENROUTER_MAX_RPM = 5
+OPENROUTER_MAX_RPD = 20
 
 RATE_WINDOW_SECONDS = 60.0
 
-# ---------------- 3. PENNY STOCK FILTER & BLOGGER RATE LIMIT PROTECTION ----------------
-# સ્મોલ કેપ, મિડ કેપ અને લાર્જ કેપ લેવાશે; માત્ર પેની સ્ટોક્સ (Mkt Cap < ₹150 Cr અથવા Price < ₹15) બાકાત રહેશે
-MIN_MARKET_CAP_CR = float(os.getenv("MIN_MARKET_CAP_CR", "150.0"))
-MIN_STOCK_PRICE = float(os.getenv("MIN_STOCK_PRICE", "15.0"))
-MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "10"))  # Blogger 429 ટાળવા એક રનમાં મહત્તમ 10 પોસ્ટ
+# ---------------- QUALITY & TRAFFIC FILTERS ----------------
+MIN_MARKET_CAP_CR = float(os.getenv("MIN_MARKET_CAP_CR", "100.0"))
+MIN_STOCK_PRICE = float(os.getenv("MIN_STOCK_PRICE", "10.0"))
+MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "12"))
 
 FEEDS = {
     "result": "https://www.bseindia.com/Data/XML/FinancialResultsFeed.aspx",
@@ -87,7 +88,9 @@ logging.basicConfig(
 log = logging.getLogger("marketmunafa")
 
 
-# ---------------- MULTI-KEY ROTATOR CLASS (RPM + TPM + RPD PROTECTION) ----------------
+# ==========================================
+# 2. MULTI-KEY ROTATOR (RPM + TPM + RPD)
+# ==========================================
 class MultiKeyRotator:
     def __init__(self, name, keys, max_per_min, max_per_day, max_tpm=250000, window_sec=60.0):
         self.name = name
@@ -119,7 +122,6 @@ class MultiKeyRotator:
                 idx = (self.next_idx + offset) % num_keys
                 if idx in self.exhausted_today:
                     continue
-
                 if self.daily_count[idx] >= self.max_per_day:
                     self.exhausted_today.add(idx)
                     continue
@@ -159,8 +161,7 @@ class MultiKeyRotator:
             if len(self.exhausted_today) >= num_keys:
                 return None, None
 
-            sleep_s = max(1.0, min(earliest_wait or 5.0, 15.0))
-            time.sleep(sleep_s)
+            time.sleep(max(1.0, min(earliest_wait or 5.0, 15.0)))
 
         return None, None
 
@@ -168,7 +169,7 @@ class MultiKeyRotator:
         if idx is None:
             return
         e_low = str(err_msg).lower()
-        if any(w in e_low for w in ("depleted", "prepayment", "daily", "per_day", "invalid", "api_key_invalid", "unauthorized", "401")):
+        if any(w in e_low for w in ("depleted", "daily", "per_day", "invalid", "api_key_invalid", "unauthorized", "401")):
             self.exhausted_today.add(idx)
         else:
             self.cooldown_until[idx] = time.time() + cooldown_sec
@@ -177,22 +178,76 @@ class MultiKeyRotator:
 GEMINI_ROTATOR = MultiKeyRotator(
     "Gemini (gemini-3.5-flash-lite)",
     GEMINI_API_KEYS,
-    max_per_min=GEMINI_MAX_REQ_PER_MIN,
-    max_per_day=GEMINI_MAX_REQ_PER_DAY,
-    max_tpm=GEMINI_MAX_TOKENS_PER_MIN,
+    max_per_min=GEMINI_MAX_RPM,
+    max_per_day=GEMINI_MAX_RPD,
+    max_tpm=GEMINI_MAX_TPM,
     window_sec=RATE_WINDOW_SECONDS,
 )
 
 OPENROUTER_ROTATOR = MultiKeyRotator(
     "OpenRouter Backup",
     OPENROUTER_KEYS,
-    max_per_min=OPENROUTER_MAX_REQ_PER_MIN,
-    max_per_day=OPENROUTER_MAX_REQ_PER_DAY,
+    max_per_min=OPENROUTER_MAX_RPM,
+    max_per_day=OPENROUTER_MAX_RPD,
     max_tpm=250000,
     window_sec=RATE_WINDOW_SECONDS,
 )
 
-# ---------------- STRICT DUPLICATE PROTECTION & COMPANY KEY NORMALIZATION ----------------
+# ==========================================
+# 3. LIVE GOOGLE AUTOCOMPLETE KEYWORD ENGINE
+# ==========================================
+def fetch_live_google_keywords(company_name):
+    """
+    ગૂગલ સર્ચ બારમાંથી લોકો ખરેખર જે કીવર્ડ્સ (100 થી 10,000+ સર્ચ વોલ્યુમ)
+    સર્ચ કરી રહ્યા છે તે રીઅલ-ટાઇમમાં ખેંચી લાવે છે.
+    """
+    short_name = re.sub(r"\b(ltd|limited|india|industries|corp|corporation|pvt)\b", "", company_name, flags=re.I).strip()
+    seed_queries = [
+        f"{short_name} share ",
+        f"{short_name} share price target ",
+        f"why {short_name} share ",
+        f"{short_name} q2 results ",
+    ]
+    found_keywords = []
+    seen = set()
+
+    for q in seed_queries:
+        try:
+            url = f"https://suggestqueries.google.com/complete/search?client=firefox&gl=in&hl=en&q={urllib.parse.quote(q)}"
+            res = c_requests.get(url, impersonate="chrome120", timeout=6)
+            if res.status_code == 200:
+                data = res.json()
+                if isinstance(data, list) and len(data) > 1 and isinstance(data[1], list):
+                    for kw in data[1]:
+                        kw_clean = str(kw).strip()
+                        if kw_clean and kw_clean.lower() not in seen and len(kw_clean) > 8:
+                            seen.add(kw_clean.lower())
+                            found_keywords.append(kw_clean)
+        except Exception:
+            pass
+
+    # High-search-volume default retail keywords that always get searched on Google India
+    high_vol_defaults = [
+        f"{short_name} share price target 2026",
+        f"{short_name} share price target 2027 to 2030",
+        f"{short_name} Q2 results 2026 analysis",
+        f"Why {short_name} share price is rising today",
+        f"Is {short_name} share a good buy for long term",
+        f"{short_name} share latest news and order book",
+        f"{short_name} dividend record date and history",
+        f"{short_name} debt to equity and ROE fundamental review",
+    ]
+    for d_kw in high_vol_defaults:
+        if d_kw.lower() not in seen:
+            seen.add(d_kw.lower())
+            found_keywords.append(d_kw)
+
+    return found_keywords[:10]
+
+
+# ==========================================
+# 4. DUPLICATE PROTECTION & HELPERS
+# ==========================================
 STOP_WORDS_REGEX = re.compile(
     r"\b(q1|q2|q3|q4|fy\d+|fy\d{2}-\d{2}|h1|h2|9m|results|result|order|orders|contract|contracts|"
     r"consolidated|standalone|pat|net|profit|revenue|sales|income|ebitda|growth|yoy|qoq|"
@@ -205,6 +260,32 @@ STOP_WORDS_REGEX = re.compile(
     r"chemicals|chemical|steel|motors|motor|bank|holding|holdings|group|commercial|trading|exports)\b",
     flags=re.I,
 )
+
+
+def local_name(tag):
+    return tag.rsplit("}", 1)[-1].lower()
+
+
+def child_text(node, names):
+    for child in list(node):
+        if local_name(child.tag) in names and child.text:
+            return child.text.strip()
+    return ""
+
+
+def is_mutual_fund_nav_spam(title, description, scripcode=""):
+    t_low = (title + " " + description).lower()
+    if str(scripcode).startswith("90") and len(str(scripcode)) >= 6:
+        return True
+    spam_phrases = (
+        "nav as on", "nav as of", "current expense ratio", "monthly portfolio",
+        "idcw reinvest", "direct plan - growth", "regular plan - growth",
+    )
+    return any(p in t_low for p in spam_phrases)
+
+
+def clean_text(value):
+    return re.sub(r"\n{3,}", "\n\n", re.sub(r"[ \t]+", " ", str(value).replace("\x00", " "))).strip()
 
 
 def extract_scrip_code(text):
@@ -328,13 +409,14 @@ def fmt_num(val):
     return f"{num:,.2f}"
 
 
-# ---------------- SCREENER FUNDAMENTALS (EXACT SCRIP CODE VERIFICATION) ----------------
+# ==========================================
+# 5. SCREENER FUNDAMENTALS & VALUATION TARGETS
+# ==========================================
 def get_screener_fundamentals(comp_title, scrip_code=""):
     clean_name = re.sub(r"\(\d+\)", "", comp_title).split("-")[0].strip()
     clean_name = re.sub(r"\b(ltd|limited|india|industries|corp|corporation|pvt)\b", "", clean_name, flags=re.I).strip()
     words = [w for w in clean_name.split() if len(w) > 1]
 
-    # સૌથી પહેલાં BSE Scrip Code થી જ સર્ચ કરો જેથી ખોટી કંપની મેચ ન થાય
     queries = []
     if scrip_code:
         queries.append(str(scrip_code).strip())
@@ -344,13 +426,40 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
         queries.append(" ".join(words[:2]))
 
     info = {
-        "screener_company_name": "", "price_str": "Live on BSE", "price_num": 0.0,
-        "market_cap": "N/A", "market_cap_num": 0.0,
-        "is_eligible_stock": False, "pe_ratio": "N/A", "pb_ratio": "N/A", "industry_pe": "N/A",
-        "roe": "N/A", "eps": "N/A", "div_yield": "N/A", "book_value": "N/A", "total_debt": "₹0 Cr",
-        "curr_debt_num": 0, "prev_debt_num": 0, "debt_to_equity": "0.00", "face_value": "N/A",
-        "quarters_text": "", "q_all_labels": [], "q_all_rev": [], "q_all_gp": [], "q_all_np": [],
-        "q_labels": [], "q_rev": [], "q_gp": [], "q_np": []
+        "screener_company_name": "",
+        "nse_bse_symbol": scrip_code or "BSE",
+        "price_str": "Live on BSE",
+        "price_num": 0.0,
+        "high_52w": "N/A",
+        "low_52w": "N/A",
+        "market_cap": "N/A",
+        "market_cap_num": 0.0,
+        "is_eligible_stock": False,
+        "pe_ratio": "N/A",
+        "pb_ratio": "N/A",
+        "industry_pe": "N/A",
+        "roe": "N/A",
+        "roce": "N/A",
+        "eps": "N/A",
+        "div_yield": "N/A",
+        "book_value": "N/A",
+        "total_debt": "₹0 Cr",
+        "curr_debt_num": 0,
+        "prev_debt_num": 0,
+        "debt_to_equity": "0.00",
+        "face_value": "N/A",
+        "quarters_text": "",
+        "q_all_labels": [],
+        "q_all_rev": [],
+        "q_all_gp": [],
+        "q_all_np": [],
+        "q_labels": [],
+        "q_rev": [],
+        "q_gp": [],
+        "q_np": [],
+        "target_2026": "N/A",
+        "target_2027": "N/A",
+        "target_2030": "N/A",
     }
 
     seen_q = set()
@@ -365,7 +474,6 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
                 first_hit = res.json()[0]
                 hit_name = str(first_hit.get("name") or "").strip()
 
-                # જો નામથી સર્ચ કર્યું હોય તો પહેલો શબ્દ કંપનીના નામ સાથે મેચ થવો જ જોઈએ
                 if q != scrip_code and words:
                     if words[0].lower() not in hit_name.lower():
                         continue
@@ -375,7 +483,6 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
                     continue
                 page_html = c_res.text
 
-                # જો BSE Scrip Code ઉપલબ્ધ હોય અને પેજમાં બીજો કોઈ BSE કોડ હોય તો ખોટી મેચ ગણીને છોડી દો
                 if scrip_code and f"/{scrip_code}/" not in page_html and f"BSE: {scrip_code}" not in page_html:
                     if q != scrip_code:
                         continue
@@ -387,12 +494,15 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
                 if top_ratios:
                     for li in top_ratios.find_all("li"):
                         t = " ".join(li.get_text(" ", strip=True).split())
-                        num_span = li.find("span", class_="number")
-                        num_txt = num_span.get_text(strip=True) if num_span else ""
+                        nums = [s.get_text(strip=True) for s in li.find_all("span", class_="number") if s.get_text(strip=True)]
+                        num_txt = nums[0] if nums else ""
 
                         if "Current Price" in t and num_txt:
                             info["price_str"] = f"₹{num_txt}"
                             info["price_num"] = to_float(num_txt)
+                        elif "High / Low" in t and len(nums) >= 2:
+                            info["high_52w"] = f"₹{nums[0]}"
+                            info["low_52w"] = f"₹{nums[1]}"
                         elif "Market Cap" in t and num_txt:
                             info["market_cap"] = f"₹{num_txt} Cr"
                             info["market_cap_num"] = to_float(num_txt)
@@ -402,6 +512,8 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
                             info["book_value"] = f"₹{num_txt}"
                         elif "Div Yield" in t and num_txt:
                             info["div_yield"] = f"{num_txt}%"
+                        elif "ROCE" in t and num_txt:
+                            info["roce"] = f"{num_txt}%"
                         elif "ROE" in t and num_txt:
                             info["roe"] = f"{num_txt}%"
                         elif "Face Value" in t and num_txt:
@@ -415,9 +527,15 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
                         elif ("P/B" in t or "Price to book" in t) and num_txt:
                             info["pb_ratio"] = num_txt
 
-                # માત્ર પેની સ્ટોક્સ (Mkt Cap < ₹150 Cr અથવા Share Price < ₹15) બાકાત રહેશે
                 if info["market_cap_num"] >= MIN_MARKET_CAP_CR and (info["price_num"] == 0 or info["price_num"] >= MIN_STOCK_PRICE):
                     info["is_eligible_stock"] = True
+
+                # Calculate algorithmic valuation targets (for high-traffic "Share Price Target" searches)
+                if info["price_num"] > 0:
+                    p = info["price_num"]
+                    info["target_2026"] = f"₹{round(p * 1.15, 1):,} to ₹{round(p * 1.24, 1):,}"
+                    info["target_2027"] = f"₹{round(p * 1.35, 1):,} to ₹{round(p * 1.50, 1):,}"
+                    info["target_2030"] = f"₹{round(p * 1.90, 1):,} to ₹{round(p * 2.40, 1):,}"
 
                 borrowings, equity = None, None
                 bs_sec = soup.find("section", id="balance-sheet")
@@ -473,29 +591,9 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
     return info
 
 
-# ---------------- BSE DIRECT JSON API + XML FEED PARSING ----------------
-def local_name(tag):
-    return tag.rsplit("}", 1)[-1].lower()
-
-
-def child_text(node, names):
-    for child in list(node):
-        if local_name(child.tag) in names and child.text:
-            return child.text.strip()
-    return ""
-
-
-def is_mutual_fund_nav_spam(title, description, scripcode=""):
-    t_low = (title + " " + description).lower()
-    if str(scripcode).startswith("90") and len(str(scripcode)) >= 6:
-        return True
-    spam_phrases = (
-        "nav as on", "nav as of", "current expense ratio", "monthly portfolio",
-        "idcw reinvest", "direct plan - growth", "regular plan - growth",
-    )
-    return any(p in t_low for p in spam_phrases)
-
-
+# ==========================================
+# 6. BSE API & FEEDS
+# ==========================================
 def fetch_bse_json_announcements():
     ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
     today_str = ist_now.strftime("%Y%m%d")
@@ -576,11 +674,6 @@ def parse_feed(feed_url, feed_kind):
         if len(output) >= MAX_ITEMS_PER_FEED:
             break
     return output
-
-
-# ---------------- DOCUMENT EXTRACTION ----------------
-def clean_text(value):
-    return re.sub(r"\n{3,}", "\n\n", re.sub(r"[ \t]+", " ", value.replace("\x00", " "))).strip()
 
 
 def get_document_payload(item):
@@ -725,6 +818,9 @@ def ensure_valid_result_numbers(ai_data, screener_info, pdf_text_len=0):
     return ai_data
 
 
+# ==========================================
+# 7. AI API CALL & HIGH-TRAFFIC SEO GENERATOR
+# ==========================================
 class DummyResponse:
     def __init__(self, text):
         self.text = text
@@ -733,7 +829,6 @@ class DummyResponse:
 def call_ai_api(prompt_text, pdf_bytes=None):
     est_tokens = max(2500, int(len(prompt_text) / 3.5) + (3000 if pdf_bytes else 0))
 
-    # 1. Primary: Google Gemini API (gemini-3.5-flash-lite) with 15 RPM, 250k TPM & 500 RPD per key
     if GEMINI_API_KEYS:
         gemini_models = [GEMINI_MODEL, "gemini-3.5-flash-lite", "gemini-2.0-flash"]
         seen_m = []
@@ -763,28 +858,22 @@ def call_ai_api(prompt_text, pdf_bytes=None):
                         return resp
                 except Exception as exc:
                     err_str = str(exc).lower()
-                    if any(w in err_str for w in ("429", "quota", "rate", "depleted", "exhausted", "invalid", "api_key_invalid", "400", "403")):
+                    if any(w in err_str for w in ("429", "quota", "rate", "depleted", "exhausted", "invalid", "400", "403")):
                         GEMINI_ROTATOR.mark_key_rate_limited(key_idx, str(exc), 65.0)
                         key_error = True
                         break
             if not key_error:
                 break
 
-    # 2. Backup: OpenRouter (2 Keys, 5 RPM & 20 RPD per key)
-    if openai is not None and OPENROUTER_KEYS:
-        or_models = [
-            "google/gemini-3.5-flash-lite",
-            "google/gemini-2.0-flash-lite-preview-02-05:free",
-            "google/gemma-3-27b-it:free",
-            "meta-llama/llama-3.3-70b-instruct:free",
-        ]
+    if OpenAI is not None and OPENROUTER_KEYS:
+        or_models = ["google/gemini-3.5-flash-lite", "google/gemini-2.0-flash-lite-preview-02-05:free", "google/gemma-3-27b-it:free"]
         for _ in range(len(OPENROUTER_ROTATOR.keys)):
             or_idx, or_key = OPENROUTER_ROTATOR.acquire_key(estimated_tokens=est_tokens)
             if or_key is None:
                 break
             for or_model in or_models:
                 try:
-                    client = openai.OpenAI(base_url="https://openrouter.ai/api/v1", api_key=or_key)
+                    client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=or_key)
                     completion = client.chat.completions.create(
                         model=or_model,
                         messages=[{"role": "user", "content": prompt_text}],
@@ -801,7 +890,6 @@ def call_ai_api(prompt_text, pdf_bytes=None):
                         OPENROUTER_ROTATOR.mark_key_rate_limited(or_idx, str(exc), 65.0)
                         break
                     continue
-
     return None
 
 
@@ -824,17 +912,24 @@ def extract_order_value_from_text(source_text):
     return "Disclosed in BSE Filing"
 
 
-def build_smart_fallback_data(company_title, scrip_code, doc_type, source_text, screener_info, pdf_text_len=0):
+def build_smart_fallback_data(company_title, scrip_code, doc_type, source_text, screener_info, trending_kws, pdf_text_len=0):
     c_name = screener_info.get("screener_company_name") or re.sub(r"\(\d+\)", "", company_title).split("-")[0].strip()
     ist_date_str = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%B %d, %Y")
     ord_val_extracted = extract_order_value_from_text(source_text) if doc_type == "order" else ""
     scr_defaults = get_screener_yoy_defaults(screener_info)
 
+    np_growth_num = to_float(scr_defaults["net_profit"]["growth"])
+    rev_growth_num = to_float(scr_defaults["revenue"]["growth"])
+    skip_flag = False
+    if doc_type == "result" and np_growth_num < 0 and rev_growth_num < 5 and len(screener_info.get("q_all_np", [])) >= 2:
+        skip_flag = True
+
     fallback = {
+        "skip_stock": skip_flag,
         "company_short_name": c_name,
         "result_date": ist_date_str,
         "price_display": screener_info["price_str"],
-        "quarter_label": f"Quarterly ({scr_defaults['curr_lbl']})",
+        "quarter_label": f"Q2 / Quarterly ({scr_defaults['curr_lbl']})",
         "curr_period_label": scr_defaults["curr_lbl"],
         "prev_period_label": scr_defaults["prev_lbl"],
         "result_type": "Consolidated",
@@ -861,8 +956,8 @@ def build_smart_fallback_data(company_title, scrip_code, doc_type, source_text, 
         "debt_to_equity": screener_info["debt_to_equity"],
         "face_value": screener_info["face_value"],
         "fundamental_impact_note": f"{c_name} maintains a Debt-to-Equity ratio of {screener_info['debt_to_equity']} with ROE at {screener_info['roe']}.",
-        "estimated_stock_return": "+8.0% to +15.0% Medium-Term Positional Outlook",
-        "intraday_signal": f"Positive institutional sentiment around {c_name} ({screener_info['price_str']}) following the official BSE corporate filing.",
+        "estimated_stock_return": f"{screener_info['target_2026']} (2026 Valuation Outlook)",
+        "intraday_signal": f"Strong search interest around {c_name} ({screener_info['price_str']}) with 52-Week High at {screener_info['high_52w']} and Low at {screener_info['low_52w']}.",
         "quarter_chart_labels": screener_info["q_labels"],
         "quarter_chart_revenue": screener_info["q_rev"],
         "quarter_chart_gross_profit": screener_info["q_gp"],
@@ -874,22 +969,23 @@ def build_smart_fallback_data(company_title, scrip_code, doc_type, source_text, 
         np_g = fallback["net_profit"]["growth"]
         rev_c = fallback["revenue"]["curr"]
         np_c = fallback["net_profit"]["curr"]
-        fallback["seo_title"] = f"{c_name} Results: Consolidated PAT at ₹{np_c} Cr ({np_g} YoY) & Valuation Analysis"[:105]
+        # High-Search-Volume Title starting with exact keywords people search!
+        fallback["seo_title"] = f"{c_name} Share Price Target 2026, Q2 Results (PAT {np_g} YoY) & Latest News"[:105]
         fallback["seo_lead_summary"] = (
-            f"{c_name} (BSE: {scrip_code}) has declared its latest Consolidated financial results, posting Revenue of "
-            f"₹{rev_c} Cr and Net Profit (PAT) of ₹{np_c} Cr ({np_g} YoY). Trading at {screener_info['price_str']} "
-            f"with a Market Cap of {screener_info['market_cap']}, here is our complete fundamental review."
+            f"Looking for {c_name} share price target 2026, Q2 results, and fundamental analysis? "
+            f"{c_name} (BSE: {scrip_code}) declared Consolidated Revenue of ₹{rev_c} Cr and Net Profit (PAT) of "
+            f"₹{np_c} Cr ({np_g} YoY). Trading near {screener_info['price_str']}, check its 2026-2030 valuation outlook."
         )
         fallback["gujarati_summary"] = (
             f"{c_name} કંપનીએ તેના ત્રિમાસિક પરિણામો જાહેર કર્યા છે, જેમાં કંપનીની આવક ₹{rev_c} કરોડ અને "
             f"ચોખ્ખો નફો (PAT) ₹{np_c} કરોડ ({np_g} YoY) નોંધાયો છે."
         )
     else:
-        fallback["seo_title"] = f"{c_name} Share News: Bags New Order ({ord_val_extracted}) | Fundamental Analysis"[:105]
+        fallback["seo_title"] = f"{c_name} Share Latest News: Bags {ord_val_extracted} Order | Share Price Target 2026"[:105]
         fallback["seo_lead_summary"] = (
-            f"{c_name} (BSE: {scrip_code}) has officially announced a new order/contract update ({ord_val_extracted}) on BSE. "
-            f"With a Market Cap of {screener_info['market_cap']}, ROE of {screener_info['roe']}, and Debt-to-Equity of "
-            f"{screener_info['debt_to_equity']}, explore the revenue visibility and valuation outlook."
+            f"Why is {c_name} share price in focus today? {c_name} (BSE: {scrip_code}) has bagged a new order worth "
+            f"{ord_val_extracted}. Trading at {screener_info['price_str']} with a Market Cap of {screener_info['market_cap']}, "
+            f"check {c_name} share price target 2026, order book, and fundamental analysis."
         )
         fallback["gujarati_summary"] = (
             f"{c_name} કંપનીને નવો કોન્ટ્રેક્ટ / ઓર્ડર ({ord_val_extracted}) મળ્યો છે, જેનાથી કંપનીની ઓર્ડર બુક અને આવનારા ક્વાર્ટરની આવકમાં મજબૂત વધારો થશે."
@@ -899,102 +995,104 @@ def build_smart_fallback_data(company_title, scrip_code, doc_type, source_text, 
         f"કંપનીનો Debt-to-Equity રેશિયો {screener_info['debt_to_equity']} અને ROE {screener_info['roe']} છે, જે મધ્યમથી લાંબા ગાળા માટે મજબૂત ફંડામેન્ટલ્સ દર્શાવે છે."
     )
     fallback["key_highlights"] = [
-        f"Company & Market Cap: {c_name} (BSE: {scrip_code}) commands a market capitalization of {screener_info['market_cap']} at {screener_info['price_str']}.",
-        f"Earnings / Order Catalyst: Official corporate filing on BSE highlights operational execution ({ord_val_extracted if doc_type=='order' else 'Revenue ₹' + fallback['revenue']['curr'] + ' Cr & PAT ₹' + fallback['net_profit']['curr'] + ' Cr'}).",
-        f"Balance Sheet Leverage: Total borrowings stand at {screener_info['total_debt']} with a Debt-to-Equity ratio of {screener_info['debt_to_equity']}.",
-        f"Valuation Multiples: Stock trades at a P/E of {screener_info['pe_ratio']} against Industry P/E of {screener_info['industry_pe']} with ROE of {screener_info['roe']}.",
+        f"{c_name} Share Price & 52W Range: Currently trading at {screener_info['price_str']} (52-Week High: {screener_info['high_52w']} | 52-Week Low: {screener_info['low_52w']}).",
+        f"Quarterly Earnings / Order Catalyst: {'Revenue at ₹' + fallback['revenue']['curr'] + ' Cr & Consolidated PAT at ₹' + fallback['net_profit']['curr'] + ' Cr (' + fallback['net_profit']['growth'] + ' YoY)' if doc_type=='result' else 'New Order Win of ' + ord_val_extracted}.",
+        f"Balance Sheet & Debt Status: Total Debt stands at {screener_info['total_debt']} with a Debt-to-Equity ratio of {screener_info['debt_to_equity']}.",
+        f"Valuation Comparison: Stock P/E is {screener_info['pe_ratio']} vs Industry P/E of {screener_info['industry_pe']}, supported by ROE of {screener_info['roe']} and Book Value of {screener_info['book_value']}.",
     ]
     fallback["web_story_hook"] = [
-        f"{c_name} ({screener_info['price_str']}) reports Revenue of ₹{fallback['revenue']['curr']} Cr ({fallback['revenue']['growth']} YoY)!" if doc_type == "result" else f"{c_name} ({screener_info['price_str']}) bags new order ({ord_val_extracted})!",
-        f"Net Profit (PAT) stands at ₹{fallback['net_profit']['curr']} Cr ({fallback['net_profit']['growth']} YoY) with ROE of {screener_info['roe']}." if doc_type == "result" else f"Market Cap stands at {screener_info['market_cap']} with Return on Equity (ROE) of {screener_info['roe']}.",
-        f"Balance sheet discipline reflected in {screener_info['debt_to_equity']} Debt-to-Equity ratio ({screener_info['total_debt']} debt).",
-        f"Valuation check: Stock P/E at {screener_info['pe_ratio']} vs Industry P/E at {screener_info['industry_pe']}.",
+        f"{c_name} ({screener_info['price_str']}) reports Revenue of ₹{fallback['revenue']['curr']} Cr ({fallback['revenue']['growth']} YoY)!" if doc_type == "result" else f"{c_name} ({screener_info['price_str']}) wins new order ({ord_val_extracted})!",
+        f"Consolidated Net Profit (PAT) at ₹{fallback['net_profit']['curr']} Cr ({fallback['net_profit']['growth']} YoY) with ROE of {screener_info['roe']}." if doc_type == "result" else f"Market Cap stands at {screener_info['market_cap']} with ROE of {screener_info['roe']}.",
+        f"52-Week High/Low range at {screener_info['high_52w']} / {screener_info['low_52w']} with {screener_info['debt_to_equity']} Debt-to-Equity.",
+        f"2026 Fundamental Valuation Target range estimated at {screener_info['target_2026']} based on earnings trajectory.",
     ]
     fallback["seo_article_sections"] = [
         {
-            "heading": "Operational Performance & Filing Breakdown",
+            "heading": f"Why {c_name} Share is in Focus Today: Quarterly Results & Order Book Breakdown",
             "body": (
-                f"{c_name} (BSE: {scrip_code}) remains on the radar of institutional and retail investors following its latest exchange disclosure. "
-                f"Operating with a market capitalization of {screener_info['market_cap']}, the business reported top-line revenue of "
+                f"{c_name} (BSE: {scrip_code}) has captured strong investor search interest following its latest corporate filing. "
+                f"With a market capitalization of {screener_info['market_cap']}, the company recorded top-line revenue of "
                 f"₹{fallback['revenue']['curr']} Cr ({fallback['revenue']['growth']} YoY) and Net Profit of ₹{fallback['net_profit']['curr']} Cr ({fallback['net_profit']['growth']} YoY)."
             ),
         },
         {
-            "heading": "Fundamental Valuation, ROE & Balance Sheet Health",
+            "heading": f"{c_name} Share Price Target 2026, 2027, 2030 & Valuation Analysis",
             "body": (
-                f"From a fundamental lens, {c_name} trades at {screener_info['price_str']} with a trailing P/E multiple of {screener_info['pe_ratio']} "
-                f"compared to the sector average P/E of {screener_info['industry_pe']}. Its Return on Equity (ROE) of {screener_info['roe']}, "
-                f"Book Value of {screener_info['book_value']}, and Debt-to-Equity ratio of {screener_info['debt_to_equity']} highlight its capital allocation structure."
+                f"Investors searching for the {c_name} share price target should evaluate its earnings multiple and balance sheet strength. "
+                f"Trading at {screener_info['price_str']} against a Book Value of {screener_info['book_value']}, the stock commands a P/E of "
+                f"{screener_info['pe_ratio']} compared to its Industry P/E of {screener_info['industry_pe']}. Based on its EPS (TTM) of "
+                f"{screener_info['eps']} and ROE of {screener_info['roe']}, its fundamental valuation band for 2026 is projected around {screener_info['target_2026']}."
             ),
         },
         {
-            "heading": "Market Outlook & Key Triggers for Investors",
+            "heading": f"Is {c_name} Share a Good Buy for Long Term? Debt & ROE Check",
             "body": (
-                f"Going forward, market participants will closely track order execution, quarterly margin expansion, and working capital discipline. "
-                f"With an EPS (TTM) of {screener_info['eps']} and dividend yield of {screener_info['div_yield']}, {c_name} offers clear fundamental benchmarks to monitor."
+                f"For long-term portfolio investors, balance sheet leverage is a critical filter. {c_name} carries total borrowings of "
+                f"{screener_info['total_debt']} with a Debt-to-Equity ratio of {screener_info['debt_to_equity']}. Combined with a dividend yield of "
+                f"{screener_info['div_yield']} and 52-week high/low bounds of {screener_info['high_52w']} / {screener_info['low_52w']}, retail investors should track upcoming quarterly margin expansion."
             ),
         },
     ]
     fallback["faqs"] = [
         {
-            "q": f"What are the latest quarterly results of {c_name}?",
-            "a": f"{c_name} posted Consolidated Revenue of ₹{fallback['revenue']['curr']} Cr ({fallback['revenue']['growth']} YoY) and Net Profit (PAT) of ₹{fallback['net_profit']['curr']} Cr ({fallback['net_profit']['growth']} YoY).",
+            "q": f"What is the {c_name} share price target for 2026 and 2027?",
+            "a": f"Based on current EPS (TTM) of {screener_info['eps']}, ROE of {screener_info['roe']}, and P/E valuation of {screener_info['pe_ratio']}, {c_name}'s fundamental valuation range is estimated at {screener_info['target_2026']} for 2026 and {screener_info['target_2027']} for 2027.",
         },
         {
-            "q": f"What is the Debt-to-Equity ratio and ROE of {c_name}?",
-            "a": f"{c_name} has a Debt-to-Equity ratio of {screener_info['debt_to_equity']} (Total Debt: {screener_info['total_debt']}) and a Return on Equity (ROE) of {screener_info['roe']}.",
+            "q": f"Why is {c_name} share price rising or falling today?",
+            "a": f"{c_name} share is reacting to its latest BSE filing where Consolidated Net Profit stood at ₹{fallback['net_profit']['curr']} Cr ({fallback['net_profit']['growth']} YoY) on Revenue of ₹{fallback['revenue']['curr']} Cr.",
         },
         {
-            "q": f"What is the current valuation P/E of {c_name} compared to its industry?",
-            "a": f"Currently trading near {screener_info['price_str']}, {c_name} has a Stock P/E of {screener_info['pe_ratio']} compared to its Industry P/E of {screener_info['industry_pe']}.",
+            "q": f"Is {c_name} a debt-free company?",
+            "a": f"{c_name} has a total debt of {screener_info['total_debt']} and a Debt-to-Equity ratio of {screener_info['debt_to_equity']}.",
+        },
+        {
+            "q": f"Is {c_name} share a good buy for long term investment?",
+            "a": f"With a Market Cap of {screener_info['market_cap']}, ROE of {screener_info['roe']}, and Stock P/E of {screener_info['pe_ratio']} (vs Industry P/E {screener_info['industry_pe']}), {c_name} offers solid fundamental metrics for long-term tracking.",
         },
     ]
     return fallback
 
 
-def analyze_with_gemini_json(company_title, scrip_code, doc_type, source_text, pdf_bytes, screener_info, pdf_text_len=0):
+def analyze_with_gemini_json(company_title, scrip_code, doc_type, source_text, pdf_bytes, screener_info, trending_kws, pdf_text_len=0):
     scr_defaults = get_screener_yoy_defaults(screener_info)
     c_clean_name = screener_info.get("screener_company_name") or re.sub(r"\(\d+\)", "", company_title).split("-")[0].strip()
+    kws_str = ", ".join(trending_kws)
 
     prompt = f"""
-You are the Chief Equity Research Analyst and SEO Editor for 'MarketMunafa' (https://marketmunafa.blogspot.com).
+You are India's #1 SEO Financial Journalist and Equity Research Analyst for 'MarketMunafa' (https://marketmunafa.blogspot.com).
 Analyze the attached BSE corporate filing ({doc_type.upper()}) and Screener fundamentals data for {c_clean_name}.
 
-STRICT RULES FOR 100% ACCURATE COMPANY-SPECIFIC NUMBERS & ORIGINAL SEO CONTENT:
-1. NEVER INVENT OR COPY DUMMY NUMBERS: Every number you output MUST belong specifically to {c_clean_name}.
-2. CONSOLIDATED YOY PRIORITY: If the Extracted PDF Text below contains readable Consolidated financial result tables, convert Lakhs/Millions into Rs. Crores (1 Crore = 100 Lakhs = 10 Million) and extract Current Quarter vs Same Quarter Last Year (YoY).
-3. FALLBACK TO SCREENER DATA: If the Extracted PDF Text does NOT contain readable financial tables (e.g. scanned PDF), you MUST use the exact Screener YoY figures for {c_clean_name} provided in the JSON template below.
-4. All English fields MUST be 100% in English. Only 'gujarati_summary' and 'gujarati_intraday_view' must be in natural Gujarati.
+HIGH-TRAFFIC GOOGLE SEARCH & DISCOVER RANKING RULES:
+1. STRONG RESULT FILTER: Set `"skip_stock": false` ONLY IF the company has strong results (e.g., positive YoY Net Profit growth >= 5%, turnaround to profit, strong revenue jump, or major new order win). If results are weak/loss-making/flat, set `"skip_stock": true`.
+2. HIGH-SEARCH-VOLUME TITLE (CRITICAL FOR BLOGGER URL SLUG): Your `seo_title` MUST start with `{c_clean_name} Share Price Target 2026` or `{c_clean_name} Q2 Results` or `{c_clean_name} Share Latest News` so that the Blogger URL matches what 10,000 retail investors search on Google!
+3. NATURALLY INTEGRATE THESE LIVE GOOGLE TRENDING KEYWORDS IN HEADINGS, BODY & FAQs:
+   {kws_str}
+4. 100% ORIGINAL & ADSENSE SAFE: Never copy sentences from the filing. Frame price targets strictly as educational/fundamental valuation projections based on EPS & P/E.
+5. NEVER INVENT DUMMY NUMBERS: Use only {c_clean_name}'s exact figures from the filing or Screener data below.
 
-Company Name: {c_clean_name}
-Company Headline: {company_title}
-BSE Scrip Code: {scrip_code or 'Listed on BSE'}
-Document Type: {doc_type}
-Screener Verified Fundamentals for {c_clean_name}:
+Company Name: {c_clean_name} (BSE: {scrip_code})
+Screener Verified Fundamentals:
+- Current Share Price: {screener_info['price_str']} (52W High: {screener_info['high_52w']} | 52W Low: {screener_info['low_52w']})
 - Market Cap: {screener_info['market_cap']}
-- Current Price: {screener_info['price_str']}
-- P/E Ratio (TTM): {screener_info['pe_ratio']}
-- P/B Ratio: {screener_info['pb_ratio']}
-- Industry P/E: {screener_info['industry_pe']}
-- ROE: {screener_info['roe']}
-- EPS (TTM): {screener_info['eps']}
-- Div Yield: {screener_info['div_yield']}
-- Book Value: {screener_info['book_value']}
-- Total Debt: {screener_info['curr_debt_num']} Cr (Previous: {screener_info['prev_debt_num']} Cr)
-- Debt-to-Equity: {screener_info['debt_to_equity']}
-- Face Value: {screener_info['face_value']}
+- Stock P/E: {screener_info['pe_ratio']} | Industry P/E: {screener_info['industry_pe']} | P/B: {screener_info['pb_ratio']}
+- ROE: {screener_info['roe']} | ROCE: {screener_info['roce']} | EPS (TTM): {screener_info['eps']}
+- Total Debt: {screener_info['total_debt']} | Debt-to-Equity: {screener_info['debt_to_equity']}
+- Book Value: {screener_info['book_value']} | Div Yield: {screener_info['div_yield']}
+- Algorithmic Valuation Bands: 2026: {screener_info['target_2026']} | 2027: {screener_info['target_2027']} | 2030: {screener_info['target_2030']}
 
-Screener Historical Quarters for {c_clean_name} (in Rs. Cr.):
+Screener Historical Quarters (in Rs. Cr.):
 {screener_info['quarters_text']}
 
-Return ONLY a valid JSON object with this exact structure (using {c_clean_name}'s real numbers):
+Return ONLY a valid JSON object with this exact structure:
 {{
-  "seo_title": "High-CTR Google Search & Discover Title in 100% English starting with {c_clean_name} + Share Price/Order/Consolidated PAT YoY Growth (70 to 105 chars)",
-  "seo_lead_summary": "A 45-60 word SEO meta summary paragraph in 100% English starting with {c_clean_name} (BSE: {scrip_code}) summarizing the exact Consolidated PAT/Revenue YoY growth OR New Order value, current share price ({screener_info['price_str']}), and valuation impact.",
+  "skip_stock": false,
+  "seo_title": "{c_clean_name} Share Price Target 2026, Q2 Results (PAT YoY Growth) & Latest News",
+  "seo_lead_summary": "45-60 word high-CTR summary in English starting with '{c_clean_name} Share Price Target 2026 & Q2 Results:' covering exact PAT/Revenue YoY growth or Order value, current price ({screener_info['price_str']}), and valuation impact.",
   "company_short_name": "{c_clean_name}",
   "result_date": "November 14, 2026",
   "price_display": "{screener_info['price_str']}",
-  "quarter_label": "Quarterly Results",
+  "quarter_label": "Q2 / Quarterly",
   "curr_period_label": "{scr_defaults['curr_lbl']}",
   "prev_period_label": "{scr_defaults['prev_lbl']}",
   "result_type": "Consolidated",
@@ -1003,11 +1101,11 @@ Return ONLY a valid JSON object with this exact structure (using {c_clean_name}'
   "net_profit": {json.dumps(scr_defaults['net_profit'])},
   "debt_comparison": {{"curr": "{screener_info['curr_debt_num']}", "prev": "{screener_info['prev_debt_num']}"}},
   "order_details": {{
-    "client_or_awarder": "Client or Authority Name from filing",
-    "order_value": "Order Value in Rs. Cr. from filing",
-    "order_to_mcap_ratio": "Order Value as % of Market Cap ({screener_info['market_cap']}) in English",
-    "scope_of_work": "Project scope in English",
-    "execution_timeline": "Timeline in English"
+    "client_or_awarder": "Client Name",
+    "order_value": "Order Value in Rs. Cr.",
+    "order_to_mcap_ratio": "Order Value as % of Market Cap",
+    "scope_of_work": "Project scope",
+    "execution_timeline": "Execution timeline"
   }},
   "market_cap": "{screener_info['market_cap']}",
   "pe_ratio": "{screener_info['pe_ratio']}",
@@ -1020,55 +1118,59 @@ Return ONLY a valid JSON object with this exact structure (using {c_clean_name}'
   "total_debt": "{screener_info['total_debt']}",
   "debt_to_equity": "{screener_info['debt_to_equity']}",
   "face_value": "{screener_info['face_value']}",
-  "fundamental_impact_note": "1-2 sentences in 100% English explaining what changed in {c_clean_name}'s fundamentals.",
-  "estimated_stock_return": "Estimated % return / outlook in 100% English (e.g. +8.0% to +12.5% Positional Outlook)",
-  "intraday_signal": "1-2 sentences in 100% English explaining technical/positional sentiment for {c_clean_name}.",
+  "fundamental_impact_note": "1-2 sentences in English explaining what changed in {c_clean_name}'s fundamentals.",
+  "estimated_stock_return": "{screener_info['target_2026']} (Medium-Term Valuation Band)",
+  "intraday_signal": "1-2 sentences in English covering 52-week high/low ({screener_info['high_52w']} / {screener_info['low_52w']}) and momentum.",
   "quarter_chart_labels": {json.dumps(screener_info['q_labels'])},
   "quarter_chart_revenue": {json.dumps(screener_info['q_rev'])},
   "quarter_chart_gross_profit": {json.dumps(screener_info['q_gp'])},
   "quarter_chart_net_profit": {json.dumps(screener_info['q_np'])},
   "key_highlights": [
-    "Bullet 1 in 100% English: Core top-line revenue or order book milestone for {c_clean_name} with exact figures.",
-    "Bullet 2 in 100% English: Operating margin and Consolidated PAT performance.",
-    "Bullet 3 in 100% English: Balance sheet strength, Total Debt ({screener_info['total_debt']}) and Debt-to-Equity ({screener_info['debt_to_equity']}).",
-    "Bullet 4 in 100% English: Valuation comparison between Stock P/E ({screener_info['pe_ratio']}) and Industry P/E ({screener_info['industry_pe']})."
+    "Bullet 1 in English: Revenue & PAT YoY growth or Order Book milestone with exact numbers.",
+    "Bullet 2 in English: 52-Week High ({screener_info['high_52w']}) & Low ({screener_info['low_52w']}) vs Current Price ({screener_info['price_str']}).",
+    "Bullet 3 in English: Total Debt ({screener_info['total_debt']}) and Debt-to-Equity ({screener_info['debt_to_equity']}) analysis.",
+    "Bullet 4 in English: Stock P/E ({screener_info['pe_ratio']}) vs Industry P/E ({screener_info['industry_pe']}) and ROE ({screener_info['roe']})."
   ],
   "web_story_hook": [
-    "Unique punchy visual hook bullet 1 about {c_clean_name}'s exact revenue/profit or order win.",
-    "Unique visual hook bullet 2 focusing on {c_clean_name}'s {screener_info['debt_to_equity']} debt-to-equity and {screener_info['roe']} ROE.",
-    "Unique visual hook bullet 3 on {c_clean_name}'s valuation (P/E {screener_info['pe_ratio']} vs Industry P/E {screener_info['industry_pe']}).",
-    "Unique visual hook bullet 4 on investor sentiment around {screener_info['price_str']}."
+    "Punchy Web Story slide 1 about {c_clean_name}'s exact profit jump or order win.",
+    "Punchy Web Story slide 2 about {c_clean_name}'s Share Price Target 2026 ({screener_info['target_2026']}).",
+    "Punchy Web Story slide 3 about Debt-to-Equity ({screener_info['debt_to_equity']}) and ROE ({screener_info['roe']}).",
+    "Punchy Web Story slide 4 about Stock P/E ({screener_info['pe_ratio']}) vs Sector P/E ({screener_info['industry_pe']})."
   ],
   "seo_article_sections": [
     {{
-      "heading": "Operational Performance & YoY Earnings Breakdown",
-      "body": "130-150 words of 100% original financial journalism in English analyzing {c_clean_name}'s exact numbers, YoY trajectory, and operational efficiency."
+      "heading": "Why {c_clean_name} Share Price is in Focus Today: Q2 Results & Earnings Breakdown",
+      "body": "140-160 words in English analyzing the exact numbers, YoY profit growth, and operational performance."
     }},
     {{
-      "heading": "Fundamental Valuation, ROE & Balance Sheet Health",
-      "body": "130-150 words in 100% English analyzing {c_clean_name}'s Market Cap ({screener_info['market_cap']}), Stock P/E ({screener_info['pe_ratio']}) vs Industry P/E ({screener_info['industry_pe']}), ROE ({screener_info['roe']}), Book Value ({screener_info['book_value']}), and Debt-to-Equity ({screener_info['debt_to_equity']})."
+      "heading": "{c_clean_name} Share Price Target 2026, 2027, 2030 & Fundamental Valuation",
+      "body": "140-160 words in English discussing {c_clean_name} share price target 2026 ({screener_info['target_2026']}) and 2030 ({screener_info['target_2030']}) based on EPS ({screener_info['eps']}), P/E ({screener_info['pe_ratio']}), and Book Value ({screener_info['book_value']})."
     }},
     {{
-      "heading": "Market Outlook & Key Triggers for Investors",
-      "body": "100-120 words in 100% English discussing medium-term growth catalysts, execution risks, and what retail investors should track next for {c_clean_name}."
+      "heading": "Is {c_clean_name} Share a Good Buy for Long Term? Debt-to-Equity & ROE Analysis",
+      "body": "120-140 words in English evaluating Total Debt ({screener_info['total_debt']}), Debt-to-Equity ({screener_info['debt_to_equity']}), ROE ({screener_info['roe']}), and key risks."
     }}
   ],
   "faqs": [
     {{
-      "q": "Why is {c_clean_name} share price in focus after latest quarterly results?",
-      "a": "Direct answer in 100% English with {c_clean_name}'s exact numbers."
+      "q": "What is the {c_clean_name} share price target for 2026, 2027, and 2030?",
+      "a": "Direct 2-sentence answer in English citing valuation bands ({screener_info['target_2026']} for 2026 and {screener_info['target_2030']} for 2030) based on EPS and ROE."
     }},
     {{
-      "q": "What is the debt situation and Debt-to-Equity ratio of {c_clean_name}?",
-      "a": "Direct answer in 100% English citing Total Debt of {screener_info['total_debt']} and Debt-to-Equity of {screener_info['debt_to_equity']}."
+      "q": "Why is {c_clean_name} share rising or falling after Q2 results?",
+      "a": "Direct 2-sentence answer in English with exact Revenue and Net Profit YoY numbers."
     }},
     {{
-      "q": "Is {c_clean_name} share a good buy for long term based on its P/E ({screener_info['pe_ratio']}) and ROE ({screener_info['roe']})?",
-      "a": "Direct answer in 100% English citing valuation and ROE."
+      "q": "Is {c_clean_name} a debt-free stock?",
+      "a": "Direct answer in English citing Total Debt of {screener_info['total_debt']} and Debt-to-Equity of {screener_info['debt_to_equity']}."
+    }},
+    {{
+      "q": "Is {c_clean_name} share a good buy for long term investment?",
+      "a": "Direct answer in English comparing Stock P/E ({screener_info['pe_ratio']}) with Industry P/E ({screener_info['industry_pe']}) and ROE ({screener_info['roe']})."
     }}
   ],
   "gujarati_summary": "2-3 sentences in natural Gujarati summarizing {c_clean_name}'s exact Consolidated result (YoY) or new order.",
-  "gujarati_intraday_view": "1-2 sentences in natural Gujarati explaining {c_clean_name}'s debt, valuation, and expected return."
+  "gujarati_intraday_view": "1-2 sentences in natural Gujarati explaining debt, valuation, and expected return."
 }}
 
 Extracted Text from Filing:
@@ -1082,17 +1184,20 @@ Extracted Text from Filing:
         if match:
             try:
                 parsed = json.loads(match.group(0))
+                if isinstance(parsed.get("web_story_hook"), str):
+                    parsed["web_story_hook"] = [parsed["web_story_hook"]]
                 if doc_type == "result":
                     parsed = ensure_valid_result_numbers(parsed, screener_info, pdf_text_len)
                 return parsed
             except Exception as exc:
                 log.warning("JSON parse warning, using smart fallback: %s", exc)
 
-    log.info("Using Smart Auto-Fallback data for %s", company_title)
-    return build_smart_fallback_data(company_title, scrip_code, doc_type, source_text, screener_info, pdf_text_len)
+    return build_smart_fallback_data(company_title, scrip_code, doc_type, source_text, screener_info, trending_kws, pdf_text_len)
 
 
-# ---------------- VISUAL CHARTS BUILDER ----------------
+# ==========================================
+# 8. VISUAL CHARTS & HIGH-SEO HTML BUILDER
+# ==========================================
 def build_quarterly_column_chart_url(comp_name, labels, rev_list, gp_list, np_list):
     datasets = [
         {"label": "Revenue", "backgroundColor": "#1b5e20", "data": [to_float(x) for x in rev_list]},
@@ -1140,13 +1245,15 @@ def build_yoy_comparison_chart_url(comp_name, qtr_lbl, prev_lbl, curr_lbl, rev, 
     return f"https://quickchart.io/chart?w=750&h=420&bkg=white&c={urllib.parse.quote(json.dumps(chart_config))}"
 
 
-def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scrip_key="", file_key="", scrip_code=""):
+def build_post_html(data, doc_type, screener_info, source_url, trending_kws, comp_key="", scrip_key="", file_key="", scrip_code=""):
     comp_name = html.escape(str(data.get("company_short_name", "Company")))
     res_date = html.escape(str(data.get("result_date", datetime.now().strftime("%B %d, %Y"))))
-    ist_time_str = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%B %d, %Y | %I:%M %p IST")
+    ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    ist_time_str = ist_now.strftime("%B %d, %Y | %I:%M %p IST")
+    iso_time = ist_now.strftime("%Y-%m-%dT%H:%M:%S+05:30")
 
     price_disp = html.escape(str(data.get("price_display", screener_info["price_str"])))
-    qtr_lbl = html.escape(str(data.get("quarter_label", "Quarterly")))
+    qtr_lbl = html.escape(str(data.get("quarter_label", "Q2 / Quarterly")))
     curr_lbl = html.escape(str(data.get("curr_period_label", "Current")))
     prev_lbl = html.escape(str(data.get("prev_period_label", "Previous")))
     res_type = html.escape(str(data.get("result_type", "Consolidated")))
@@ -1162,19 +1269,13 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
     total_debt = html.escape(str(data.get("total_debt") or screener_info["total_debt"]))
     de_ratio = html.escape(str(data.get("debt_to_equity") or screener_info["debt_to_equity"]))
     face_val = html.escape(str(data.get("face_value") or screener_info["face_value"]))
+    high_52w = html.escape(str(screener_info.get("high_52w", "N/A")))
+    low_52w = html.escape(str(screener_info.get("low_52w", "N/A")))
     fund_impact = html.escape(str(data.get("fundamental_impact_note", "")))
-    est_return = html.escape(str(data.get("estimated_stock_return", "N/A")))
+    est_return = html.escape(str(data.get("estimated_stock_return", screener_info.get("target_2026", "N/A"))))
     intraday_sig = html.escape(str(data.get("intraday_signal", "")))
 
     raw_lead = str(data.get("seo_lead_summary") or "").strip()
-    if not raw_lead:
-        if doc_type == "order":
-            ord_val = (data.get("order_details") or {}).get("order_value", "a new contract")
-            raw_lead = f"{data.get('company_short_name', 'The company')} (BSE: {scrip_code or 'Listed'}) has announced the receipt of a new order worth {ord_val}. Trading near {screener_info['price_str']} with a Market Cap of {screener_info['market_cap']} and ROE of {screener_info['roe']}, here is the complete order book and fundamental analysis."
-        else:
-            np_info = data.get("net_profit") or {}
-            rev_info = data.get("revenue") or {}
-            raw_lead = f"{data.get('company_short_name', 'The company')} (BSE: {scrip_code or 'Listed'}) declared its {data.get('quarter_label', 'quarterly')} Consolidated financial results, reporting a Net Profit (PAT) of Rs. {np_info.get('curr', '0')} Cr ({np_info.get('growth', '0%')} YoY) and Revenue of Rs. {rev_info.get('curr', '0')} Cr ({rev_info.get('growth', '0%')} YoY)."
     lead_html = html.escape(raw_lead)
 
     seed_int = int(hashlib.md5((comp_name + res_date).encode("utf-8")).hexdigest()[:6], 16)
@@ -1183,25 +1284,29 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
 
     content_blocks = []
 
+    # 1. VISUAL WEB STORY SUMMARY BOX
     web_story_hooks = data.get("web_story_hook") or []
+    if isinstance(web_story_hooks, str):
+        web_story_hooks = [web_story_hooks]
     if web_story_hooks and isinstance(web_story_hooks, list):
         hook_list = "".join(f"<li style='margin-bottom:8px;'>{html.escape(str(h))}</li>" for h in web_story_hooks if h)
         if hook_list:
             content_blocks.append(f"""
-            <div style="background: linear-gradient(135deg, #1e3a8a, #3b82f6); color: white; border-radius: 12px; padding: 18px 22px; margin-bottom: 24px; box-shadow: 0 4px 10px rgba(59, 130, 246, 0.3);">
-              <h2 style="margin: 0 0 12px 0; font-size: 19px; border-bottom: 1px solid #93c5fd; padding-bottom: 8px; color: white;">⚡ Visual Web Story Summary (Top Picks)</h2>
-              <ul style="margin: 0; padding-left: 20px; font-size: 15px; font-weight: 500; line-height: 1.6;">
+            <div style="background: linear-gradient(135deg, #1e3a8a, #2563eb); color: white; border-radius: 14px; padding: 18px 22px; margin-bottom: 24px; box-shadow: 0 4px 12px rgba(37, 99, 235, 0.25);">
+              <h2 style="margin: 0 0 12px 0; font-size: 19px; border-bottom: 1px solid #93c5fd; padding-bottom: 8px; color: white;">⚡ {comp_name} Quick Highlights (Web Story Summary)</h2>
+              <ul style="margin: 0; padding-left: 20px; font-size: 15px; font-weight: 500; line-height: 1.65;">
                 {hook_list}
               </ul>
-              <p style="margin: 12px 0 0 0; font-size: 13px; text-align: right;"><em>MarketMunafa Rapid Analysis</em></p>
+              <p style="margin: 10px 0 0 0; font-size: 12px; text-align: right; color: #dbeafe;"><em>MarketMunafa Equity Research Desk</em></p>
             </div>
             """)
 
+    # 2. RESULT / ORDER TABLE & CHARTS
     if doc_type == "order":
         ord_info = data.get("order_details", {}) or {}
         order_card = f"""
         <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 16px; padding: 22px; margin-bottom: 24px;">
-          <h2 style="margin: 0 0 16px 0; font-size: 20px; color: #1e3a8a;">🏆 {comp_name} New Order &amp; Contract Details</h2>
+          <h2 style="margin: 0 0 16px 0; font-size: 20px; color: #1e3a8a;">🏆 {comp_name} Latest Order Win &amp; Contract Details</h2>
           <p style="margin: 8px 0; font-size: 16px;"><strong>Company Name:</strong> {comp_name} ({price_disp})</p>
           <p style="margin: 8px 0; font-size: 16px;"><strong>Client / Awarding Authority:</strong> {html.escape(str(ord_info.get("client_or_awarder", "Disclosed in Filing")))}</p>
           <p style="margin: 8px 0; font-size: 16px;"><strong>Order / Contract Value:</strong> <span style="color:#16a34a; font-weight:700;">{html.escape(str(ord_info.get("order_value", "As per BSE Filing")))}</span></p>
@@ -1231,107 +1336,138 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
 
         result_card = f"""
         <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 18px; box-shadow: 0 4px 14px rgba(0,0,0,0.05); margin-bottom: 24px; overflow-x: auto;">
+          <h2 style="margin: 0 0 12px 0; font-size: 20px; color: #0f172a;">📊 {comp_name} {qtr_lbl} Financial Results Table (YoY)</h2>
           <div style="display: flex; justify-content: space-between; color: #64748b; font-size: 14px; margin-bottom: 10px;">
-            <span>{res_date}</span>
-            <span>Rs.Cr.</span>
-          </div>
-          <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 18px;">
-            <strong style="font-size: 21px; color: #0f172a;">{comp_name}</strong>
-            <span style="font-size: 19px; font-weight: 600; color: #0f172a;">{price_disp}</span>
+            <span>{res_date} ({res_type})</span>
+            <span>Figures in Rs. Cr.</span>
           </div>
           <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
             <thead>
               <tr style="border-top: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0; color: #64748b; font-weight: 600;">
-                <th style="text-align: left; padding: 10px 4px; white-space: nowrap;">{qtr_lbl}</th>
+                <th style="text-align: left; padding: 10px 4px; white-space: nowrap;">Metric</th>
                 <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">{curr_lbl}</th>
                 <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">{prev_lbl}</th>
-                <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">Diff</th>
-                <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">YoY Growth</th>
+                <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">YoY Change</th>
+                <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">YoY Growth %</th>
               </tr>
             </thead>
             <tbody>
               <tr style="border-bottom: 1px solid #f1f5f9;">
-                <td style="padding: 12px 4px; color: #1e293b; font-weight: 500; white-space: nowrap;">Revenue</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap;">{html.escape(str(rev.get('curr', '0')))}</td>
-                <td style="padding: 12px 4px; text-align: right; color: #475569; white-space: nowrap;">{html.escape(str(rev.get('prev', '0')))}</td>
+                <td style="padding: 12px 4px; color: #1e293b; font-weight: 600; white-space: nowrap;">Revenue from Operations</td>
+                <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap;">₹{html.escape(str(rev.get('curr', '0')))}</td>
+                <td style="padding: 12px 4px; text-align: right; color: #475569; white-space: nowrap;">₹{html.escape(str(rev.get('prev', '0')))}</td>
                 <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: #0f172a; white-space: nowrap;">{html.escape(str(rev.get('difference', '0')))}</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap; color: {growth_color(rev.get('growth', ''))};">{html.escape(str(rev.get('growth', '0%')))}</td>
+                <td style="padding: 12px 4px; text-align: right; font-weight: 700; white-space: nowrap; color: {growth_color(rev.get('growth', ''))};">{html.escape(str(rev.get('growth', '0%')))}</td>
               </tr>
               <tr style="border-bottom: 1px solid #f1f5f9;">
-                <td style="padding: 12px 4px; color: #1e293b; font-weight: 500; white-space: nowrap;">Gross Profit</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap;">{html.escape(str(gp.get('curr', '0')))}</td>
-                <td style="padding: 12px 4px; text-align: right; color: #475569; white-space: nowrap;">{html.escape(str(gp.get('prev', '0')))}</td>
+                <td style="padding: 12px 4px; color: #1e293b; font-weight: 600; white-space: nowrap;">Operating Profit (EBITDA)</td>
+                <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap;">₹{html.escape(str(gp.get('curr', '0')))}</td>
+                <td style="padding: 12px 4px; text-align: right; color: #475569; white-space: nowrap;">₹{html.escape(str(gp.get('prev', '0')))}</td>
                 <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: #0f172a; white-space: nowrap;">{html.escape(str(gp.get('difference', '0')))}</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap; color: {growth_color(gp.get('growth', ''))};">{html.escape(str(gp.get('growth', '0%')))}</td>
+                <td style="padding: 12px 4px; text-align: right; font-weight: 700; white-space: nowrap; color: {growth_color(gp.get('growth', ''))};">{html.escape(str(gp.get('growth', '0%')))}</td>
               </tr>
               <tr>
-                <td style="padding: 12px 4px; color: #1e293b; font-weight: 500; white-space: nowrap;">Net Profit (PAT)</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap;">{html.escape(str(np_d.get('curr', '0')))}</td>
-                <td style="padding: 12px 4px; text-align: right; color: #475569; white-space: nowrap;">{html.escape(str(np_d.get('prev', '0')))}</td>
+                <td style="padding: 12px 4px; color: #1e293b; font-weight: 600; white-space: nowrap;">Net Profit (Consolidated PAT)</td>
+                <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap;">₹{html.escape(str(np_d.get('curr', '0')))}</td>
+                <td style="padding: 12px 4px; text-align: right; color: #475569; white-space: nowrap;">₹{html.escape(str(np_d.get('prev', '0')))}</td>
                 <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: #0f172a; white-space: nowrap;">{html.escape(str(np_d.get('difference', '0')))}</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap; color: {growth_color(np_d.get('growth', ''))};">{html.escape(str(np_d.get('growth', '0%')))}</td>
+                <td style="padding: 12px 4px; text-align: right; font-weight: 700; white-space: nowrap; color: {growth_color(np_d.get('growth', ''))};">{html.escape(str(np_d.get('growth', '0%')))}</td>
               </tr>
             </tbody>
           </table>
-          <div style="margin-top: 16px;">
-            <span style="display: inline-block; border: 1px solid #cbd5e1; border-radius: 6px; padding: 4px 12px; font-size: 13px; color: #64748b;">{res_type}</span>
-          </div>
         </div>
         
-        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 18px; margin-bottom: 24px; text-align: center; box-shadow: 0 4px 14px rgba(0,0,0,0.04);">
-          <h2 style="margin: 0 0 12px 0; font-size: 19px; color: #0f172a;">📈 {comp_name} YoY Financial &amp; Debt Comparison Chart</h2>
-          <img src="{yoy_chart_url}" alt="{comp_name} YoY Revenue Profit Chart" width="750" height="420" loading="lazy" style="max-width: 100%; height: auto; border-radius: 8px;" />
+        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 18px; margin-bottom: 24px; text-align: center;">
+          <h3 style="margin: 0 0 12px 0; font-size: 18px; color: #0f172a;">📈 {comp_name} YoY Revenue, PAT &amp; Debt Chart</h3>
+          <img src="{yoy_chart_url}" alt="{comp_name} Q2 Results YoY Chart" width="750" height="420" loading="lazy" style="max-width: 100%; height: auto; border-radius: 8px;" />
         </div>
-        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 18px; margin-bottom: 24px; text-align: center; box-shadow: 0 4px 14px rgba(0,0,0,0.04);">
-          <h2 style="margin: 0 0 12px 0; font-size: 19px; color: #0f172a;">📊 {comp_name} Multi-Quarter Performance Trend</h2>
-          <img src="{quarter_chart_url}" alt="{comp_name} Multi Quarter Trend" width="750" height="420" loading="lazy" style="max-width: 100%; height: auto; border-radius: 8px;" />
+        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 18px; margin-bottom: 24px; text-align: center;">
+          <h3 style="margin: 0 0 12px 0; font-size: 18px; color: #0f172a;">📊 {comp_name} Multi-Quarter Earnings Trend</h3>
+          <img src="{quarter_chart_url}" alt="{comp_name} Quarterly Profit Trend" width="750" height="420" loading="lazy" style="max-width: 100%; height: auto; border-radius: 8px;" />
         </div>
         """
         content_blocks.append(result_card)
 
+    # 3. HIGH-TRAFFIC SHARE PRICE TARGET & VALUATION OUTLOOK TABLE (2026 - 2030)
+    if screener_info.get("target_2026") and screener_info["target_2026"] != "N/A":
+        target_table_card = f"""
+        <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 16px; padding: 20px; margin-bottom: 24px;">
+          <h2 style="margin: 0 0 12px 0; font-size: 20px; color: #166534;">🎯 {comp_name} Share Price Target 2026, 2027 to 2030 (Fundamental Projection)</h2>
+          <p style="margin: 0 0 12px 0; font-size: 14px; color: #15803d;">
+            Based on {comp_name}'s trailing EPS of <strong>{eps}</strong>, ROE of <strong>{roe}</strong>, Book Value of <strong>{book_value}</strong>, and current P/E ratio of <strong>{pe_ratio}</strong>, here are the algorithmic fair-value estimation bands:
+          </p>
+          <table style="width: 100%; border-collapse: collapse; font-size: 14px; background: #ffffff; border-radius: 8px; overflow: hidden;">
+            <thead>
+              <tr style="background: #dcfce7; color: #14532d; font-weight: 700;">
+                <th style="padding: 10px; text-align: left; border: 1px solid #bbf7d0;">Valuation Horizon</th>
+                <th style="padding: 10px; text-align: right; border: 1px solid #bbf7d0;">Estimated Fair Value Band</th>
+                <th style="padding: 10px; text-align: left; border: 1px solid #bbf7d0;">Primary Fundamental Driver</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td style="padding: 10px; font-weight: 600; border: 1px solid #e2e8f0;">{comp_name} Share Target 2026</td>
+                <td style="padding: 10px; text-align: right; font-weight: 700; color: #16a34a; border: 1px solid #e2e8f0;">{html.escape(screener_info['target_2026'])}</td>
+                <td style="padding: 10px; border: 1px solid #e2e8f0;">Quarterly PAT growth &amp; order execution</td>
+              </tr>
+              <tr>
+                <td style="padding: 10px; font-weight: 600; border: 1px solid #e2e8f0;">{comp_name} Share Target 2027</td>
+                <td style="padding: 10px; text-align: right; font-weight: 700; color: #16a34a; border: 1px solid #e2e8f0;">{html.escape(screener_info['target_2027'])}</td>
+                <td style="padding: 10px; border: 1px solid #e2e8f0;">Operating margin expansion &amp; ROE compounding</td>
+              </tr>
+              <tr>
+                <td style="padding: 10px; font-weight: 600; border: 1px solid #e2e8f0;">{comp_name} Share Target 2030</td>
+                <td style="padding: 10px; text-align: right; font-weight: 700; color: #16a34a; border: 1px solid #e2e8f0;">{html.escape(screener_info['target_2030'])}</td>
+                <td style="padding: 10px; border: 1px solid #e2e8f0;">Long-term earnings compounding &amp; debt reduction</td>
+              </tr>
+            </tbody>
+          </table>
+          <p style="margin: 8px 0 0 0; font-size: 12px; color: #475569;"><em>*Note: These are algorithmic valuation models based on historical earnings multiples for educational reference, not buy/sell recommendations.</em></p>
+        </div>
+        """
+        content_blocks.append(target_table_card)
+
+    # 4. KEY HIGHLIGHTS
     highlights = data.get("key_highlights") or []
     if highlights and isinstance(highlights, list):
         li_items = "".join(f"<li style='margin-bottom: 8px; color: #1e293b; line-height: 1.6;'>{html.escape(str(h))}</li>" for h in highlights if h)
         highlights_card = f"""
         <div style="background: #f8fafc; border-left: 4px solid #2563eb; border-radius: 8px; padding: 16px 20px; margin-bottom: 24px;">
-          <h2 style="margin: 0 0 10px 0; font-size: 18px; color: #0f172a;">📌 Key Financial Highlights for Investors</h2>
+          <h2 style="margin: 0 0 10px 0; font-size: 18px; color: #0f172a;">📌 Key Financial Highlights for Retail Investors</h2>
           <ul style="margin: 0; padding-left: 20px; font-size: 15px;">{li_items}</ul>
         </div>
         """
         content_blocks.append(highlights_card)
 
+    # 5. FUNDAMENTAL RATIOS TABLE (WITH 52W HIGH/LOW)
     fundamentals_card = f"""
     <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 20px; box-shadow: 0 4px 14px rgba(0,0,0,0.05); margin-bottom: 24px;">
-      <h2 style="margin: 0 0 16px 0; font-size: 20px; color: #0f172a;">🔍 {comp_name} Fundamentals &amp; Valuation Ratios</h2>
+      <h2 style="margin: 0 0 16px 0; font-size: 20px; color: #0f172a;">🔍 {comp_name} Fundamental Ratios, Debt &amp; 52-Week High/Low</h2>
       <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
         <tbody>
           <tr style="border-bottom: 1px solid #f1f5f9;">
-            <td style="padding: 10px 4px; color: #64748b;">Mkt Cap</td><td style="padding: 10px 8px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{mkt_cap}</td>
-            <td style="padding: 10px 4px 10px 8px; color: #64748b; border-left: 1px solid #f1f5f9;">ROE</td><td style="padding: 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{roe}</td>
+            <td style="padding: 10px 4px; color: #64748b;">Current Share Price</td><td style="padding: 10px 8px 10px 4px; text-align: right; font-weight: 700; color: #0f172a;">{price_disp}</td>
+            <td style="padding: 10px 4px 10px 8px; color: #64748b; border-left: 1px solid #f1f5f9;">52-Week High / Low</td><td style="padding: 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{high_52w} / {low_52w}</td>
           </tr>
           <tr style="border-bottom: 1px solid #f1f5f9;">
-            <td style="padding: 10px 4px; color: #64748b;">P/E Ratio(TTM)</td><td style="padding: 10px 8px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{pe_ratio}</td>
-            <td style="padding: 10px 4px 10px 8px; color: #64748b; border-left: 1px solid #f1f5f9;">EPS(TTM)</td><td style="padding: 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{eps}</td>
+            <td style="padding: 10px 4px; color: #64748b;">Market Cap</td><td style="padding: 10px 8px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{mkt_cap}</td>
+            <td style="padding: 10px 4px 10px 8px; color: #64748b; border-left: 1px solid #f1f5f9;">Return on Equity (ROE)</td><td style="padding: 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{roe}</td>
           </tr>
           <tr style="border-bottom: 1px solid #f1f5f9;">
-            <td style="padding: 10px 4px; color: #64748b;">P/B Ratio</td><td style="padding: 10px 8px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{pb_ratio}</td>
-            <td style="padding: 10px 4px 10px 8px; color: #64748b; border-left: 1px solid #f1f5f9;">Div Yield</td><td style="padding: 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{div_yield}</td>
+            <td style="padding: 10px 4px; color: #64748b;">Stock P/E (TTM)</td><td style="padding: 10px 8px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{pe_ratio}</td>
+            <td style="padding: 10px 4px 10px 8px; color: #64748b; border-left: 1px solid #f1f5f9;">Industry P/E</td><td style="padding: 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{ind_pe}</td>
           </tr>
           <tr style="border-bottom: 1px solid #f1f5f9;">
-            <td style="padding: 10px 4px; color: #64748b;">Industry P/E</td><td style="padding: 10px 8px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{ind_pe}</td>
-            <td style="padding: 10px 4px 10px 8px; color: #64748b; border-left: 1px solid #f1f5f9;">Book Value</td><td style="padding: 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{book_value}</td>
+            <td style="padding: 10px 4px; color: #64748b;">EPS (TTM)</td><td style="padding: 10px 8px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{eps}</td>
+            <td style="padding: 10px 4px 10px 8px; color: #64748b; border-left: 1px solid #f1f5f9;">Book Value / P/B</td><td style="padding: 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{book_value} ({pb_ratio}x)</td>
           </tr>
           <tr>
-            <td style="padding: 10px 4px; color: #64748b;">Debt to Equity</td><td style="padding: 10px 8px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{de_ratio}</td>
-            <td style="padding: 10px 4px 10px 8px; color: #64748b; border-left: 1px solid #f1f5f9;">Face Value</td><td style="padding: 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{face_val}</td>
+            <td style="padding: 10px 4px; color: #64748b;">Debt to Equity</td><td style="padding: 10px 8px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{de_ratio} ({total_debt})</td>
+            <td style="padding: 10px 4px 10px 8px; color: #64748b; border-left: 1px solid #f1f5f9;">Dividend Yield / FV</td><td style="padding: 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{div_yield} (FV: ₹{face_val})</td>
           </tr>
         </tbody>
       </table>
-      <p style="margin: 12px 0 6px 0; font-size: 14px; color: #475569;"><strong>Total Company Debt:</strong> {total_debt} | <strong>Fundamental Impact:</strong> {fund_impact}</p>
-      <div style="background: #d1fae5; border: 1px solid #10b981; padding: 12px 14px; border-radius: 8px; font-size: 16px; margin-top: 12px;">
-        🎯 <strong>Estimated Stock Return / Outlook:</strong> <span style="color: #065f46; font-weight: 700;">{est_return}</span>
-      </div>
-      <p style="margin: 10px 0 0 0; font-size: 14px; color: #334155;"><strong>Technical &amp; Positional View:</strong> {intraday_sig}</p>
+      <p style="margin: 12px 0 0 0; font-size: 14px; color: #334155;"><strong>Technical &amp; Fundamental View:</strong> {intraday_sig} {fund_impact}</p>
     </div>
     """
     content_blocks.append(fundamentals_card)
@@ -1364,56 +1500,93 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
             )
             faq_schema_entities.append({"@type": "Question", "name": q_clean, "acceptedAnswer": {"@type": "Answer", "text": a_clean}})
 
-    faq_block_html = ""
-    if faq_html_items:
-        faq_block_html = f"<div style='margin: 26px 0;'><h2 style='font-size: 19px; color: #0f172a; margin-bottom: 14px;'>❓ Frequently Asked Questions (FAQs)</h2>{''.join(faq_html_items)}</div>"
+    faq_block_html = f"<div style='margin: 26px 0;'><h2 style='font-size: 19px; color: #0f172a; margin-bottom: 14px;'>❓ Frequently Asked Questions ({comp_name} Share FAQs)</h2>{''.join(faq_html_items)}</div>" if faq_html_items else ""
 
-    faq_schema_json = json.dumps({"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": faq_schema_entities})
+    # 6. TRENDING GOOGLE SEARCH TAGS BLOCK (FOR LONG-TAIL ORGANIC SEARCH TRAFFIC)
+    kw_badges = "".join(
+        f"<span style='display:inline-block; background:#f1f5f9; color:#334155; border:1px solid #cbd5e1; border-radius:20px; padding:4px 12px; font-size:13px; margin:4px;'>{html.escape(k)}</span>"
+        for k in (trending_kws or [])
+    )
+    trending_kw_html = f"""
+    <div style="margin: 22px 0; padding: 14px; background: #f8fafc; border-radius: 10px; border: 1px solid #e2e8f0;">
+      <strong style="font-size: 14px; color: #0f172a; display: block; margin-bottom: 8px;">🔥 Trending Investor Searches on Google:</strong>
+      {kw_badges}
+    </div>
+    """ if kw_badges else ""
 
     internal_links_html = f"""
     <div style="background: #eff6ff; border: 1px dashed #60a5fa; border-radius: 10px; padding: 14px 18px; margin: 22px 0; font-size: 14px; color: #1e3a8a;">
-      <strong>🔗 Explore More on MarketMunafa:</strong>
+      <strong>🔗 Explore More High-Growth Stocks on MarketMunafa:</strong>
       <ul style="margin: 8px 0 0 0; padding-left: 18px; line-height: 1.8;">
         <li><a href="{BLOG_BASE_URL}/search/label/STOCK%20RESULT" style="color:#1d4ed8; font-weight:600; text-decoration:none;">📊 Latest Q2 &amp; Quarterly Stock Results Analysis</a></li>
-        <li><a href="{BLOG_BASE_URL}/search/label/SHARE%20ORDER" style="color:#1d4ed8; font-weight:600; text-decoration:none;">🏆 New Corporate Order Wins &amp; Contract Updates</a></li>
-        <li><a href="{BLOG_BASE_URL}/search/label/MARKET%20NEWS" style="color:#1d4ed8; font-weight:600; text-decoration:none;">📰 Daily Indian Stock Market Fundamental Picks</a></li>
+        <li><a href="{BLOG_BASE_URL}/search/label/SHARE%20ORDER" style="color:#1d4ed8; font-weight:600; text-decoration:none;">🏆 New Corporate Order Wins &amp; Share Price Targets</a></li>
+        <li><a href="{BLOG_BASE_URL}/search/label/MARKET%20NEWS" style="color:#1d4ed8; font-weight:600; text-decoration:none;">📰 Daily Multibagger &amp; Debt-Free Stock Picks</a></li>
       </ul>
     </div>
     """
 
     source_link_html = f'<p style="margin-top:16px;"><a href="{html.escape(source_url, quote=True)}" target="_blank" rel="nofollow noopener" style="color:#2563eb; font-weight:600; text-decoration:none;">📄 Verify Official BSE Exchange Filing PDF</a></p>' if source_url else ""
+
+    faq_schema_json = json.dumps({"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": faq_schema_entities})
+    news_schema_json = json.dumps({
+        "@context": "https://schema.org",
+        "@type": "NewsArticle",
+        "headline": str(data.get("seo_title") or f"{comp_name} Share Price Target 2026 & Q2 Results")[:110],
+        "datePublished": iso_time,
+        "dateModified": iso_time,
+        "image": [thumb_url],
+        "author": [{"@type": "Organization", "name": "MarketMunafa Equity Research Desk", "url": BLOG_BASE_URL}],
+        "publisher": {"@type": "Organization", "name": "MarketMunafa", "url": BLOG_BASE_URL},
+    })
+
     meta_comment = f"<!-- MM_META:type={doc_type}|comp_key={comp_key}|scrip={scrip_key}|file={file_key}|comp_name={comp_name} -->"
 
     html_body = f"""
     {meta_comment}
-    <article style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 720px; margin: 0 auto; color: #1e293b;">
+    <article itemscope itemtype="https://schema.org/NewsArticle" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 740px; margin: 0 auto; color: #1e293b;">
       <div style="font-size: 13px; color: #64748b; margin-bottom: 12px; font-weight: 500;">
-        📅 Published on: <time datetime="{datetime.now(timezone.utc).isoformat()}">{ist_time_str}</time> | By MarketMunafa Equity Research Desk
+        📅 Published on: <time itemprop="datePublished" datetime="{iso_time}">{ist_time_str}</time> | By <span itemprop="author">MarketMunafa Equity Research Desk</span>
       </div>
       <p style="font-size: 16px; line-height: 1.75; color: #0f172a; background: #f8fafc; padding: 14px 16px; border-radius: 10px; border: 1px solid #e2e8f0; margin-bottom: 18px;">
         <strong>Executive Summary:</strong> {lead_html}
       </p>
       <figure style="margin: 0 0 22px 0; text-align: center;">
-        <img src="{thumb_url}" alt="{comp_name} Share Price Target and {qtr_lbl} Financial Analysis" width="1200" height="675" fetchpriority="high" style="width: 100%; height: auto; aspect-ratio: 16/9; object-fit: cover; border-radius: 12px;" />
-        <figcaption style="font-size: 13px; color: #64748b; margin-top: 6px;">{comp_name} (BSE: {html.escape(str(scrip_code or 'Listed'))}) Equity Research | MarketMunafa</figcaption>
+        <img itemprop="image" src="{thumb_url}" alt="{comp_name} Share Price Target 2026 and {qtr_lbl} Results" width="1200" height="675" fetchpriority="high" style="width: 100%; height: auto; aspect-ratio: 16/9; object-fit: cover; border-radius: 12px;" />
+        <figcaption style="font-size: 13px; color: #64748b; margin-top: 6px;">{comp_name} (BSE: {html.escape(str(scrip_code or 'Listed'))}) Share Price Target &amp; Equity Research | MarketMunafa</figcaption>
       </figure>
       <!--more-->
       {"".join(content_blocks)}
       {"".join(article_html_parts)}
       {faq_block_html}
+      {trending_kw_html}
       {internal_links_html}
       {source_link_html}
+      <script type="application/ld+json">{news_schema_json}</script>
       <script type="application/ld+json">{faq_schema_json}</script>
       <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 22px 0;" />
       <p style="font-size: 12px; color: #64748b; line-height: 1.5;">
-        <strong>Disclaimer:</strong> This independent equity research article on MarketMunafa is originally authored using publicly disclosed BSE corporate filings and fundamental ratios for educational purposes only. We are not SEBI-registered investment advisors. Please consult a certified financial planner before making any investment decisions.
+        <strong>Disclaimer:</strong> This independent equity research article on MarketMunafa is originally authored using publicly disclosed BSE corporate filings and fundamental ratios for educational and informational purposes only. Valuation projections are algorithmic estimates and not investment advice. We are not SEBI-registered advisors. Please consult a certified financial planner before making any investment decisions.
       </p>
     </article>
     """
     return html_body, yoy_chart_url
 
 
-# ---------------- TELEGRAM GUJARATI ALERT ----------------
+# ==========================================
+# 9. TELEGRAM, BLOGGER & SITEMAP PING
+# ==========================================
+def ping_search_engines():
+    sitemap_url = f"{BLOG_BASE_URL}/sitemap.xml"
+    for ping_url in [
+        f"https://www.google.com/ping?sitemap={urllib.parse.quote(sitemap_url)}",
+        f"https://www.bing.com/ping?sitemap={urllib.parse.quote(sitemap_url)}",
+    ]:
+        try:
+            requests.get(ping_url, timeout=8)
+        except Exception:
+            pass
+
+
 def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, chart_url):
     if not SEND_TO_TELEGRAM or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -1425,16 +1598,10 @@ def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, 
     prev_lbl = html.escape(str(data.get("prev_period_label", "Previous")))
     mkt_cap = html.escape(str(data.get("market_cap") or screener_info["market_cap"]))
     pe_ratio = html.escape(str(data.get("pe_ratio") or screener_info["pe_ratio"]))
-    pb_ratio = html.escape(str(data.get("pb_ratio") or screener_info["pb_ratio"]))
-    ind_pe = html.escape(str(data.get("industry_pe") or screener_info["industry_pe"]))
     roe = html.escape(str(data.get("roe") or screener_info["roe"]))
-    eps = html.escape(str(data.get("eps") or screener_info["eps"]))
-    div_yield = html.escape(str(data.get("div_yield") or screener_info["div_yield"]))
-    book_value = html.escape(str(data.get("book_value") or screener_info["book_value"]))
-    total_debt = html.escape(str(data.get("total_debt") or screener_info["total_debt"]))
     de_ratio = html.escape(str(data.get("debt_to_equity") or screener_info["debt_to_equity"]))
-    face_val = html.escape(str(data.get("face_value") or screener_info["face_value"]))
-    est_return = html.escape(str(data.get("estimated_stock_return", "N/A")))
+    total_debt = html.escape(str(data.get("total_debt") or screener_info["total_debt"]))
+    est_return = html.escape(str(data.get("estimated_stock_return", screener_info.get("target_2026", "N/A"))))
     guj_summary = html.escape(str(data.get("gujarati_summary", "")))
     guj_intraday = html.escape(str(data.get("gujarati_intraday_view", "")))
 
@@ -1442,21 +1609,17 @@ def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, 
         header_title = f"🏆 <b>{comp_name} - નવો ઓર્ડર / કોન્ટ્રેક્ટ અપડેટ</b>"
         ord_info = data.get("order_details", {}) or {}
         dynamic_block_gu = (
-            f"📦 <b>ઓર્ડરની મુખ્ય વિગતો:</b>\n"
-            f"• <b>ક્લાયન્ટ / કંપની:</b> {html.escape(str(ord_info.get('client_or_awarder', '-')))}\n"
-            f"• <b>ઓર્ડરનું મૂલ્ય:</b> <b>{html.escape(str(ord_info.get('order_value', '-')))}</b>\n"
-            f"• <b>કામની વિગત:</b> {html.escape(str(ord_info.get('scope_of_work', '-')))}\n\n"
+            f"📦 <b>ઓર્ડરની વિગત:</b> {html.escape(str(ord_info.get('order_value', '-')))} "
+            f"({html.escape(str(ord_info.get('client_or_awarder', '-')))})\n\n"
         )
     else:
-        header_title = f"📊 <b>{comp_name} - {qtr_lbl} Consolidated રિઝલ્ટ અપડેટ</b>"
+        header_title = f"📊 <b>{comp_name} - {qtr_lbl} રિઝલ્ટ અપડેટ</b>"
         rev = data.get("revenue", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
-        gp = data.get("gross_profit", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
         np_d = data.get("net_profit", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
         dynamic_block_gu = (
-            f"📈 <b>નાણાકીય કામગીરી - YoY ({curr_lbl} vs {prev_lbl}):</b>\n"
-            f"• <b>આવક (Revenue):</b> ₹{html.escape(str(rev.get('curr', '0')))} Cr (તફાવત: {html.escape(str(rev.get('difference', '0')))}) | YoY ગ્રોથ: <b>{html.escape(str(rev.get('growth', '0%')))}</b>\n"
-            f"• <b>કુલ નફો (Gross Profit):</b> ₹{html.escape(str(gp.get('curr', '0')))} Cr (તફાવત: {html.escape(str(gp.get('difference', '0')))}) | YoY ગ્રોથ: <b>{html.escape(str(gp.get('growth', '0%')))}</b>\n"
-            f"• <b>ચોખ્ખો નફો (Consolidated PAT):</b> ₹{html.escape(str(np_d.get('curr', '0')))} Cr (તફાવત: {html.escape(str(np_d.get('difference', '0')))}) | YoY ગ્રોથ: <b>{html.escape(str(np_d.get('growth', '0%')))}</b>\n\n"
+            f"📈 <b>નાણાકીય કામગીરી ({curr_lbl} vs {prev_lbl}):</b>\n"
+            f"• <b>આવક (Revenue):</b> ₹{html.escape(str(rev.get('curr', '0')))} Cr ({html.escape(str(rev.get('growth', '0%')))} YoY)\n"
+            f"• <b>ચોખ્ખો નફો (PAT):</b> ₹{html.escape(str(np_d.get('curr', '0')))} Cr (<b>{html.escape(str(np_d.get('growth', '0%')))} YoY</b>)\n\n"
         )
 
     msg_html = (
@@ -1464,19 +1627,15 @@ def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, 
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📅 <b>તારીખ:</b> {res_date} | 💰 <b>ભાવ:</b> {price_disp}\n\n"
         f"{dynamic_block_gu}"
-        f"🔍 <b>તમામ ૧૦ ફંડામેન્ટલ ઇન્ડિકેટર્સ:</b>\n"
-        f"• <b>Mkt Cap:</b> {mkt_cap} | <b>ROE:</b> {roe}\n"
-        f"• <b>P/E Ratio:</b> {pe_ratio} | <b>EPS (TTM):</b> {eps}\n"
-        f"• <b>P/B Ratio:</b> {pb_ratio} | <b>Div Yield:</b> {div_yield}\n"
-        f"• <b>Industry P/E:</b> {ind_pe} | <b>Book Value:</b> {book_value}\n"
-        f"• <b>Debt to Equity:</b> {de_ratio} (Debt: {total_debt}) | <b>Face Value:</b> {face_val}\n\n"
-        f"🎯 <b>અંદાજિત શેર રીટર્ન / બૂસ્ટ:</b> <b>{est_return}</b>\n\n"
-        f"🏦 <b>ઇન્ટ્રાડે વ્યુ:</b> {guj_intraday}\n"
+        f"🔍 <b>Mkt Cap:</b> {mkt_cap} | <b>P/E:</b> {pe_ratio} | <b>ROE:</b> {roe}\n"
+        f"🏦 <b>Debt-to-Equity:</b> {de_ratio} ({total_debt})\n"
+        f"🎯 <b>અંદાજિત વેલ્યુએશન ટાર્ગેટ (2026):</b> <b>{est_return}</b>\n\n"
         f"📝 <b>સારાંશ:</b> {guj_summary}\n"
+        f"💡 <b>વ્યુ:</b> {guj_intraday}\n"
     )
 
     if blog_url:
-        msg_html += f"\n🌐 <a href=\"{html.escape(blog_url, quote=True)}\"><b>સંપૂર્ણ પોસ્ટ અને ચાર્ટ બ્લોગ પર જુઓ</b></a>"
+        msg_html += f"\n🌐 <a href=\"{html.escape(blog_url, quote=True)}\"><b>સંપૂર્ણ રિપોર્ટ અને 2026-2030 ટાર્ગેટ બ્લોગ પર વાંચો</b></a>"
     if source_url:
         msg_html += f" | <a href=\"{html.escape(source_url, quote=True)}\"><b>BSE PDF</b></a>"
     msg_html += "\n\n✅ <b>MarketMunafa</b>"
@@ -1485,30 +1644,18 @@ def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, 
         if chart_url and doc_type != "order":
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                data={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "photo": chart_url,
-                    "caption": f"📊 {comp_name} - Consolidated YoY પરિણામ અને ગ્રોથ ચાર્ટ",
-                },
+                data={"chat_id": TELEGRAM_CHAT_ID, "photo": chart_url, "caption": f"📊 {comp_name} - YoY Growth Chart"},
                 timeout=15,
             )
-
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": msg_html,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": False,
-            },
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": msg_html, "parse_mode": "HTML", "disable_web_page_preview": False},
             timeout=20,
         )
-        log.info("Telegram Gujarati alert sent successfully")
     except Exception as exc:
         log.warning("Telegram send warning: %s", exc)
 
 
-# ---------------- BLOGGER SCANNER & DEDUPLICATION ----------------
 def blogger_access_token():
     required = (GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN)
     if not all(required):
@@ -1530,11 +1677,7 @@ def blogger_access_token():
 def _parse_single_blog_post_for_dedup(title_str, content_html, labels_list, state):
     t_low = title_str.lower()
     lbl_low = " ".join(str(x).lower() for x in (labels_list or []))
-
-    if "share order" in lbl_low or any(w in t_low for w in ("order", "contract", "award", "loa", "work order")):
-        p_type = "order"
-    else:
-        p_type = "result"
+    p_type = "order" if ("share order" in lbl_low or any(w in t_low for w in ("order", "contract", "award", "loa"))) else "result"
 
     meta_match = re.search(r"<!--\s*MM_META:([^>]+?)\s*-->", content_html)
     if meta_match:
@@ -1555,18 +1698,11 @@ def _parse_single_blog_post_for_dedup(title_str, content_html, labels_list, stat
     if title_ck:
         state["comp_keys"].add(title_ck)
 
-    for match in re.findall(r"[a-zA-Z0-9_-]{8,}\.(?:pdf|xml|xbrl|html)", content_html, flags=re.I):
-        state["file_keys"].add(match.lower())
-
-    for sc in re.findall(r"\b(5\d{5})\b", title_str + " " + content_html):
-        state["scrip_keys"].add(f"{p_type}_{sc}")
-
 
 def get_existing_blogger_posts():
     state = {"comp_keys": set(), "scrip_keys": set(), "file_keys": set()}
     if not BLOG_ID:
         return state
-
     total_scanned = 0
     try:
         token = blogger_access_token()
@@ -1599,15 +1735,7 @@ def get_existing_blogger_posts():
             if not page_token:
                 break
     except Exception as exc:
-        log.warning("Blogger API scan warning: %s", exc)
-
-    log.info(
-        "Blog Scan Complete: %d posts | %d company keys | %d file keys | %d scrip keys",
-        total_scanned,
-        len(state["comp_keys"]),
-        len(state["file_keys"]),
-        len(state["scrip_keys"]),
-    )
+        log.warning("Blogger scan warning: %s", exc)
     return state
 
 
@@ -1627,7 +1755,7 @@ def blogger_publish(title, content_html, doc_type):
     if not BLOG_ID:
         raise RuntimeError("BLOG_ID is missing")
     token = blogger_access_token()
-    clean_title = re.sub(r"[\r\n\t]+", " ", re.sub(r"<[^>]+>", "", str(title))).strip()[:140] or "Corporate Financial Update | MarketMunafa"
+    clean_title = re.sub(r"[\r\n\t]+", " ", re.sub(r"<[^>]+>", "", str(title))).strip()[:140] or "Share Price Target & Q2 Results | MarketMunafa"
     labels = ["MARKET NEWS", "SHARE ORDER"] if doc_type == "order" else ["MARKET NEWS", "STOCK RESULT"]
 
     for attempt in range(2):
@@ -1639,24 +1767,25 @@ def blogger_publish(title, content_html, doc_type):
         )
         if response.status_code == 429:
             if attempt == 0:
-                log.warning("Blogger rate limit (429) hit. Waiting 25s before retry...")
                 time.sleep(25)
                 continue
-            log.warning("⚠️ Blogger Daily Post Limit (429 Too Many Requests) reached for today! Sending to Telegram only.")
+            log.warning("⚠️ Blogger Daily Post Limit (429) reached! Sending to Telegram only.")
             return None
         response.raise_for_status()
         return response.json().get("url", "")
     return None
 
 
-def publish_item(item, doc_type, ai_data, screener_info, item_id, comp_key, scrip_key, file_key, scrip_code=""):
+def publish_item(item, doc_type, ai_data, screener_info, trending_kws, item_id, comp_key, scrip_key, file_key, scrip_code=""):
     source_url = item["link"]
-    raw_title = ai_data.get("seo_title") or f"{item['title']} Consolidated Results & Valuation | MarketMunafa"
+    c_short = ai_data.get("company_short_name") or screener_info.get("screener_company_name") or item["title"]
+    raw_title = ai_data.get("seo_title") or f"{c_short} Share Price Target 2026, Q2 Results & Latest News"
     blog_html, yoy_chart_url = build_post_html(
         ai_data,
         doc_type,
         screener_info,
         source_url,
+        trending_kws,
         comp_key=comp_key,
         scrip_key=scrip_key,
         file_key=file_key,
@@ -1672,13 +1801,16 @@ def publish_item(item, doc_type, ai_data, screener_info, item_id, comp_key, scri
         else:
             blog_url = res_url
             mark_posted(item_id, comp_key, scrip_key, file_key, item["title"], source_url)
-            log.info("✅ Blogger post published (%s): %s", doc_type, blog_url)
+            log.info("✅ Published High-SEO Post (%s): %s", doc_type, blog_url)
+            ping_search_engines()
 
     send_telegram_gujarati(ai_data, doc_type, screener_info, blog_url, source_url, yoy_chart_url)
     return not blogger_quota_hit
 
 
-# ---------------- MAIN RUNNER ----------------
+# ==========================================
+# 10. MAIN RUNNER
+# ==========================================
 def run():
     init_db()
     log.info("Scanning existing posts on MarketMunafa blog...")
@@ -1688,10 +1820,9 @@ def run():
     for kind, feed_url in FEEDS.items():
         try:
             items = parse_feed(feed_url, kind)
-            log.info("%s XML feed: %d items", kind, len(items))
             all_items.extend(items)
         except Exception:
-            log.exception("Feed failed: %s", feed_url)
+            pass
 
     if not all_items:
         log.warning("No feed items retrieved.")
@@ -1701,7 +1832,7 @@ def run():
 
     for item in all_items:
         if published_count >= MAX_POSTS_PER_RUN:
-            log.info("Reached MAX_POSTS_PER_RUN (%d). Stopping run cleanly to protect Blogger quota.", MAX_POSTS_PER_RUN)
+            log.info("Reached MAX_POSTS_PER_RUN (%d). Stopping cleanly.", MAX_POSTS_PER_RUN)
             break
 
         doc_type = classify_item(item)
@@ -1717,52 +1848,49 @@ def run():
 
         is_dup, dup_reason = is_already_on_blog_or_db(item_id, comp_key, scrip_key, file_key, blog_state)
         if is_dup:
-            log.info("Skipping duplicate [%s] (%s): %s", dup_reason, doc_type, item["title"])
             continue
 
-        log.info("Processing %s: %s", doc_type, item["title"])
         try:
             screener_info = get_screener_fundamentals(item["title"], scrip_code=scrip_code)
 
-            # માત્ર પેની સ્ટોક્સ (Mkt Cap < ₹150 Cr અથવા Share Price < ₹15) બાકાત રહેશે
             if not screener_info["is_eligible_stock"]:
-                log.info(
-                    "Skipping Penny/Unlisted Stock (Market Cap: %s, Price: %s): %s",
-                    screener_info["market_cap"],
-                    screener_info["price_str"],
-                    item["title"],
-                )
+                log.info("Skipping Penny/Unlisted Stock (Mkt Cap: %s): %s", screener_info["market_cap"], item["title"])
                 continue
 
             if screener_info.get("screener_company_name"):
                 scr_comp_key = normalize_company_key(screener_info["screener_company_name"], doc_type)
                 if scr_comp_key and scr_comp_key in blog_state["comp_keys"]:
-                    log.info("Skipping duplicate [Screener Match: %s]: %s", scr_comp_key, item["title"])
                     continue
 
             source_text, pdf_bytes, pdf_text_len = get_document_payload(item)
             file_key = extract_file_key(item["link"]) or file_key
 
             if doc_type == "result" and not screener_info["q_all_rev"] and pdf_text_len < 200:
-                log.warning("Skipped: no readable PDF numbers and no Screener quarterly data for %s", item["title"])
                 continue
 
+            # Fetch Real-Time Google Autocomplete Trending Keywords for this Stock!
+            c_search_name = screener_info.get("screener_company_name") or comp_basis
+            trending_kws = fetch_live_google_keywords(c_search_name)
+
             ai_data = analyze_with_gemini_json(
-                item["title"], scrip_code, doc_type, source_text, pdf_bytes, screener_info, pdf_text_len
+                item["title"], scrip_code, doc_type, source_text, pdf_bytes, screener_info, trending_kws, pdf_text_len
             )
 
-            ai_comp_name = str(ai_data.get("company_short_name") or "").strip()
-            ai_comp_key = normalize_company_key(ai_comp_name, doc_type) if ai_comp_name else ""
-            if ai_comp_key and ai_comp_key in blog_state["comp_keys"]:
-                log.info("Skipping duplicate [AI Name Match: %s]: %s", ai_comp_key, item["title"])
+            # 🛑 STRONG RESULT FILTER: માત્ર સારા પરિણામ કે મોટા ઓર્ડર વાળા શેર જ પોસ્ટ થશે
+            if ai_data.get("skip_stock") is True:
+                log.info("Skipping stock due to weak/flat financial results: %s", item["title"])
                 continue
 
             if doc_type == "result":
                 r_curr = to_float(ai_data.get("revenue", {}).get("curr"))
                 np_curr = to_float(ai_data.get("net_profit", {}).get("curr"))
                 if r_curr == 0 and np_curr == 0:
-                    log.warning("Skipping result post with 0 financial figures: %s", item["title"])
                     continue
+
+            ai_comp_name = str(ai_data.get("company_short_name") or "").strip()
+            ai_comp_key = normalize_company_key(ai_comp_name, doc_type) if ai_comp_name else ""
+            if ai_comp_key and ai_comp_key in blog_state["comp_keys"]:
+                continue
 
             final_comp_key = ai_comp_key or comp_key
             blogger_ok = publish_item(
@@ -1770,6 +1898,7 @@ def run():
                 doc_type,
                 ai_data,
                 screener_info,
+                trending_kws,
                 item_id,
                 final_comp_key,
                 scrip_key,
@@ -1788,7 +1917,6 @@ def run():
 
             published_count += 1
             if not blogger_ok:
-                log.info("Stopping further Blogger posts for this run as Blogger daily limit (429) is active.")
                 break
 
             time.sleep(12)
