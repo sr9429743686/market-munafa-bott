@@ -46,9 +46,9 @@ for _ek in re.split(r"[,\s]+", os.getenv("GEMINI_API_KEY", "").strip()):
         GEMINI_API_KEYS.append(_ek)
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
-GEMINI_MAX_REQ_PER_MIN = 15       # 15 RPM
+GEMINI_MAX_REQ_PER_MIN = 15        # 15 RPM
 GEMINI_MAX_TOKENS_PER_MIN = 250000 # 250,000 TPM
-GEMINI_MAX_REQ_PER_DAY = 500      # 500 RPD
+GEMINI_MAX_REQ_PER_DAY = 500       # 500 RPD
 
 # ---------------- 2. OPENROUTER BACKUP KEYS (ONLY 2 KEYS: 5 RPM, 20 RPD) ----------------
 OPENROUTER_KEYS = [
@@ -60,10 +60,11 @@ OPENROUTER_MAX_REQ_PER_DAY = 20
 
 RATE_WINDOW_SECONDS = 60.0
 
-# ---------------- 3. PENNY STOCK FILTER (INCLUDE SMALL, MID & LARGE CAPS) ----------------
-# માત્ર પેની સ્ટોક્સ (Market Cap < ₹100 Cr અથવા Share Price < ₹10) સ્કીપ થશે; બધા સ્મોલ/મિડ/લાર્જ કેપ લેવાશે
-MIN_MARKET_CAP_CR = float(os.getenv("MIN_MARKET_CAP_CR", "100.0"))
-MIN_STOCK_PRICE = float(os.getenv("MIN_STOCK_PRICE", "10.0"))
+# ---------------- 3. PENNY STOCK FILTER & BLOGGER RATE LIMIT PROTECTION ----------------
+# સ્મોલ કેપ, મિડ કેપ અને લાર્જ કેપ લેવાશે; માત્ર પેની સ્ટોક્સ (Mkt Cap < ₹150 Cr અથવા Price < ₹15) બાકાત રહેશે
+MIN_MARKET_CAP_CR = float(os.getenv("MIN_MARKET_CAP_CR", "150.0"))
+MIN_STOCK_PRICE = float(os.getenv("MIN_STOCK_PRICE", "15.0"))
+MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "10"))  # Blogger 429 ટાળવા એક રનમાં મહત્તમ 10 પોસ્ટ
 
 FEEDS = {
     "result": "https://www.bseindia.com/Data/XML/FinancialResultsFeed.aspx",
@@ -95,7 +96,7 @@ class MultiKeyRotator:
         self.max_per_day = max_per_day
         self.max_tpm = max_tpm
         self.window_sec = window_sec
-        self.usage_history = {i: [] for i in range(len(self.keys))}  # list of (timestamp, tokens)
+        self.usage_history = {i: [] for i in range(len(self.keys))}
         self.daily_count = {i: 0 for i in range(len(self.keys))}
         self.cooldown_until = {i: 0.0 for i in range(len(self.keys))}
         self.exhausted_today = set()
@@ -327,12 +328,20 @@ def fmt_num(val):
     return f"{num:,.2f}"
 
 
-# ---------------- SCREENER FUNDAMENTALS & PENNY STOCK FILTER ----------------
-def get_screener_fundamentals(comp_title):
+# ---------------- SCREENER FUNDAMENTALS (EXACT SCRIP CODE VERIFICATION) ----------------
+def get_screener_fundamentals(comp_title, scrip_code=""):
     clean_name = re.sub(r"\(\d+\)", "", comp_title).split("-")[0].strip()
     clean_name = re.sub(r"\b(ltd|limited|india|industries|corp|corporation|pvt)\b", "", clean_name, flags=re.I).strip()
     words = [w for w in clean_name.split() if len(w) > 1]
-    queries = [clean_name] + ([" ".join(words[:2])] if len(words) >= 2 else []) + ([words[0]] if words else [])
+
+    # સૌથી પહેલાં BSE Scrip Code થી જ સર્ચ કરો જેથી ખોટી કંપની મેચ ન થાય
+    queries = []
+    if scrip_code:
+        queries.append(str(scrip_code).strip())
+    if clean_name:
+        queries.append(clean_name)
+    if len(words) >= 2:
+        queries.append(" ".join(words[:2]))
 
     info = {
         "screener_company_name": "", "price_str": "Live on BSE", "price_num": 0.0,
@@ -354,10 +363,24 @@ def get_screener_fundamentals(comp_title):
             res = c_requests.get(search_url, impersonate="chrome120", timeout=12)
             if res.status_code == 200 and isinstance(res.json(), list) and len(res.json()) > 0:
                 first_hit = res.json()[0]
-                info["screener_company_name"] = str(first_hit.get("name") or "").strip()
+                hit_name = str(first_hit.get("name") or "").strip()
+
+                # જો નામથી સર્ચ કર્યું હોય તો પહેલો શબ્દ કંપનીના નામ સાથે મેચ થવો જ જોઈએ
+                if q != scrip_code and words:
+                    if words[0].lower() not in hit_name.lower():
+                        continue
+
                 c_res = c_requests.get("https://www.screener.in" + first_hit["url"], impersonate="chrome120", timeout=15)
                 if c_res.status_code != 200:
                     continue
+                page_html = c_res.text
+
+                # જો BSE Scrip Code ઉપલબ્ધ હોય અને પેજમાં બીજો કોઈ BSE કોડ હોય તો ખોટી મેચ ગણીને છોડી દો
+                if scrip_code and f"/{scrip_code}/" not in page_html and f"BSE: {scrip_code}" not in page_html:
+                    if q != scrip_code:
+                        continue
+
+                info["screener_company_name"] = hit_name
                 soup = BeautifulSoup(c_res.content, "html.parser")
 
                 top_ratios = soup.find("ul", id="top-ratios")
@@ -392,7 +415,7 @@ def get_screener_fundamentals(comp_title):
                         elif ("P/B" in t or "Price to book" in t) and num_txt:
                             info["pb_ratio"] = num_txt
 
-                # સ્મોલ કેપ, મિડ કેપ અને લાર્જ કેપ બધા લેવાશે; માત્ર પેની સ્ટોક્સ (Mkt Cap < ₹100 Cr અથવા Price < ₹10) બાકાત રહેશે
+                # માત્ર પેની સ્ટોક્સ (Mkt Cap < ₹150 Cr અથવા Share Price < ₹15) બાકાત રહેશે
                 if info["market_cap_num"] >= MIN_MARKET_CAP_CR and (info["price_num"] == 0 or info["price_num"] >= MIN_STOCK_PRICE):
                     info["is_eligible_stock"] = True
 
@@ -1607,14 +1630,23 @@ def blogger_publish(title, content_html, doc_type):
     clean_title = re.sub(r"[\r\n\t]+", " ", re.sub(r"<[^>]+>", "", str(title))).strip()[:140] or "Corporate Financial Update | MarketMunafa"
     labels = ["MARKET NEWS", "SHARE ORDER"] if doc_type == "order" else ["MARKET NEWS", "STOCK RESULT"]
 
-    response = requests.post(
-        f"https://www.googleapis.com/blogger/v3/blogs/{BLOG_ID}/posts/",
-        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-        json={"title": clean_title, "content": content_html, "labels": labels},
-        timeout=25,
-    )
-    response.raise_for_status()
-    return response.json().get("url", "")
+    for attempt in range(2):
+        response = requests.post(
+            f"https://www.googleapis.com/blogger/v3/blogs/{BLOG_ID}/posts/",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"title": clean_title, "content": content_html, "labels": labels},
+            timeout=25,
+        )
+        if response.status_code == 429:
+            if attempt == 0:
+                log.warning("Blogger rate limit (429) hit. Waiting 25s before retry...")
+                time.sleep(25)
+                continue
+            log.warning("⚠️ Blogger Daily Post Limit (429 Too Many Requests) reached for today! Sending to Telegram only.")
+            return None
+        response.raise_for_status()
+        return response.json().get("url", "")
+    return None
 
 
 def publish_item(item, doc_type, ai_data, screener_info, item_id, comp_key, scrip_key, file_key, scrip_code=""):
@@ -1632,12 +1664,18 @@ def publish_item(item, doc_type, ai_data, screener_info, item_id, comp_key, scri
     )
 
     blog_url = ""
+    blogger_quota_hit = False
     if POST_TO_BLOGGER:
-        blog_url = blogger_publish(raw_title, blog_html, doc_type)
-        mark_posted(item_id, comp_key, scrip_key, file_key, item["title"], source_url)
-        log.info("✅ Blogger post published (%s): %s", doc_type, blog_url)
+        res_url = blogger_publish(raw_title, blog_html, doc_type)
+        if res_url is None:
+            blogger_quota_hit = True
+        else:
+            blog_url = res_url
+            mark_posted(item_id, comp_key, scrip_key, file_key, item["title"], source_url)
+            log.info("✅ Blogger post published (%s): %s", doc_type, blog_url)
 
     send_telegram_gujarati(ai_data, doc_type, screener_info, blog_url, source_url, yoy_chart_url)
+    return not blogger_quota_hit
 
 
 # ---------------- MAIN RUNNER ----------------
@@ -1659,7 +1697,13 @@ def run():
         log.warning("No feed items retrieved.")
         return
 
+    published_count = 0
+
     for item in all_items:
+        if published_count >= MAX_POSTS_PER_RUN:
+            log.info("Reached MAX_POSTS_PER_RUN (%d). Stopping run cleanly to protect Blogger quota.", MAX_POSTS_PER_RUN)
+            break
+
         doc_type = classify_item(item)
         if not doc_type:
             continue
@@ -1678,9 +1722,9 @@ def run():
 
         log.info("Processing %s: %s", doc_type, item["title"])
         try:
-            screener_info = get_screener_fundamentals(item["title"])
+            screener_info = get_screener_fundamentals(item["title"], scrip_code=scrip_code)
 
-            # માત્ર પેની સ્ટોક્સ (Mkt Cap < ₹100 Cr અથવા Share Price < ₹10) સ્કીપ થશે; બધા સ્મોલ/મિડ/લાર્જ કેપ લેવાશે
+            # માત્ર પેની સ્ટોક્સ (Mkt Cap < ₹150 Cr અથવા Share Price < ₹15) બાકાત રહેશે
             if not screener_info["is_eligible_stock"]:
                 log.info(
                     "Skipping Penny/Unlisted Stock (Market Cap: %s, Price: %s): %s",
@@ -1721,7 +1765,7 @@ def run():
                     continue
 
             final_comp_key = ai_comp_key or comp_key
-            publish_item(
+            blogger_ok = publish_item(
                 item,
                 doc_type,
                 ai_data,
@@ -1742,7 +1786,12 @@ def run():
             if file_key:
                 blog_state["file_keys"].add(file_key)
 
-            time.sleep(4)
+            published_count += 1
+            if not blogger_ok:
+                log.info("Stopping further Blogger posts for this run as Blogger daily limit (429) is active.")
+                break
+
+            time.sleep(12)
         except Exception:
             log.exception("Item processing failed: %s", item["title"])
 
