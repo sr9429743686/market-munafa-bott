@@ -36,7 +36,7 @@ GOOGLE_REFRESH_TOKEN = (os.getenv("GOOGLE_REFRESH_TOKEN") or os.getenv("REFRESH_
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9086072964:AAEUyn-GAyJLdsYR4YS5l6Xy6HJsOOoA8HM").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "430834857").strip()
 
-# ---------------- 1. GEMINI API KEYS & LIMITS (10/MIN, 100/DAY PER KEY) ----------------
+# ---------------- 1. GEMINI 3.5 FLASH-LITE QUOTA (15 RPM, 250,000 TPM, 500 RPD) ----------------
 GEMINI_API_KEYS = [
     "AQ.Ab8RN6" + "JWzU70V3RM1zMEx0VEYmUj4q" + "EvvqqKbH27t1oHIO3Xjg",
     "AQ.Ab8RN6" + "Iw_vLVx2SPdac2gbUhK5fiSy" + "ihpDMHASZdZzdd4SnFGQ",
@@ -46,10 +46,11 @@ for _ek in re.split(r"[,\s]+", os.getenv("GEMINI_API_KEY", "").strip()):
         GEMINI_API_KEYS.append(_ek)
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
-GEMINI_MAX_REQ_PER_MIN = 10
-GEMINI_MAX_REQ_PER_DAY = 100
+GEMINI_MAX_REQ_PER_MIN = 15       # 15 RPM
+GEMINI_MAX_TOKENS_PER_MIN = 250000 # 250,000 TPM
+GEMINI_MAX_REQ_PER_DAY = 500      # 500 RPD
 
-# ---------------- 2. OPENROUTER BACKUP KEYS & LIMITS (ONLY 2 KEYS: 5/MIN, 20/DAY) ----------------
+# ---------------- 2. OPENROUTER BACKUP KEYS (ONLY 2 KEYS: 5 RPM, 20 RPD) ----------------
 OPENROUTER_KEYS = [
     "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",
     "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",
@@ -58,7 +59,11 @@ OPENROUTER_MAX_REQ_PER_MIN = 5
 OPENROUTER_MAX_REQ_PER_DAY = 20
 
 RATE_WINDOW_SECONDS = 60.0
-MIN_MARKET_CAP_CR = 1000.0  # ₹1,000 Cr થી ઉપરની કંપનીઓ પોસ્ટ થશે
+
+# ---------------- 3. PENNY STOCK FILTER (INCLUDE SMALL, MID & LARGE CAPS) ----------------
+# માત્ર પેની સ્ટોક્સ (Market Cap < ₹100 Cr અથવા Share Price < ₹10) સ્કીપ થશે; બધા સ્મોલ/મિડ/લાર્જ કેપ લેવાશે
+MIN_MARKET_CAP_CR = float(os.getenv("MIN_MARKET_CAP_CR", "100.0"))
+MIN_STOCK_PRICE = float(os.getenv("MIN_STOCK_PRICE", "10.0"))
 
 FEEDS = {
     "result": "https://www.bseindia.com/Data/XML/FinancialResultsFeed.aspx",
@@ -81,21 +86,22 @@ logging.basicConfig(
 log = logging.getLogger("marketmunafa")
 
 
-# ---------------- MULTI-KEY ROTATOR CLASS ----------------
+# ---------------- MULTI-KEY ROTATOR CLASS (RPM + TPM + RPD PROTECTION) ----------------
 class MultiKeyRotator:
-    def __init__(self, name, keys, max_per_min, max_per_day, window_sec=60.0):
+    def __init__(self, name, keys, max_per_min, max_per_day, max_tpm=250000, window_sec=60.0):
         self.name = name
         self.keys = [k.strip() for k in keys if k and k.strip()]
         self.max_per_min = max_per_min
         self.max_per_day = max_per_day
+        self.max_tpm = max_tpm
         self.window_sec = window_sec
-        self.usage_history = {i: [] for i in range(len(self.keys))}
+        self.usage_history = {i: [] for i in range(len(self.keys))}  # list of (timestamp, tokens)
         self.daily_count = {i: 0 for i in range(len(self.keys))}
         self.cooldown_until = {i: 0.0 for i in range(len(self.keys))}
         self.exhausted_today = set()
         self.next_idx = 0
 
-    def acquire_key(self):
+    def acquire_key(self, estimated_tokens=4000):
         num_keys = len(self.keys)
         if num_keys == 0:
             return None, None
@@ -118,30 +124,35 @@ class MultiKeyRotator:
                     continue
 
                 cutoff = now - self.window_sec
-                self.usage_history[idx] = [t for t in self.usage_history[idx] if t > cutoff]
+                self.usage_history[idx] = [(t, tok) for (t, tok) in self.usage_history[idx] if t > cutoff]
 
                 if now < self.cooldown_until[idx]:
                     w = self.cooldown_until[idx] - now
                     earliest_wait = w if earliest_wait is None else min(earliest_wait, w)
                     continue
 
-                if len(self.usage_history[idx]) < self.max_per_min:
-                    self.usage_history[idx].append(now)
+                curr_rpm = len(self.usage_history[idx])
+                curr_tpm = sum(tok for (_, tok) in self.usage_history[idx])
+
+                if curr_rpm < self.max_per_min and (curr_tpm + estimated_tokens) <= self.max_tpm:
+                    self.usage_history[idx].append((now, estimated_tokens))
                     self.daily_count[idx] += 1
                     self.next_idx = (idx + 1) % num_keys
                     log.info(
-                        "Using %s Key #%d/%d | Minute Req: %d/%d | Daily Req: %d/%d",
+                        "Using %s Key #%d/%d | RPM: %d/%d | TPM: %d/%d | RPD: %d/%d",
                         self.name,
                         idx + 1,
                         num_keys,
-                        len(self.usage_history[idx]),
+                        curr_rpm + 1,
                         self.max_per_min,
+                        curr_tpm + estimated_tokens,
+                        self.max_tpm,
                         self.daily_count[idx],
                         self.max_per_day,
                     )
                     return idx, self.keys[idx]
                 else:
-                    w = (self.usage_history[idx][0] + self.window_sec) - now + 1.0
+                    w = (self.usage_history[idx][0][0] + self.window_sec) - now + 1.0
                     earliest_wait = w if earliest_wait is None else min(earliest_wait, w)
 
             if len(self.exhausted_today) >= num_keys:
@@ -162,21 +173,21 @@ class MultiKeyRotator:
             self.cooldown_until[idx] = time.time() + cooldown_sec
 
 
-# Gemini Rotator: 10 req/min, 100 req/day per key
 GEMINI_ROTATOR = MultiKeyRotator(
     "Gemini (gemini-3.5-flash-lite)",
     GEMINI_API_KEYS,
     max_per_min=GEMINI_MAX_REQ_PER_MIN,
     max_per_day=GEMINI_MAX_REQ_PER_DAY,
+    max_tpm=GEMINI_MAX_TOKENS_PER_MIN,
     window_sec=RATE_WINDOW_SECONDS,
 )
 
-# OpenRouter Rotator: 5 req/min, 20 req/day per key
 OPENROUTER_ROTATOR = MultiKeyRotator(
     "OpenRouter Backup",
     OPENROUTER_KEYS,
     max_per_min=OPENROUTER_MAX_REQ_PER_MIN,
     max_per_day=OPENROUTER_MAX_REQ_PER_DAY,
+    max_tpm=250000,
     window_sec=RATE_WINDOW_SECONDS,
 )
 
@@ -316,7 +327,7 @@ def fmt_num(val):
     return f"{num:,.2f}"
 
 
-# ---------------- SCREENER FUNDAMENTALS & MARKET CAP FILTER (₹1,000 Cr+) ----------------
+# ---------------- SCREENER FUNDAMENTALS & PENNY STOCK FILTER ----------------
 def get_screener_fundamentals(comp_title):
     clean_name = re.sub(r"\(\d+\)", "", comp_title).split("-")[0].strip()
     clean_name = re.sub(r"\b(ltd|limited|india|industries|corp|corporation|pvt)\b", "", clean_name, flags=re.I).strip()
@@ -324,8 +335,9 @@ def get_screener_fundamentals(comp_title):
     queries = [clean_name] + ([" ".join(words[:2])] if len(words) >= 2 else []) + ([words[0]] if words else [])
 
     info = {
-        "screener_company_name": "", "price_str": "Live on BSE", "market_cap": "N/A", "market_cap_num": 0.0,
-        "is_mid_large_cap": False, "pe_ratio": "N/A", "pb_ratio": "N/A", "industry_pe": "N/A",
+        "screener_company_name": "", "price_str": "Live on BSE", "price_num": 0.0,
+        "market_cap": "N/A", "market_cap_num": 0.0,
+        "is_eligible_stock": False, "pe_ratio": "N/A", "pb_ratio": "N/A", "industry_pe": "N/A",
         "roe": "N/A", "eps": "N/A", "div_yield": "N/A", "book_value": "N/A", "total_debt": "₹0 Cr",
         "curr_debt_num": 0, "prev_debt_num": 0, "debt_to_equity": "0.00", "face_value": "N/A",
         "quarters_text": "", "q_all_labels": [], "q_all_rev": [], "q_all_gp": [], "q_all_np": [],
@@ -357,6 +369,7 @@ def get_screener_fundamentals(comp_title):
 
                         if "Current Price" in t and num_txt:
                             info["price_str"] = f"₹{num_txt}"
+                            info["price_num"] = to_float(num_txt)
                         elif "Market Cap" in t and num_txt:
                             info["market_cap"] = f"₹{num_txt} Cr"
                             info["market_cap_num"] = to_float(num_txt)
@@ -379,8 +392,9 @@ def get_screener_fundamentals(comp_title):
                         elif ("P/B" in t or "Price to book" in t) and num_txt:
                             info["pb_ratio"] = num_txt
 
-                if info["market_cap_num"] >= MIN_MARKET_CAP_CR:
-                    info["is_mid_large_cap"] = True
+                # સ્મોલ કેપ, મિડ કેપ અને લાર્જ કેપ બધા લેવાશે; માત્ર પેની સ્ટોક્સ (Mkt Cap < ₹100 Cr અથવા Price < ₹10) બાકાત રહેશે
+                if info["market_cap_num"] >= MIN_MARKET_CAP_CR and (info["price_num"] == 0 or info["price_num"] >= MIN_STOCK_PRICE):
+                    info["is_eligible_stock"] = True
 
                 borrowings, equity = None, None
                 bs_sec = soup.find("section", id="balance-sheet")
@@ -549,6 +563,7 @@ def clean_text(value):
 def get_document_payload(item):
     parts = [f"COMPANY TITLE: {item['title']}"]
     pdf_bytes = None
+    extracted_pdf_text = ""
     if item["description"]:
         parts.append("FEED DESCRIPTION:\n" + item["description"])
     url, attach_name = item["link"], item.get("attachment_name", "")
@@ -571,12 +586,12 @@ def get_document_payload(item):
                 with open(tmp.name, "rb") as f:
                     for page in PyPDF2.PdfReader(f).pages[:MAX_PDF_PAGES]:
                         text_parts.append(page.extract_text() or "")
-            extracted = clean_text("\n".join(text_parts))[:MAX_TEXT_CHARS]
-            if extracted:
-                parts.append("EXTRACTED PDF TEXT:\n" + extracted)
+            extracted_pdf_text = clean_text("\n".join(text_parts))[:MAX_TEXT_CHARS]
+            if extracted_pdf_text:
+                parts.append("EXTRACTED PDF TEXT:\n" + extracted_pdf_text)
         except Exception as exc:
             log.warning("Attachment download warning: %s", exc)
-    return clean_text("\n\n".join(parts))[:MAX_TEXT_CHARS], pdf_bytes
+    return clean_text("\n\n".join(parts))[:MAX_TEXT_CHARS], pdf_bytes, len(extracted_pdf_text)
 
 
 def classify_item(item):
@@ -619,10 +634,7 @@ def compute_metric_dict(curr_val, prev_val):
     return {"curr": fmt_num(c), "prev": fmt_num(p), "difference": diff_str, "growth": g_str}
 
 
-def ensure_valid_result_numbers(ai_data, screener_info):
-    rev = ai_data.get("revenue") or {}
-    gp = ai_data.get("gross_profit") or {}
-    np_d = ai_data.get("net_profit") or {}
+def get_screener_yoy_defaults(screener_info):
     q_rev_all = screener_info.get("q_all_rev", [])
     q_gp_all = screener_info.get("q_all_gp", [])
     q_np_all = screener_info.get("q_all_np", [])
@@ -637,29 +649,55 @@ def ensure_valid_result_numbers(ai_data, screener_info):
             return arr[0], arr[0]
         return 0, 0
 
-    if len(q_lbl_all) >= 5:
-        if str(ai_data.get("curr_period_label", "")).upper() in ("", "N/A", "CURRENT"):
-            ai_data["curr_period_label"] = q_lbl_all[-1]
-        if str(ai_data.get("prev_period_label", "")).upper() in ("", "N/A", "PREVIOUS"):
-            ai_data["prev_period_label"] = q_lbl_all[-5]
+    curr_lbl = q_lbl_all[-1] if len(q_lbl_all) >= 1 else "Current"
+    prev_lbl = q_lbl_all[-5] if len(q_lbl_all) >= 5 else (q_lbl_all[-2] if len(q_lbl_all) >= 2 else "Previous YoY")
 
-    if to_float(rev.get("curr")) == 0 and to_float(rev.get("prev")) == 0 and q_rev_all:
-        c_val, p_val = pick_curr_prev(q_rev_all)
-        ai_data["revenue"] = compute_metric_dict(c_val, p_val)
+    r_c, r_p = pick_curr_prev(q_rev_all)
+    g_c, g_p = pick_curr_prev(q_gp_all)
+    n_c, n_p = pick_curr_prev(q_np_all)
+
+    return {
+        "curr_lbl": curr_lbl,
+        "prev_lbl": prev_lbl,
+        "revenue": compute_metric_dict(r_c, r_p),
+        "gross_profit": compute_metric_dict(g_c, g_p),
+        "net_profit": compute_metric_dict(n_c, n_p),
+    }
+
+
+def ensure_valid_result_numbers(ai_data, screener_info, pdf_text_len=0):
+    defaults = get_screener_yoy_defaults(screener_info)
+    rev = ai_data.get("revenue") or {}
+    gp = ai_data.get("gross_profit") or {}
+    np_d = ai_data.get("net_profit") or {}
+
+    use_screener_strict = (pdf_text_len < 250 and len(screener_info.get("q_all_rev", [])) >= 2)
+
+    if use_screener_strict or str(ai_data.get("curr_period_label", "")).upper() in ("", "N/A", "CURRENT"):
+        ai_data["curr_period_label"] = defaults["curr_lbl"]
+    if use_screener_strict or str(ai_data.get("prev_period_label", "")).upper() in ("", "N/A", "PREVIOUS"):
+        ai_data["prev_period_label"] = defaults["prev_lbl"]
+
+    if use_screener_strict or (to_float(rev.get("curr")) == 0 and to_float(rev.get("prev")) == 0):
+        ai_data["revenue"] = defaults["revenue"]
     else:
         ai_data["revenue"] = compute_metric_dict(rev.get("curr"), rev.get("prev"))
 
-    if to_float(gp.get("curr")) == 0 and to_float(gp.get("prev")) == 0 and q_gp_all:
-        c_val, p_val = pick_curr_prev(q_gp_all)
-        ai_data["gross_profit"] = compute_metric_dict(c_val, p_val)
+    if use_screener_strict or (to_float(gp.get("curr")) == 0 and to_float(gp.get("prev")) == 0):
+        ai_data["gross_profit"] = defaults["gross_profit"]
     else:
         ai_data["gross_profit"] = compute_metric_dict(gp.get("curr"), gp.get("prev"))
 
-    if to_float(np_d.get("curr")) == 0 and to_float(np_d.get("prev")) == 0 and q_np_all:
-        c_val, p_val = pick_curr_prev(q_np_all)
-        ai_data["net_profit"] = compute_metric_dict(c_val, p_val)
+    if use_screener_strict or (to_float(np_d.get("curr")) == 0 and to_float(np_d.get("prev")) == 0):
+        ai_data["net_profit"] = defaults["net_profit"]
     else:
         ai_data["net_profit"] = compute_metric_dict(np_d.get("curr"), np_d.get("prev"))
+
+    if use_screener_strict or not ai_data.get("quarter_chart_revenue"):
+        ai_data["quarter_chart_labels"] = screener_info.get("q_labels", [])
+        ai_data["quarter_chart_revenue"] = screener_info.get("q_rev", [])
+        ai_data["quarter_chart_gross_profit"] = screener_info.get("q_gp", [])
+        ai_data["quarter_chart_net_profit"] = screener_info.get("q_np", [])
 
     return ai_data
 
@@ -670,16 +708,18 @@ class DummyResponse:
 
 
 def call_ai_api(prompt_text, pdf_bytes=None):
-    # 1. Primary: Google Gemini API (gemini-3.5-flash-lite) with 10/min & 100/day per key
+    est_tokens = max(2500, int(len(prompt_text) / 3.5) + (3000 if pdf_bytes else 0))
+
+    # 1. Primary: Google Gemini API (gemini-3.5-flash-lite) with 15 RPM, 250k TPM & 500 RPD per key
     if GEMINI_API_KEYS:
-        gemini_models = [GEMINI_MODEL, "gemini-3.5-flash-lite", "gemini-3.8-flash", "gemini-2.0-flash"]
+        gemini_models = [GEMINI_MODEL, "gemini-3.5-flash-lite", "gemini-2.0-flash"]
         seen_m = []
         for m in gemini_models:
             if m and m not in seen_m:
                 seen_m.append(m)
 
         for _ in range(len(GEMINI_ROTATOR.keys)):
-            key_idx, active_key = GEMINI_ROTATOR.acquire_key()
+            key_idx, active_key = GEMINI_ROTATOR.acquire_key(estimated_tokens=est_tokens)
             if active_key is None:
                 break
             try:
@@ -707,7 +747,7 @@ def call_ai_api(prompt_text, pdf_bytes=None):
             if not key_error:
                 break
 
-    # 2. Backup: OpenRouter (2 Keys, 5/min & 20/day per key)
+    # 2. Backup: OpenRouter (2 Keys, 5 RPM & 20 RPD per key)
     if openai is not None and OPENROUTER_KEYS:
         or_models = [
             "google/gemini-3.5-flash-lite",
@@ -716,7 +756,7 @@ def call_ai_api(prompt_text, pdf_bytes=None):
             "meta-llama/llama-3.3-70b-instruct:free",
         ]
         for _ in range(len(OPENROUTER_ROTATOR.keys)):
-            or_idx, or_key = OPENROUTER_ROTATOR.acquire_key()
+            or_idx, or_key = OPENROUTER_ROTATOR.acquire_key(estimated_tokens=est_tokens)
             if or_key is None:
                 break
             for or_model in or_models:
@@ -761,22 +801,23 @@ def extract_order_value_from_text(source_text):
     return "Disclosed in BSE Filing"
 
 
-def build_smart_fallback_data(company_title, scrip_code, doc_type, source_text, screener_info):
+def build_smart_fallback_data(company_title, scrip_code, doc_type, source_text, screener_info, pdf_text_len=0):
     c_name = screener_info.get("screener_company_name") or re.sub(r"\(\d+\)", "", company_title).split("-")[0].strip()
     ist_date_str = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%B %d, %Y")
     ord_val_extracted = extract_order_value_from_text(source_text) if doc_type == "order" else ""
+    scr_defaults = get_screener_yoy_defaults(screener_info)
 
     fallback = {
         "company_short_name": c_name,
         "result_date": ist_date_str,
         "price_display": screener_info["price_str"],
-        "quarter_label": "Latest Quarter",
-        "curr_period_label": "Current",
-        "prev_period_label": "Previous YoY",
+        "quarter_label": f"Quarterly ({scr_defaults['curr_lbl']})",
+        "curr_period_label": scr_defaults["curr_lbl"],
+        "prev_period_label": scr_defaults["prev_lbl"],
         "result_type": "Consolidated",
-        "revenue": {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"},
-        "gross_profit": {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"},
-        "net_profit": {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"},
+        "revenue": scr_defaults["revenue"],
+        "gross_profit": scr_defaults["gross_profit"],
+        "net_profit": scr_defaults["net_profit"],
         "debt_comparison": {"curr": screener_info["curr_debt_num"], "prev": screener_info["prev_debt_num"]},
         "order_details": {
             "client_or_awarder": "Institutional / Corporate Client (As per BSE Filing)",
@@ -806,11 +847,11 @@ def build_smart_fallback_data(company_title, scrip_code, doc_type, source_text, 
     }
 
     if doc_type == "result":
-        fallback = ensure_valid_result_numbers(fallback, screener_info)
+        fallback = ensure_valid_result_numbers(fallback, screener_info, pdf_text_len)
         np_g = fallback["net_profit"]["growth"]
         rev_c = fallback["revenue"]["curr"]
         np_c = fallback["net_profit"]["curr"]
-        fallback["seo_title"] = f"{c_name} Q2 Results: Consolidated PAT at ₹{np_c} Cr ({np_g} YoY) & Valuation Analysis"[:105]
+        fallback["seo_title"] = f"{c_name} Results: Consolidated PAT at ₹{np_c} Cr ({np_g} YoY) & Valuation Analysis"[:105]
         fallback["seo_lead_summary"] = (
             f"{c_name} (BSE: {scrip_code}) has declared its latest Consolidated financial results, posting Revenue of "
             f"₹{rev_c} Cr and Net Profit (PAT) of ₹{np_c} Cr ({np_g} YoY). Trading at {screener_info['price_str']} "
@@ -836,13 +877,13 @@ def build_smart_fallback_data(company_title, scrip_code, doc_type, source_text, 
     )
     fallback["key_highlights"] = [
         f"Company & Market Cap: {c_name} (BSE: {scrip_code}) commands a market capitalization of {screener_info['market_cap']} at {screener_info['price_str']}.",
-        f"Earnings / Order Catalyst: Official corporate filing on BSE highlights strong operational execution ({ord_val_extracted if doc_type=='order' else fallback['net_profit']['growth'] + ' YoY PAT change'}).",
+        f"Earnings / Order Catalyst: Official corporate filing on BSE highlights operational execution ({ord_val_extracted if doc_type=='order' else 'Revenue ₹' + fallback['revenue']['curr'] + ' Cr & PAT ₹' + fallback['net_profit']['curr'] + ' Cr'}).",
         f"Balance Sheet Leverage: Total borrowings stand at {screener_info['total_debt']} with a Debt-to-Equity ratio of {screener_info['debt_to_equity']}.",
         f"Valuation Multiples: Stock trades at a P/E of {screener_info['pe_ratio']} against Industry P/E of {screener_info['industry_pe']} with ROE of {screener_info['roe']}.",
     ]
     fallback["web_story_hook"] = [
-        f"{c_name} ({screener_info['price_str']}) in focus after latest BSE corporate filing!",
-        f"Market Cap stands at {screener_info['market_cap']} with Return on Equity (ROE) of {screener_info['roe']}.",
+        f"{c_name} ({screener_info['price_str']}) reports Revenue of ₹{fallback['revenue']['curr']} Cr ({fallback['revenue']['growth']} YoY)!" if doc_type == "result" else f"{c_name} ({screener_info['price_str']}) bags new order ({ord_val_extracted})!",
+        f"Net Profit (PAT) stands at ₹{fallback['net_profit']['curr']} Cr ({fallback['net_profit']['growth']} YoY) with ROE of {screener_info['roe']}." if doc_type == "result" else f"Market Cap stands at {screener_info['market_cap']} with Return on Equity (ROE) of {screener_info['roe']}.",
         f"Balance sheet discipline reflected in {screener_info['debt_to_equity']} Debt-to-Equity ratio ({screener_info['total_debt']} debt).",
         f"Valuation check: Stock P/E at {screener_info['pe_ratio']} vs Industry P/E at {screener_info['industry_pe']}.",
     ]
@@ -851,8 +892,8 @@ def build_smart_fallback_data(company_title, scrip_code, doc_type, source_text, 
             "heading": "Operational Performance & Filing Breakdown",
             "body": (
                 f"{c_name} (BSE: {scrip_code}) remains on the radar of institutional and retail investors following its latest exchange disclosure. "
-                f"Operating with a market capitalization of {screener_info['market_cap']}, the business continues to focus on top-line visibility "
-                f"and margin stability across its core segments."
+                f"Operating with a market capitalization of {screener_info['market_cap']}, the business reported top-line revenue of "
+                f"₹{fallback['revenue']['curr']} Cr ({fallback['revenue']['growth']} YoY) and Net Profit of ₹{fallback['net_profit']['curr']} Cr ({fallback['net_profit']['growth']} YoY)."
             ),
         },
         {
@@ -873,8 +914,8 @@ def build_smart_fallback_data(company_title, scrip_code, doc_type, source_text, 
     ]
     fallback["faqs"] = [
         {
-            "q": f"Why is {c_name} share price in focus today?",
-            "a": f"{c_name} is in focus following its latest official corporate filing on BSE regarding {'a new order win' if doc_type=='order' else 'quarterly financial results'}.",
+            "q": f"What are the latest quarterly results of {c_name}?",
+            "a": f"{c_name} posted Consolidated Revenue of ₹{fallback['revenue']['curr']} Cr ({fallback['revenue']['growth']} YoY) and Net Profit (PAT) of ₹{fallback['net_profit']['curr']} Cr ({fallback['net_profit']['growth']} YoY).",
         },
         {
             "q": f"What is the Debt-to-Equity ratio and ROE of {c_name}?",
@@ -888,24 +929,25 @@ def build_smart_fallback_data(company_title, scrip_code, doc_type, source_text, 
     return fallback
 
 
-def analyze_with_gemini_json(company_title, scrip_code, doc_type, source_text, pdf_bytes, screener_info):
+def analyze_with_gemini_json(company_title, scrip_code, doc_type, source_text, pdf_bytes, screener_info, pdf_text_len=0):
+    scr_defaults = get_screener_yoy_defaults(screener_info)
+    c_clean_name = screener_info.get("screener_company_name") or re.sub(r"\(\d+\)", "", company_title).split("-")[0].strip()
+
     prompt = f"""
 You are the Chief Equity Research Analyst and SEO Editor for 'MarketMunafa' (https://marketmunafa.blogspot.com).
-Analyze the attached BSE corporate filing ({doc_type.upper()}) and Screener fundamentals data.
+Analyze the attached BSE corporate filing ({doc_type.upper()}) and Screener fundamentals data for {c_clean_name}.
 
-STRICT RULES FOR 100% COPYRIGHT-FREE SEO CONTENT & CONSOLIDATED YOY DATA:
-1. 100% ORIGINAL & COPYRIGHT-FREE WRITING: Write all analysis in your own original equity-research voice. Never copy sentences verbatim from the filing.
-2. EXCLUDE STANDALONE: Completely ignore 'Standalone' figures if 'Consolidated' figures exist in the PDF. Always prioritize 'Consolidated Financial Results'. Only use Standalone if the company has no subsidiaries.
-3. FOCUS ON CONSOLIDATED PAT & YOY GROWTH: For 'net_profit', strictly extract Consolidated Profit After Tax (PAT). Compare the latest quarter ('curr') against the SAME QUARTER LAST YEAR ('prev' - Year-on-Year / YoY).
-4. NEVER return "N/A" for Revenue, Gross Profit, or Net Profit in a 'result' filing. If Gross Profit is not explicitly labeled, compute (Revenue minus Cost of Materials/Operating Expenses) or use EBITDA / PBT. If the PDF is unreadable, use the "Screener Historical Quarters" below.
-5. GOOGLE NEWS RANKING QUESTIONS: Include specific trending search keyword questions and exact answers related to this stock in the FAQs section. Include at least 3 Long-tail Micro Niche questions.
-6. VISUAL WEB STORY HOOK: Provide 4 bullet points that can be directly used in a Visual Web Story summary box at the top of the post. Ensure they sound exciting and professional.
-7. All English fields MUST be 100% in English. Only 'gujarati_summary' and 'gujarati_intraday_view' must be in natural Gujarati.
+STRICT RULES FOR 100% ACCURATE COMPANY-SPECIFIC NUMBERS & ORIGINAL SEO CONTENT:
+1. NEVER INVENT OR COPY DUMMY NUMBERS: Every number you output MUST belong specifically to {c_clean_name}.
+2. CONSOLIDATED YOY PRIORITY: If the Extracted PDF Text below contains readable Consolidated financial result tables, convert Lakhs/Millions into Rs. Crores (1 Crore = 100 Lakhs = 10 Million) and extract Current Quarter vs Same Quarter Last Year (YoY).
+3. FALLBACK TO SCREENER DATA: If the Extracted PDF Text does NOT contain readable financial tables (e.g. scanned PDF), you MUST use the exact Screener YoY figures for {c_clean_name} provided in the JSON template below.
+4. All English fields MUST be 100% in English. Only 'gujarati_summary' and 'gujarati_intraday_view' must be in natural Gujarati.
 
+Company Name: {c_clean_name}
 Company Headline: {company_title}
 BSE Scrip Code: {scrip_code or 'Listed on BSE'}
 Document Type: {doc_type}
-Screener Fundamentals:
+Screener Verified Fundamentals for {c_clean_name}:
 - Market Cap: {screener_info['market_cap']}
 - Current Price: {screener_info['price_str']}
 - P/E Ratio (TTM): {screener_info['pe_ratio']}
@@ -919,28 +961,28 @@ Screener Fundamentals:
 - Debt-to-Equity: {screener_info['debt_to_equity']}
 - Face Value: {screener_info['face_value']}
 
-Screener Historical Quarters (in Rs. Cr.):
+Screener Historical Quarters for {c_clean_name} (in Rs. Cr.):
 {screener_info['quarters_text']}
 
-Return ONLY a valid JSON object with this exact structure:
+Return ONLY a valid JSON object with this exact structure (using {c_clean_name}'s real numbers):
 {{
-  "seo_title": "High-CTR Google Search & Discover Title in 100% English starting with Company Name + Share Price/Order/Q2 Consolidated PAT YoY Growth (70 to 105 chars)",
-  "seo_lead_summary": "A 45-60 word SEO meta summary paragraph in 100% English starting with Company Name (BSE: {scrip_code}) that summarizes the exact Consolidated PAT/Revenue YoY growth OR New Order value, current share price ({screener_info['price_str']}), and valuation impact.",
-  "company_short_name": "Clean Company Name in English",
-  "result_date": "Date of filing in English (e.g. November 14, 2026)",
+  "seo_title": "High-CTR Google Search & Discover Title in 100% English starting with {c_clean_name} + Share Price/Order/Consolidated PAT YoY Growth (70 to 105 chars)",
+  "seo_lead_summary": "A 45-60 word SEO meta summary paragraph in 100% English starting with {c_clean_name} (BSE: {scrip_code}) summarizing the exact Consolidated PAT/Revenue YoY growth OR New Order value, current share price ({screener_info['price_str']}), and valuation impact.",
+  "company_short_name": "{c_clean_name}",
+  "result_date": "November 14, 2026",
   "price_display": "{screener_info['price_str']}",
-  "quarter_label": "e.g. Q2 FY26-27",
-  "curr_period_label": "e.g. Sep 26",
-  "prev_period_label": "e.g. Sep 25",
+  "quarter_label": "Quarterly Results",
+  "curr_period_label": "{scr_defaults['curr_lbl']}",
+  "prev_period_label": "{scr_defaults['prev_lbl']}",
   "result_type": "Consolidated",
-  "revenue": {{"curr": "36.76", "prev": "27.15", "growth": "+35.4%", "difference": "+9.61 Cr"}},
-  "gross_profit": {{"curr": "14.24", "prev": "7.75", "growth": "+83.7%", "difference": "+6.49 Cr"}},
-  "net_profit": {{"curr": "11.27", "prev": "6.89", "growth": "+63.6%", "difference": "+4.38 Cr"}},
+  "revenue": {json.dumps(scr_defaults['revenue'])},
+  "gross_profit": {json.dumps(scr_defaults['gross_profit'])},
+  "net_profit": {json.dumps(scr_defaults['net_profit'])},
   "debt_comparison": {{"curr": "{screener_info['curr_debt_num']}", "prev": "{screener_info['prev_debt_num']}"}},
   "order_details": {{
-    "client_or_awarder": "Client or Authority Name",
-    "order_value": "Order Value in Rs. Cr.",
-    "order_to_mcap_ratio": "Order Value as % of Market Cap in English",
+    "client_or_awarder": "Client or Authority Name from filing",
+    "order_value": "Order Value in Rs. Cr. from filing",
+    "order_to_mcap_ratio": "Order Value as % of Market Cap ({screener_info['market_cap']}) in English",
     "scope_of_work": "Project scope in English",
     "execution_timeline": "Timeline in English"
   }},
@@ -955,55 +997,55 @@ Return ONLY a valid JSON object with this exact structure:
   "total_debt": "{screener_info['total_debt']}",
   "debt_to_equity": "{screener_info['debt_to_equity']}",
   "face_value": "{screener_info['face_value']}",
-  "fundamental_impact_note": "1-2 sentences in 100% English explaining what changed in the fundamentals.",
-  "estimated_stock_return": "Estimated % return / outlook in 100% English (e.g. +8.0% to +12.5% Bullish Momentum)",
-  "intraday_signal": "1-2 sentences in 100% English explaining technical/positional sentiment.",
-  "quarter_chart_labels": ["Jun 25", "Sep 25", "Dec 25", "Mar 26", "Jun 26", "Sep 26"],
-  "quarter_chart_revenue": [24.1, 27.15, 26.04, 28.31, 30.8, 36.76],
-  "quarter_chart_gross_profit": [7.1, 7.75, 7.9, 8.6, 10.2, 14.24],
-  "quarter_chart_net_profit": [5.45, 6.89, 5.83, 7.51, 9.02, 11.27],
+  "fundamental_impact_note": "1-2 sentences in 100% English explaining what changed in {c_clean_name}'s fundamentals.",
+  "estimated_stock_return": "Estimated % return / outlook in 100% English (e.g. +8.0% to +12.5% Positional Outlook)",
+  "intraday_signal": "1-2 sentences in 100% English explaining technical/positional sentiment for {c_clean_name}.",
+  "quarter_chart_labels": {json.dumps(screener_info['q_labels'])},
+  "quarter_chart_revenue": {json.dumps(screener_info['q_rev'])},
+  "quarter_chart_gross_profit": {json.dumps(screener_info['q_gp'])},
+  "quarter_chart_net_profit": {json.dumps(screener_info['q_np'])},
   "key_highlights": [
-    "Bullet 1 in 100% English: Core top-line revenue or order book milestone with exact figures.",
-    "Bullet 2 in 100% English: Operating margin and Consolidated PAT expansion/contraction.",
+    "Bullet 1 in 100% English: Core top-line revenue or order book milestone for {c_clean_name} with exact figures.",
+    "Bullet 2 in 100% English: Operating margin and Consolidated PAT performance.",
     "Bullet 3 in 100% English: Balance sheet strength, Total Debt ({screener_info['total_debt']}) and Debt-to-Equity ({screener_info['debt_to_equity']}).",
     "Bullet 4 in 100% English: Valuation comparison between Stock P/E ({screener_info['pe_ratio']}) and Industry P/E ({screener_info['industry_pe']})."
   ],
   "web_story_hook": [
-    "Provide a highly engaging, unique punchy visual hook bullet 1 about {company_title} profit/growth.",
-    "Provide visual hook bullet 2 focusing on debt/valuation.",
-    "Provide visual hook bullet 3 on market momentum.",
-    "Provide visual hook bullet 4 on investor sentiment."
+    "Unique punchy visual hook bullet 1 about {c_clean_name}'s exact revenue/profit or order win.",
+    "Unique visual hook bullet 2 focusing on {c_clean_name}'s {screener_info['debt_to_equity']} debt-to-equity and {screener_info['roe']} ROE.",
+    "Unique visual hook bullet 3 on {c_clean_name}'s valuation (P/E {screener_info['pe_ratio']} vs Industry P/E {screener_info['industry_pe']}).",
+    "Unique visual hook bullet 4 on investor sentiment around {screener_info['price_str']}."
   ],
   "seo_article_sections": [
     {{
       "heading": "Operational Performance & YoY Earnings Breakdown",
-      "body": "130-150 words of 100% original, copyright-free financial journalism in English analyzing the exact numbers from the filing, YoY trajectory, and operational efficiency."
+      "body": "130-150 words of 100% original financial journalism in English analyzing {c_clean_name}'s exact numbers, YoY trajectory, and operational efficiency."
     }},
     {{
       "heading": "Fundamental Valuation, ROE & Balance Sheet Health",
-      "body": "130-150 words in 100% English analyzing Market Cap, Stock P/E vs Industry P/E, ROE, EPS, Book Value, Debt-to-Equity, and whether the stock looks undervalued or richly priced."
+      "body": "130-150 words in 100% English analyzing {c_clean_name}'s Market Cap ({screener_info['market_cap']}), Stock P/E ({screener_info['pe_ratio']}) vs Industry P/E ({screener_info['industry_pe']}), ROE ({screener_info['roe']}), Book Value ({screener_info['book_value']}), and Debt-to-Equity ({screener_info['debt_to_equity']})."
     }},
     {{
       "heading": "Market Outlook & Key Triggers for Investors",
-      "body": "100-120 words in 100% English discussing medium-term growth catalysts, execution risks, and what retail investors should track next."
+      "body": "100-120 words in 100% English discussing medium-term growth catalysts, execution risks, and what retail investors should track next for {c_clean_name}."
     }}
   ],
   "faqs": [
     {{
-      "q": "Why {company_title} share price is falling/rising after Q2 results?",
-      "a": "Direct answer in 100% English with exact numbers."
+      "q": "Why is {c_clean_name} share price in focus after latest quarterly results?",
+      "a": "Direct answer in 100% English with {c_clean_name}'s exact numbers."
     }},
     {{
-      "q": "What is the dividend record date or debt situation for {company_title}?",
-      "a": "Direct answer in 100% English."
+      "q": "What is the debt situation and Debt-to-Equity ratio of {c_clean_name}?",
+      "a": "Direct answer in 100% English citing Total Debt of {screener_info['total_debt']} and Debt-to-Equity of {screener_info['debt_to_equity']}."
     }},
     {{
-      "q": "Is {company_title} share a good buy for long term based on its {screener_info['debt_to_equity']} Debt-to-Equity and ROE?",
+      "q": "Is {c_clean_name} share a good buy for long term based on its P/E ({screener_info['pe_ratio']}) and ROE ({screener_info['roe']})?",
       "a": "Direct answer in 100% English citing valuation and ROE."
     }}
   ],
-  "gujarati_summary": "2-3 sentences in natural Gujarati summarizing the Consolidated result (YoY) or new order.",
-  "gujarati_intraday_view": "1-2 sentences in natural Gujarati explaining debt, valuation, and expected return."
+  "gujarati_summary": "2-3 sentences in natural Gujarati summarizing {c_clean_name}'s exact Consolidated result (YoY) or new order.",
+  "gujarati_intraday_view": "1-2 sentences in natural Gujarati explaining {c_clean_name}'s debt, valuation, and expected return."
 }}
 
 Extracted Text from Filing:
@@ -1018,13 +1060,13 @@ Extracted Text from Filing:
             try:
                 parsed = json.loads(match.group(0))
                 if doc_type == "result":
-                    parsed = ensure_valid_result_numbers(parsed, screener_info)
+                    parsed = ensure_valid_result_numbers(parsed, screener_info, pdf_text_len)
                 return parsed
             except Exception as exc:
                 log.warning("JSON parse warning, using smart fallback: %s", exc)
 
     log.info("Using Smart Auto-Fallback data for %s", company_title)
-    return build_smart_fallback_data(company_title, scrip_code, doc_type, source_text, screener_info)
+    return build_smart_fallback_data(company_title, scrip_code, doc_type, source_text, screener_info, pdf_text_len)
 
 
 # ---------------- VISUAL CHARTS BUILDER ----------------
@@ -1081,9 +1123,9 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
     ist_time_str = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%B %d, %Y | %I:%M %p IST")
 
     price_disp = html.escape(str(data.get("price_display", screener_info["price_str"])))
-    qtr_lbl = html.escape(str(data.get("quarter_label", "Q2 FY26-27")))
-    curr_lbl = html.escape(str(data.get("curr_period_label", "Sep 26")))
-    prev_lbl = html.escape(str(data.get("prev_period_label", "Sep 25")))
+    qtr_lbl = html.escape(str(data.get("quarter_label", "Quarterly")))
+    curr_lbl = html.escape(str(data.get("curr_period_label", "Current")))
+    prev_lbl = html.escape(str(data.get("prev_period_label", "Previous")))
     res_type = html.escape(str(data.get("result_type", "Consolidated")))
 
     mkt_cap = html.escape(str(data.get("market_cap") or screener_info["market_cap"]))
@@ -1355,7 +1397,7 @@ def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, 
     comp_name = html.escape(str(data.get("company_short_name", "Company")))
     res_date = html.escape(str(data.get("result_date", "")))
     price_disp = html.escape(str(data.get("price_display", screener_info["price_str"])))
-    qtr_lbl = html.escape(str(data.get("quarter_label", "Q2 FY26-27")))
+    qtr_lbl = html.escape(str(data.get("quarter_label", "Quarterly")))
     curr_lbl = html.escape(str(data.get("curr_period_label", "Current")))
     prev_lbl = html.escape(str(data.get("prev_period_label", "Previous")))
     mkt_cap = html.escape(str(data.get("market_cap") or screener_info["market_cap"]))
@@ -1638,9 +1680,14 @@ def run():
         try:
             screener_info = get_screener_fundamentals(item["title"])
 
-            # ₹1,000 Cr થી ઓછી માર્કેટ કેપ વાળી પેની કંપનીઓને સ્કીપ કરો
-            if not screener_info["is_mid_large_cap"] and screener_info["market_cap_num"] > 0:
-                log.info("Skipping Small/Penny Cap Company (Market Cap: %s < ₹1,000 Cr): %s", screener_info["market_cap"], item["title"])
+            # માત્ર પેની સ્ટોક્સ (Mkt Cap < ₹100 Cr અથવા Share Price < ₹10) સ્કીપ થશે; બધા સ્મોલ/મિડ/લાર્જ કેપ લેવાશે
+            if not screener_info["is_eligible_stock"]:
+                log.info(
+                    "Skipping Penny/Unlisted Stock (Market Cap: %s, Price: %s): %s",
+                    screener_info["market_cap"],
+                    screener_info["price_str"],
+                    item["title"],
+                )
                 continue
 
             if screener_info.get("screener_company_name"):
@@ -1649,15 +1696,15 @@ def run():
                     log.info("Skipping duplicate [Screener Match: %s]: %s", scr_comp_key, item["title"])
                     continue
 
-            source_text, pdf_bytes = get_document_payload(item)
+            source_text, pdf_bytes, pdf_text_len = get_document_payload(item)
             file_key = extract_file_key(item["link"]) or file_key
 
-            if doc_type == "result" and not pdf_bytes and not screener_info["q_all_rev"] and len(source_text) < 120:
-                log.warning("Skipped: no PDF and no Screener quarterly data for %s", item["title"])
+            if doc_type == "result" and not screener_info["q_all_rev"] and pdf_text_len < 200:
+                log.warning("Skipped: no readable PDF numbers and no Screener quarterly data for %s", item["title"])
                 continue
 
             ai_data = analyze_with_gemini_json(
-                item["title"], scrip_code, doc_type, source_text, pdf_bytes, screener_info
+                item["title"], scrip_code, doc_type, source_text, pdf_bytes, screener_info, pdf_text_len
             )
 
             ai_comp_name = str(ai_data.get("company_short_name") or "").strip()
@@ -1695,7 +1742,7 @@ def run():
             if file_key:
                 blog_state["file_keys"].add(file_key)
 
-            time.sleep(5)
+            time.sleep(4)
         except Exception:
             log.exception("Item processing failed: %s", item["title"])
 
