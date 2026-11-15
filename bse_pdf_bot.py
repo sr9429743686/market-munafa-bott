@@ -64,7 +64,7 @@ RATE_WINDOW_SECONDS = 60.0
 
 # ---------------- QUALITY, ADSENSE & GOOGLE NEWS FILTERS ----------------
 MIN_MARKET_CAP_CR = float(os.getenv("MIN_MARKET_CAP_CR", "75.0"))
-MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "6"))  # હાઇ-ક્વોલિટી અને AdSense સેફ્ટી માટે એક રનમાં મહત્તમ 6 શ્રેષ્ઠ પોસ્ટ
+MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "6"))
 
 FEEDS = {
     "result": "https://www.bseindia.com/Data/XML/FinancialResultsFeed.aspx",
@@ -220,11 +220,15 @@ def translate_text_indic(text, target_lang):
 
 def build_multilang_pack(data):
     lead_en = str(data.get("seo_lead_summary") or "")
+    hooks_en = data.get("web_story_hook") or []
+    if isinstance(hooks_en, str):
+        hooks_en = [hooks_en]
     highlights_en = data.get("key_highlights") or []
     sections_en = data.get("seo_article_sections") or []
     faqs_en = data.get("faqs") or []
 
     batch_items = [lead_en]
+    batch_items.extend([str(h) for h in hooks_en[:4]])
     batch_items.extend([str(k) for k in highlights_en[:4]])
     for sec in sections_en[:3]:
         batch_items.append(str(sec.get("heading", "")))
@@ -245,6 +249,11 @@ def build_multilang_pack(data):
         idx = 0
         l_lead = parts[idx] if idx < len(parts) else lead_en
         idx += 1
+
+        l_hooks = []
+        for _ in hooks_en[:4]:
+            l_hooks.append(parts[idx] if idx < len(parts) else "")
+            idx += 1
 
         l_high = []
         for _ in highlights_en[:4]:
@@ -267,6 +276,7 @@ def build_multilang_pack(data):
 
         lang_packs[lang_code] = {
             "lead": l_lead,
+            "hooks": l_hooks,
             "highlights": l_high,
             "sections": l_secs,
             "faqs": l_faqs,
@@ -1208,7 +1218,7 @@ Supplementary Extracted Text from Filing (if any):
 
 
 # ==========================================
-# 9. VISUAL CHARTS & TEXT-FIRST ADSENSE-SAFE HTML BUILDER
+# 9. VISUAL CHARTS & 5-LANGUAGE SWITCHER (TEXT & HIGHLIGHTS FIRST)
 # ==========================================
 def build_quarterly_column_chart_url(comp_name, labels, rev_list, gp_list, np_list):
     datasets = [
@@ -1257,42 +1267,60 @@ def build_yoy_comparison_chart_url(comp_name, qtr_lbl, prev_lbl, curr_lbl, rev, 
     return f"https://quickchart.io/chart?w=750&h=420&bkg=white&c={urllib.parse.quote(json.dumps(chart_config))}"
 
 
-def _render_clean_language_details_html(lang_code, summary_btn_label, pack_dict, is_open=False):
-    open_attr = " open" if is_open else ""
-    high_li = "".join(f"<li style='margin-bottom:7px; line-height:1.65;'>{html.escape(str(k))}</li>" for k in pack_dict.get("highlights", []) if k)
+def _render_top_intro_panel_html(lang_code, summary_label, highlight_label, badge_title, lead_txt, high_list, hooks_list):
+    """
+    ભાષાના બટનની તરત જ નીચે (ફોટો અને ટેબલની પહેલાં) લખાણ અને મુખ્ય હાઇલાઇટ્સ બતાવે છે.
+    """
+    high_li = "".join(f"<li style='margin-bottom:8px; color:#1e293b; line-height:1.65;'>{html.escape(str(k))}</li>" for k in high_list if k)
+    hook_li = "".join(f"<li style='margin-bottom:8px;'>{html.escape(str(h))}</li>" for h in hooks_list if h)
+
+    return f"""
+    <div class="mm-top-panel mm-top-{lang_code}" lang="{lang_code}">
+      <p style="font-size: 15.5px; line-height: 1.75; color: #0f172a; background: #f8fafc; padding: 14px 16px; border-radius: 10px; border-left: 4px solid #2563eb; border: 1px solid #cbd5e1; border-left-width: 5px; margin-bottom: 16px;">
+        <strong>{summary_label}:</strong> {html.escape(str(lead_txt))}
+      </p>
+      <div style="background: #f8fafc; border-left: 5px solid #16a34a; border-radius: 10px; padding: 14px 18px; margin-bottom: 18px; border: 1px solid #e2e8f0; border-left-width: 5px;">
+        <h2 style="margin: 0 0 8px 0; font-size: 17.5px; color: #0f172a;">📌 {highlight_label}</h2>
+        <ul style="margin: 0; padding-left: 18px; font-size: 14.5px; font-weight: 500;">{high_li}</ul>
+      </div>
+      <div style="background: linear-gradient(135deg, #1e3a8a, #2563eb); color: white; border-radius: 14px; padding: 16px 18px; margin-bottom: 20px; box-shadow: 0 4px 12px rgba(37, 99, 235, 0.2);">
+        <h3 style="margin: 0 0 10px 0; font-size: 17px; border-bottom: 1px solid #93c5fd; padding-bottom: 6px; color: white;">⚡ {badge_title}</h3>
+        <ul style="margin: 0; padding-left: 18px; font-size: 14px; font-weight: 500; line-height: 1.65;">{hook_li}</ul>
+      </div>
+    </div>
+    """
+
+
+def _render_bottom_analysis_panel_html(lang_code, faq_label, sections_list, faqs_list):
+    """
+    ટેબલ અને ચાર્ટ્સની નીચે તે જ સિલેક્ટ કરેલી ભાષામાં ઊંડાણપૂર્વકનું વિશ્લેષણ અને FAQs બતાવે છે.
+    """
     sec_html = ""
-    for s in pack_dict.get("sections", []):
+    for s in sections_list:
         if s.get("body"):
             sec_html += (
-                f"<h3 style='font-size:17px; color:#0f172a; margin:16px 0 6px 0;'>📝 {html.escape(str(s.get('heading', '')))}</h3>"
-                f"<p style='color:#334155; font-size:15px; line-height:1.75; margin-bottom:12px;'>{html.escape(str(s.get('body', '')))}</p>"
+                f"<h2 style='font-size:18px; color:#0f172a; margin:20px 0 8px 0;'>📝 {html.escape(str(s.get('heading', '')))}</h2>"
+                f"<p style='color:#334155; font-size:15px; line-height:1.75; margin-bottom:14px;'>{html.escape(str(s.get('body', '')))}</p>"
             )
+
     faq_html = ""
-    for fq in pack_dict.get("faqs", []):
-        if fq.get("q") and fq.get("a"):
+    for f_item in faqs_list:
+        if f_item.get("q") and f_item.get("a"):
             faq_html += (
-                f"<p style='margin:10px 0 4px 0; font-weight:700; color:#0f172a; font-size:14.5px;'>❓ {html.escape(str(fq['q']))}</p>"
-                f"<p style='margin:0 0 10px 0; color:#334155; font-size:14px; line-height:1.65;'>{html.escape(str(fq['a']))}</p>"
+                f"<details style='background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:12px 14px; margin-bottom:10px;'>"
+                f"<summary style='font-weight:600; color:#0f172a; cursor:pointer; font-size:14px;'>❓ {html.escape(str(f_item['q']))}</summary>"
+                f"<p style='margin:10px 0 0 0; color:#334155; font-size:14px; line-height:1.65;'>{html.escape(str(f_item['a']))}</p>"
+                f"</details>"
             )
 
     return f"""
-    <details{open_attr} lang="{lang_code}" style="background:#ffffff; border:2px solid #bfdbfe; border-radius:12px; padding:14px 16px; margin-bottom:14px; box-shadow:0 2px 6px rgba(0,0,0,0.03);">
-      <summary style="font-weight:700; font-size:16px; color:#1e3a8a; cursor:pointer; outline:none;">
-        {summary_btn_label}
-      </summary>
-      <div style="margin-top:14px; border-top:1px solid #e2e8f0; padding-top:12px;">
-        <p style="font-size:15px; line-height:1.75; color:#0f172a; background:#f8fafc; padding:12px; border-radius:8px; border-left:4px solid #2563eb; margin-bottom:14px;">
-          {html.escape(str(pack_dict.get("lead", "")))}
-        </p>
-        <ul style="margin:0 0 14px 0; padding-left:18px; font-size:14.5px; color:#1e293b;">
-          {high_li}
-        </ul>
-        {sec_html}
-        <div style="background:#f8fafc; border-radius:8px; padding:12px; margin-top:12px;">
-          {faq_html}
-        </div>
+    <div class="mm-bot-panel mm-bot-{lang_code}" lang="{lang_code}">
+      {sec_html}
+      <div style="margin: 22px 0;">
+        <h3 style="font-size: 18px; color: #0f172a; margin-bottom: 12px;">❓ {faq_label}</h3>
+        {faq_html}
       </div>
-    </details>
+    </div>
     """
 
 
@@ -1325,65 +1353,13 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
     fund_impact = html.escape(str(data.get("fundamental_impact_note", "")))
     intraday_sig = html.escape(str(data.get("intraday_signal", "")))
 
-    raw_lead = str(data.get("seo_lead_summary") or "").strip()
-    lead_html = html.escape(raw_lead)
-    guj_lead = html.escape(str(data.get("gujarati_summary") or ""))
-    guj_view = html.escape(str(data.get("gujarati_intraday_view") or ""))
-
     seed_int = int(hashlib.md5((comp_name + res_date).encode("utf-8")).hexdigest()[:6], 16)
+    uid = str(seed_int)[:5]
     thumb_prompt = f"modern 3d financial stock market analytics chart infographic upward trend corporate building india {comp_name}"
     thumb_url = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(thumb_prompt)}?width=1200&height=675&seed={seed_int}&nologo=true"
 
-    # =========================================================================
-    # STEP 1: TEXT & HIGHLIGHTS FIRST (CRITICAL FOR GOOGLE #1, ADSENSE & NEWS)
-    # =========================================================================
-    highlights = data.get("key_highlights") or []
-    high_li_html = "".join(f"<li style='margin-bottom: 8px; color: #1e293b; line-height: 1.65;'>{html.escape(str(h))}</li>" for h in highlights if h)
-    top_highlights_box = f"""
-    <div style="background: #f8fafc; border-left: 4px solid #16a34a; border-radius: 10px; padding: 16px 18px; margin-bottom: 20px; border: 1px solid #e2e8f0; border-left-width: 5px;">
-      <h2 style="margin: 0 0 10px 0; font-size: 18px; color: #0f172a;">📌 {comp_name} Key Financial Highlights (At a Glance)</h2>
-      <ul style="margin: 0; padding-left: 18px; font-size: 15px; font-weight: 500;">
-        {high_li_html}
-      </ul>
-    </div>
-    """ if high_li_html else ""
-
-    web_story_hooks = data.get("web_story_hook") or []
-    if isinstance(web_story_hooks, str):
-        web_story_hooks = [web_story_hooks]
-    hook_list = "".join(f"<li style='margin-bottom:8px;'>{html.escape(str(h))}</li>" for h in web_story_hooks if h)
-    web_story_box = f"""
-    <div style="background: linear-gradient(135deg, #1e3a8a, #2563eb); color: white; border-radius: 14px; padding: 16px 20px; margin-bottom: 22px; box-shadow: 0 4px 12px rgba(37, 99, 235, 0.2);">
-      <h2 style="margin: 0 0 10px 0; font-size: 18px; border-bottom: 1px solid #93c5fd; padding-bottom: 8px; color: white;">⚡ {comp_name} Quick Investor Takeaways</h2>
-      <ul style="margin: 0; padding-left: 18px; font-size: 14.5px; font-weight: 500; line-height: 1.65;">
-        {hook_list}
-      </ul>
-    </div>
-    """ if hook_list else ""
-
-    # =========================================================================
-    # STEP 2: MULTI-LANGUAGE SELECTOR BAR AT TOP (CLEAN SEMANTIC HTML5)
-    # =========================================================================
-    lang_packs = build_multilang_pack(data)
-    if guj_lead:
-        lang_packs["gu"]["lead"] = f"{guj_lead} {guj_view}".strip()
-
-    multilang_top_section = f"""
-    <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 14px; padding: 14px; margin-bottom: 24px;">
-      <div style="font-size: 14px; font-weight: 700; color: #1e3a8a; margin-bottom: 10px;">
-        🌐 તમારી ભાષામાં સંપૂર્ણ રિપોર્ટ વાંચો (Select Your Language):
-      </div>
-      {_render_clean_language_details_html("gu", "🇮🇳 ગુજરાતીમાં સંપૂર્ણ વિશ્લેષણ અને ટાર્ગેટ વાંચો (Gujarati - Open)", lang_packs["gu"], is_open=True)}
-      {_render_clean_language_details_html("hi", "🇮🇳 हिंदी में संपूर्ण विश्लेषण और शेयर टारगेट पढ़ें (Click for Hindi)", lang_packs["hi"], is_open=False)}
-      {_render_clean_language_details_html("te", "🇮🇳 తెలుగులో పూర్తి విశ్లేషణ & షేర్ టార్గెట్ చదవండి (Click for Telugu)", lang_packs["te"], is_open=False)}
-      {_render_clean_language_details_html("ta", "🇮🇳 தமிழில் முழுமையான பகுப்பாய்வு மற்றும் இலக்கு (Click for Tamil)", lang_packs["ta"], is_open=False)}
-    </div>
-    """
-
-    # =========================================================================
-    # STEP 3: FINANCIAL TABLES, VALUATION TARGETS & CHARTS
-    # =========================================================================
-    data_and_chart_blocks = []
+    # 1. UNIVERSAL ENGLISH FINANCIAL TABLES & CHARTS (PLACED BELOW INTRO TEXT & HIGHLIGHTS)
+    universal_data_blocks = []
 
     if doc_type == "order":
         ord_info = data.get("order_details", {}) or {}
@@ -1398,7 +1374,7 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
           <p style="margin: 8px 0; font-size: 15px;"><strong>Execution Timeline:</strong> {html.escape(str(ord_info.get("execution_timeline", "As per contract terms")))}</p>
         </div>
         """
-        data_and_chart_blocks.append(order_card)
+        universal_data_blocks.append(order_card)
         yoy_chart_url = ""
     else:
         rev = data.get("revenue", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
@@ -1471,21 +1447,21 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
           <img src="{quarter_chart_url}" alt="{comp_name} Quarterly Profit Trend" width="750" height="420" loading="lazy" style="max-width: 100%; height: auto; border-radius: 8px;" />
         </div>
         """
-        data_and_chart_blocks.append(result_card)
+        universal_data_blocks.append(result_card)
 
     if screener_info.get("target_2026") and screener_info["target_2026"] != "N/A":
         target_table_card = f"""
         <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 16px; padding: 16px; margin-bottom: 24px; box-sizing: border-box;">
           <h2 style="margin: 0 0 10px 0; font-size: 18px; color: #166534;">🎯 {comp_name} Share Price Target 2026, 2027 to 2030</h2>
           <p style="margin: 0 0 12px 0; font-size: 13.5px; color: #15803d;">
-            Based on {comp_name}'s EPS of <strong>{eps}</strong>, ROE of <strong>{roe}</strong>, Book Value of <strong>{book_value}</strong>, and Stock P/E of <strong>{pe_ratio}</strong>:
+            EPS: <strong>{eps}</strong> | ROE: <strong>{roe}</strong> | Book Value: <strong>{book_value}</strong> | Stock P/E: <strong>{pe_ratio}</strong>
           </p>
           <table style="width: 100%; border-collapse: collapse; font-size: 13px; background: #ffffff; border-radius: 8px; overflow: hidden;">
             <thead>
               <tr style="background: #dcfce7; color: #14532d; font-weight: 700;">
                 <th style="padding: 8px; text-align: left; border: 1px solid #bbf7d0;">Timeline</th>
                 <th style="padding: 8px; text-align: right; border: 1px solid #bbf7d0;">Valuation Band</th>
-                <th style="padding: 8px; text-align: left; border: 1px solid #bbf7d0;">Key Driver</th>
+                <th style="padding: 8px; text-align: left; border: 1px solid #bbf7d0;">Catalyst</th>
               </tr>
             </thead>
             <tbody>
@@ -1509,7 +1485,7 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
           <p style="margin: 8px 0 0 0; font-size: 12px; color: #475569;"><em>*Educational valuation estimates based on earnings multiples, not investment advice.</em></p>
         </div>
         """
-        data_and_chart_blocks.append(target_table_card)
+        universal_data_blocks.append(target_table_card)
 
     fundamentals_card = f"""
     <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 16px; box-shadow: 0 4px 14px rgba(0,0,0,0.05); margin-bottom: 24px; box-sizing: border-box;">
@@ -1541,40 +1517,155 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
       <p style="margin: 10px 0 0 0; font-size: 13.5px; color: #334155;"><strong>Technical &amp; Fundamental View:</strong> {intraday_sig} {fund_impact}</p>
     </div>
     """
-    data_and_chart_blocks.append(fundamentals_card)
+    universal_data_blocks.append(fundamentals_card)
 
-    # =========================================================================
-    # STEP 4: DEEP ENGLISH EDITORIAL ANALYSIS & FAQs (FOR UNIVERSAL GOOGLE SEO)
-    # =========================================================================
-    sections = data.get("seo_article_sections") or []
-    article_html_parts = []
-    if sections and isinstance(sections, list):
-        for sec in sections:
-            if isinstance(sec, dict):
-                h_txt = html.escape(str(sec.get("heading", "Financial & Valuation Analysis")))
-                b_txt = html.escape(str(sec.get("body", "")))
-                if b_txt:
-                    article_html_parts.append(
-                        f"<h2 style='font-size: 18px; color: #0f172a; margin: 22px 0 10px 0;'>📝 {h_txt}</h2>"
-                        f"<p style='color:#334155; font-size:15px; line-height:1.75; margin-bottom:16px;'>{b_txt}</p>"
-                    )
+    # 2. GENERATE 5-LANGUAGE PACKS (GUJARATI, HINDI, TELUGU, TAMIL & ENGLISH)
+    lang_packs = build_multilang_pack(data)
 
-    faqs = data.get("faqs") or []
-    faq_html_items = []
+    # TOP PANELS (Text, Highlights & Web Story Summary BEFORE the image & tables)
+    top_gu = _render_top_intro_panel_html(
+        "gu",
+        "સારાંશ (Executive Summary)",
+        "રોકાણકારો માટે મુખ્ય નાણાકીય હાઇલાઇટ્સ",
+        f"{comp_name} ક્વિક હાઇલાઇટ્સ (ગુજરાતી સારાંશ)",
+        lang_packs["gu"]["lead"],
+        lang_packs["gu"]["highlights"],
+        lang_packs["gu"]["hooks"],
+    )
+    top_hi = _render_top_intro_panel_html(
+        "hi",
+        "सारांश (Executive Summary)",
+        "निवेशकों के लिए प्रमुख वित्तीय हाइलाइट्स",
+        f"{comp_name} मुख्य हाइलाइट्स (हिंदी सारांश)",
+        lang_packs["hi"]["lead"],
+        lang_packs["hi"]["highlights"],
+        lang_packs["hi"]["hooks"],
+    )
+    top_en = _render_top_intro_panel_html(
+        "en",
+        "Executive Summary",
+        "Key Financial Highlights for Investors",
+        f"{comp_name} Quick Highlights (Web Story Summary)",
+        data.get("seo_lead_summary", ""),
+        data.get("key_highlights", []),
+        data.get("web_story_hook", []),
+    )
+    top_te = _render_top_intro_panel_html(
+        "te",
+        "సారాంశం (Executive Summary)",
+        "పెట్టుబడిదారులకు కీలక ఆర్థిక అంశాలు",
+        f"{comp_name} ముఖ్యాంశాలు (తెలుగు సారాంశం)",
+        lang_packs["te"]["lead"],
+        lang_packs["te"]["highlights"],
+        lang_packs["te"]["hooks"],
+    )
+    top_ta = _render_top_intro_panel_html(
+        "ta",
+        "சுருக்கம் (Executive Summary)",
+        "முதலீட்டாளர்களுக்கான முக்கிய நிதி அம்சங்கள்",
+        f"{comp_name} முக்கிய சிறப்பம்சங்கள் (தமிழ் சுருக்கம்)",
+        lang_packs["ta"]["lead"],
+        lang_packs["ta"]["highlights"],
+        lang_packs["ta"]["hooks"],
+    )
+
+    # BOTTOM PANELS (Deep Article Analysis & FAQs BELOW the tables & charts)
+    bot_gu = _render_bottom_analysis_panel_html("gu", f"{comp_name} શેર વિશે વારંવાર પૂછાતા પ્રશ્નો (FAQs)", lang_packs["gu"]["sections"], lang_packs["gu"]["faqs"])
+    bot_hi = _render_bottom_analysis_panel_html("hi", f"{comp_name} शेयर से जुड़े महत्वपूर्ण प्रश्न (FAQs)", lang_packs["hi"]["sections"], lang_packs["hi"]["faqs"])
+    bot_en = _render_bottom_analysis_panel_html("en", f"Frequently Asked Questions ({comp_name} Share FAQs)", data.get("seo_article_sections", []), data.get("faqs", []))
+    bot_te = _render_bottom_analysis_panel_html("te", f"{comp_name} షేర్ తరచుగా అడిగే ప్రశ్నలు (FAQs)", lang_packs["te"]["sections"], lang_packs["te"]["faqs"])
+    bot_ta = _render_bottom_analysis_panel_html("ta", f"{comp_name} பங்கு அடிக்கடி கேட்கப்படும் கேள்விகள் (FAQs)", lang_packs["ta"]["sections"], lang_packs["ta"]["faqs"])
+
+    # Pure CSS Language Switcher at the very top, followed by Text & Highlights FIRST, then Image, Tables & Deep Analysis
+    switcher_css_and_html = f"""
+    <style>
+      .mm-lang-wrap-{uid} input[type="radio"] {{ display: none !important; }}
+      .mm-lang-bar-{uid} {{
+        display: flex; flex-wrap: wrap; gap: 6px; background: #eff6ff; padding: 10px;
+        border-radius: 12px; border: 1px solid #bfdbfe; margin-bottom: 16px; align-items: center;
+      }}
+      .mm-lang-bar-{uid} label {{
+        cursor: pointer; padding: 7px 13px; border-radius: 20px; font-size: 13.5px; font-weight: 700;
+        background: #ffffff; color: #1e3a8a; border: 1px solid #93c5fd; transition: all 0.2s ease;
+        user-select: none; box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+      }}
+      .mm-lang-wrap-{uid} .mm-top-panel,
+      .mm-lang-wrap-{uid} .mm-bot-panel {{ display: none; }}
+      #mm-gu-{uid}:checked ~ .mm-lang-bar-{uid} label[for="mm-gu-{uid}"],
+      #mm-hi-{uid}:checked ~ .mm-lang-bar-{uid} label[for="mm-hi-{uid}"],
+      #mm-en-{uid}:checked ~ .mm-lang-bar-{uid} label[for="mm-en-{uid}"],
+      #mm-te-{uid}:checked ~ .mm-lang-bar-{uid} label[for="mm-te-{uid}"],
+      #mm-ta-{uid}:checked ~ .mm-lang-bar-{uid} label[for="mm-ta-{uid}"] {{
+        background: #1d4ed8 !important; color: #ffffff !important; border-color: #1e40af !important;
+        box-shadow: 0 3px 8px rgba(29, 78, 216, 0.3);
+      }}
+      #mm-gu-{uid}:checked ~ .mm-top-panels-{uid} .mm-top-gu,
+      #mm-gu-{uid}:checked ~ .mm-bot-panels-{uid} .mm-bot-gu {{ display: block !important; }}
+      #mm-hi-{uid}:checked ~ .mm-top-panels-{uid} .mm-top-hi,
+      #mm-hi-{uid}:checked ~ .mm-bot-panels-{uid} .mm-bot-hi {{ display: block !important; }}
+      #mm-en-{uid}:checked ~ .mm-top-panels-{uid} .mm-top-en,
+      #mm-en-{uid}:checked ~ .mm-bot-panels-{uid} .mm-bot-en {{ display: block !important; }}
+      #mm-te-{uid}:checked ~ .mm-top-panels-{uid} .mm-top-te,
+      #mm-te-{uid}:checked ~ .mm-bot-panels-{uid} .mm-bot-te {{ display: block !important; }}
+      #mm-ta-{uid}:checked ~ .mm-top-panels-{uid} .mm-top-ta,
+      #mm-ta-{uid}:checked ~ .mm-bot-panels-{uid} .mm-bot-ta {{ display: block !important; }}
+    </style>
+
+    <div class="mm-lang-wrap-{uid}">
+      <input type="radio" name="mm-lang-{uid}" id="mm-gu-{uid}" checked="checked" />
+      <input type="radio" name="mm-lang-{uid}" id="mm-hi-{uid}" />
+      <input type="radio" name="mm-lang-{uid}" id="mm-en-{uid}" />
+      <input type="radio" name="mm-lang-{uid}" id="mm-te-{uid}" />
+      <input type="radio" name="mm-lang-{uid}" id="mm-ta-{uid}" />
+
+      <div class="mm-lang-bar-{uid}">
+        <span style="font-size: 13px; font-weight: 700; color: #1e3a8a; margin-right: 4px;">🌐 ભાષા બદલો / Language:</span>
+        <label for="mm-gu-{uid}">🇮🇳 ગુજરાતી</label>
+        <label for="mm-hi-{uid}">🇮🇳 हिन्दी</label>
+        <label for="mm-en-{uid}">🌐 English</label>
+        <label for="mm-te-{uid}">🇮🇳 తెలుగు</label>
+        <label for="mm-ta-{uid}">🇮🇳 தமிழ்</label>
+      </div>
+
+      <!-- STEP 1: TEXT SUMMARY & HIGHLIGHTS FIRST -->
+      <div class="mm-top-panels-{uid}">
+        {top_gu}
+        {top_hi}
+        {top_en}
+        {top_te}
+        {top_ta}
+      </div>
+
+      <!--more-->
+
+      <!-- STEP 2: FEATURE IMAGE AFTER INTRO TEXT & HIGHLIGHTS -->
+      <figure style="margin: 0 0 22px 0; text-align: center;">
+        <img itemprop="image" src="{thumb_url}" alt="{comp_name} Share Price Target 2026 and {qtr_lbl} Results" width="1200" height="675" fetchpriority="high" style="width: 100%; height: auto; aspect-ratio: 16/9; object-fit: cover; border-radius: 12px;" />
+        <figcaption style="font-size: 12px; color: #64748b; margin-top: 6px;">{comp_name} (BSE: {html.escape(str(scrip_code or 'Listed'))}) Share Price Target &amp; Equity Research | MarketMunafa</figcaption>
+      </figure>
+
+      <!-- STEP 3: OFFICIAL BSE PDF RESULTS TABLE, CHARTS & 2026-2030 TARGET TABLE -->
+      {"".join(universal_data_blocks)}
+
+      <!-- STEP 4: DETAILED ANALYSIS & FAQs IN SELECTED LANGUAGE -->
+      <div class="mm-bot-panels-{uid}">
+        {bot_gu}
+        {bot_hi}
+        {bot_en}
+        {bot_te}
+        {bot_ta}
+      </div>
+    </div>
+    """
+
     faq_schema_entities = []
-    for f_item in faqs:
+    for f_item in (data.get("faqs") or []):
         if isinstance(f_item, dict) and f_item.get("q") and f_item.get("a"):
-            q_clean = str(f_item["q"]).strip()
-            a_clean = str(f_item["a"]).strip()
-            faq_html_items.append(
-                f"<details style='background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:12px 14px; margin-bottom:10px;'>"
-                f"<summary style='font-weight:600; color:#0f172a; cursor:pointer; font-size:14px;'>❓ {html.escape(q_clean)}</summary>"
-                f"<p style='margin:10px 0 0 0; color:#334155; font-size:14px; line-height:1.6;'>{html.escape(a_clean)}</p>"
-                f"</details>"
-            )
-            faq_schema_entities.append({"@type": "Question", "name": q_clean, "acceptedAnswer": {"@type": "Answer", "text": a_clean}})
-
-    faq_block_html = f"<div style='margin: 26px 0;'><h2 style='font-size: 18px; color: #0f172a; margin-bottom: 14px;'>❓ Frequently Asked Questions ({comp_name} Share FAQs)</h2>{''.join(faq_html_items)}</div>" if faq_html_items else ""
+            faq_schema_entities.append({
+                "@type": "Question",
+                "name": str(f_item["q"]).strip(),
+                "acceptedAnswer": {"@type": "Answer", "text": str(f_item["a"]).strip()},
+            })
 
     kw_badges = "".join(
         f"<span style='display:inline-block; background:#f1f5f9; color:#334155; border:1px solid #cbd5e1; border-radius:20px; padding:4px 10px; font-size:12px; margin:3px;'>{html.escape(k)}</span>"
@@ -1614,31 +1705,13 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
 
     meta_comment = f"<!-- MM_META:type={doc_type}|comp_key={comp_key}|scrip={scrip_key}|file={file_key}|comp_name={comp_name} -->"
 
-    # NOTICE: Executive Summary & Highlights are placed BEFORE the image so Google Search, Google News & AdSense see rich text first!
     html_body = f"""
     {meta_comment}
     <article itemscope itemtype="https://schema.org/NewsArticle" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 740px; margin: 0 auto; color: #1e293b; box-sizing: border-box;">
       <div style="font-size: 12px; color: #64748b; margin-bottom: 12px; font-weight: 500;">
         📅 Published on: <time itemprop="datePublished" datetime="{iso_time}">{ist_time_str}</time> | By <span itemprop="author">MarketMunafa Equity Research Desk</span>
       </div>
-
-      <p itemprop="description" style="font-size: 15.5px; line-height: 1.75; color: #0f172a; background: #f8fafc; padding: 14px 16px; border-radius: 10px; border: 1px solid #cbd5e1; margin-bottom: 16px;">
-        <strong>Executive Summary:</strong> {lead_html}
-      </p>
-
-      {top_highlights_box}
-      <!--more-->
-      {multilang_top_section}
-
-      <figure style="margin: 0 0 22px 0; text-align: center;">
-        <img itemprop="image" src="{thumb_url}" alt="{comp_name} Share Price Target 2026 and {qtr_lbl} Results" width="1200" height="675" fetchpriority="high" style="width: 100%; height: auto; aspect-ratio: 16/9; object-fit: cover; border-radius: 12px;" />
-        <figcaption style="font-size: 12px; color: #64748b; margin-top: 6px;">{comp_name} (BSE: {html.escape(str(scrip_code or 'Listed'))}) Share Price Target &amp; Equity Research | MarketMunafa</figcaption>
-      </figure>
-
-      {web_story_box}
-      {"".join(data_and_chart_blocks)}
-      {"".join(article_html_parts)}
-      {faq_block_html}
+      {switcher_css_and_html}
       {trending_kw_html}
       {internal_links_html}
       {source_link_html}
@@ -1646,7 +1719,7 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
       <script type="application/ld+json">{faq_schema_json}</script>
       <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 22px 0;" />
       <p style="font-size: 12px; color: #64748b; line-height: 1.5;">
-        <strong>Disclaimer &amp; Editorial Policy:</strong> This independent equity research article on MarketMunafa is 100% originally authored using publicly disclosed BSE corporate filings and fundamental ratios for educational and informational purposes only. Valuation projections are algorithmic estimates based on historical financial multiples and not investment advice. MarketMunafa is not a SEBI-registered investment advisor. Please consult a certified financial planner before making any investment decisions.
+        <strong>Disclaimer &amp; Editorial Policy:</strong> This independent equity research article on MarketMunafa is 100% originally authored in multiple Indian languages using publicly disclosed BSE corporate filings and fundamental ratios for educational purposes only. Valuation projections are algorithmic estimates and not investment advice. We are not SEBI-registered advisors.
       </p>
     </article>
     """
@@ -1884,7 +1957,7 @@ def publish_item(item, doc_type, ai_data, screener_info, trending_kws, item_id, 
         else:
             blog_url = res_url
             mark_posted(item_id, comp_key, scrip_key, file_key, item["title"], source_url)
-            log.info("✅ Published Text-First AdSense-Safe Post (%s): %s", doc_type, blog_url)
+            log.info("✅ Published 5-Language Switcher + Text-First Post (%s): %s", doc_type, blog_url)
             ping_search_engines()
 
     send_telegram_gujarati(ai_data, doc_type, screener_info, blog_url, source_url, yoy_chart_url)
@@ -1892,7 +1965,7 @@ def publish_item(item, doc_type, ai_data, screener_info, trending_kws, item_id, 
 
 
 # ==========================================
-# 11. MAIN RUNNER (ACCURACY + ADSENSE-SAFE PIPELINE)
+# 11. MAIN RUNNER
 # ==========================================
 def run():
     init_db()
