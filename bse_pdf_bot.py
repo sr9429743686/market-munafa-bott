@@ -193,14 +193,11 @@ OPENROUTER_ROTATOR = MultiKeyRotator(
     window_sec=RATE_WINDOW_SECONDS,
 )
 
+
 # ==========================================
 # 3. LIVE GOOGLE AUTOCOMPLETE KEYWORD ENGINE
 # ==========================================
 def fetch_live_google_keywords(company_name):
-    """
-    ગૂગલ સર્ચ બારમાંથી લોકો ખરેખર જે કીવર્ડ્સ (100 થી 10,000+ સર્ચ વોલ્યુમ)
-    સર્ચ કરી રહ્યા છે તે રીઅલ-ટાઇમમાં ખેંચી લાવે છે.
-    """
     short_name = re.sub(r"\b(ltd|limited|india|industries|corp|corporation|pvt)\b", "", company_name, flags=re.I).strip()
     seed_queries = [
         f"{short_name} share ",
@@ -226,7 +223,6 @@ def fetch_live_google_keywords(company_name):
         except Exception:
             pass
 
-    # High-search-volume default retail keywords that always get searched on Google India
     high_vol_defaults = [
         f"{short_name} share price target 2026",
         f"{short_name} share price target 2027 to 2030",
@@ -410,8 +406,54 @@ def fmt_num(val):
 
 
 # ==========================================
-# 5. SCREENER FUNDAMENTALS & VALUATION TARGETS
+# 5. SCREENER FUNDAMENTALS (CONSOLIDATED PRIORITY)
 # ==========================================
+def _extract_quarters_from_soup(soup):
+    q_data = {
+        "quarters_text": "",
+        "q_all_labels": [],
+        "q_all_rev": [],
+        "q_all_gp": [],
+        "q_all_np": [],
+        "q_labels": [],
+        "q_rev": [],
+        "q_gp": [],
+        "q_np": [],
+    }
+    q_sec = soup.find("section", id="quarters")
+    if not q_sec:
+        return q_data
+
+    q_lines, headers = [], []
+    for row in q_sec.find_all("tr"):
+        cols = [" ".join(c.get_text(" ", strip=True).split()) for c in row.find_all(["th", "td"])]
+        if not cols:
+            continue
+        if not headers and len(cols) > 3:
+            headers = cols[1:]
+            q_data["q_all_labels"] = headers
+            q_data["q_labels"] = headers[-6:]
+            continue
+
+        r_title = cols[0].lower().replace("+", "").strip()
+        all_nums = [to_float(c_val) for c_val in cols[1:]]
+        nums = all_nums[-6:]
+
+        if r_title in ("sales", "revenue", "revenue from operations", "interest earned") and any(all_nums):
+            q_data["q_all_rev"], q_data["q_rev"] = all_nums, nums
+            q_lines.append(" | ".join(cols))
+        elif r_title in ("operating profit", "ebitda", "financing profit") and any(all_nums):
+            q_data["q_all_gp"], q_data["q_gp"] = all_nums, nums
+            q_lines.append(" | ".join(cols))
+        elif r_title in ("net profit", "profit after tax") and any(all_nums):
+            q_data["q_all_np"], q_data["q_np"] = all_nums, nums
+            q_lines.append(" | ".join(cols))
+
+    if headers and q_lines:
+        q_data["quarters_text"] = "Quarters Header: " + " | ".join(headers) + "\n" + "\n".join(q_lines)
+    return q_data
+
+
 def get_screener_fundamentals(comp_title, scrip_code=""):
     clean_name = re.sub(r"\(\d+\)", "", comp_title).split("-")[0].strip()
     clean_name = re.sub(r"\b(ltd|limited|india|industries|corp|corporation|pvt)\b", "", clean_name, flags=re.I).strip()
@@ -478,17 +520,37 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
                     if words[0].lower() not in hit_name.lower():
                         continue
 
-                c_res = c_requests.get("https://www.screener.in" + first_hit["url"], impersonate="chrome120", timeout=15)
+                raw_url = str(first_hit["url"]).strip()
+                base_clean_url = re.sub(r"/consolidated/?$", "/", raw_url)
+                cons_url = base_clean_url.rstrip("/") + "/consolidated/"
+
+                # 1. હંમેશા પહેલાં Consolidated પેજ ચેક કરો (જેથી Rajesh Exports જેવા શેરમાં સાચા Consolidated આંકડા જ આવે)
+                c_res = c_requests.get("https://www.screener.in" + cons_url, impersonate="chrome120", timeout=15)
+                if c_res.status_code != 200:
+                    c_res = c_requests.get("https://www.screener.in" + raw_url, impersonate="chrome120", timeout=15)
                 if c_res.status_code != 200:
                     continue
-                page_html = c_res.text
 
+                page_html = c_res.text
                 if scrip_code and f"/{scrip_code}/" not in page_html and f"BSE: {scrip_code}" not in page_html:
                     if q != scrip_code:
                         continue
 
-                info["screener_company_name"] = hit_name
                 soup = BeautifulSoup(c_res.content, "html.parser")
+                q_extracted = _extract_quarters_from_soup(soup)
+
+                # જો Consolidated પેજમાં ત્રિમાસિક આંકડા ખાલી હોય, તો Standalone પેજ પરથી આંકડા લો
+                if not any(q_extracted["q_all_rev"]) and not any(q_extracted["q_all_np"]):
+                    st_res = c_requests.get("https://www.screener.in" + base_clean_url, impersonate="chrome120", timeout=15)
+                    if st_res.status_code == 200:
+                        st_soup = BeautifulSoup(st_res.content, "html.parser")
+                        st_q = _extract_quarters_from_soup(st_soup)
+                        if any(st_q["q_all_rev"]) or any(st_q["q_all_np"]):
+                            soup = st_soup
+                            q_extracted = st_q
+
+                info.update(q_extracted)
+                info["screener_company_name"] = hit_name
 
                 top_ratios = soup.find("ul", id="top-ratios")
                 if top_ratios:
@@ -530,7 +592,6 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
                 if info["market_cap_num"] >= MIN_MARKET_CAP_CR and (info["price_num"] == 0 or info["price_num"] >= MIN_STOCK_PRICE):
                     info["is_eligible_stock"] = True
 
-                # Calculate algorithmic valuation targets (for high-traffic "Share Price Target" searches)
                 if info["price_num"] > 0:
                     p = info["price_num"]
                     info["target_2026"] = f"₹{round(p * 1.15, 1):,} to ₹{round(p * 1.24, 1):,}"
@@ -560,31 +621,6 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
 
                 if info["debt_to_equity"] in ("N/A", "0.00") and borrowings is not None and equity and equity > 0:
                     info["debt_to_equity"] = f"{(borrowings / equity):.2f}"
-
-                q_sec = soup.find("section", id="quarters")
-                if q_sec:
-                    q_lines, headers = [], []
-                    for row in q_sec.find_all("tr"):
-                        cols = [" ".join(c.get_text(" ", strip=True).split()) for c in row.find_all(["th", "td"])]
-                        if not cols:
-                            continue
-                        if not headers and len(cols) > 3:
-                            headers = cols[1:]
-                            info["q_all_labels"] = headers
-                            info["q_labels"] = headers[-6:]
-                        r_title = cols[0].lower()
-                        if any(k in r_title for k in ["sales", "revenue", "operating profit", "ebitda", "net profit", "eps"]):
-                            q_lines.append(" | ".join(cols))
-                            all_nums = [to_float(c_val) for c_val in cols[1:]]
-                            nums = all_nums[-6:]
-                            if "sales" in r_title or "revenue" in r_title:
-                                info["q_all_rev"], info["q_rev"] = all_nums, nums
-                            elif "operating profit" in r_title or "ebitda" in r_title:
-                                info["q_all_gp"], info["q_gp"] = all_nums, nums
-                            elif "net profit" in r_title:
-                                info["q_all_np"], info["q_np"] = all_nums, nums
-                    if headers:
-                        info["quarters_text"] = "Quarters Header: " + " | ".join(headers) + "\n" + "\n".join(q_lines)
                 break
         except Exception as exc:
             log.warning("Screener lookup warning for %s: %s", q, exc)
@@ -787,29 +823,28 @@ def ensure_valid_result_numbers(ai_data, screener_info, pdf_text_len=0):
     gp = ai_data.get("gross_profit") or {}
     np_d = ai_data.get("net_profit") or {}
 
-    use_screener_strict = (pdf_text_len < 250 and len(screener_info.get("q_all_rev", [])) >= 2)
-
-    if use_screener_strict or str(ai_data.get("curr_period_label", "")).upper() in ("", "N/A", "CURRENT"):
+    if str(ai_data.get("curr_period_label", "")).upper() in ("", "N/A", "CURRENT"):
         ai_data["curr_period_label"] = defaults["curr_lbl"]
-    if use_screener_strict or str(ai_data.get("prev_period_label", "")).upper() in ("", "N/A", "PREVIOUS"):
+    if str(ai_data.get("prev_period_label", "")).upper() in ("", "N/A", "PREVIOUS", "PREVIOUS YOY"):
         ai_data["prev_period_label"] = defaults["prev_lbl"]
 
-    if use_screener_strict or (to_float(rev.get("curr")) == 0 and to_float(rev.get("prev")) == 0):
+    # જો Gemini એ PDF માંથી સાચા આંકડા કાઢ્યા હોય (0 ન હોય), તો તેને જ રાખો; માત્ર 0 હોય ત્યારે જ Screener વાપરો
+    if to_float(rev.get("curr")) == 0 and to_float(rev.get("prev")) == 0:
         ai_data["revenue"] = defaults["revenue"]
     else:
         ai_data["revenue"] = compute_metric_dict(rev.get("curr"), rev.get("prev"))
 
-    if use_screener_strict or (to_float(gp.get("curr")) == 0 and to_float(gp.get("prev")) == 0):
+    if to_float(gp.get("curr")) == 0 and to_float(gp.get("prev")) == 0:
         ai_data["gross_profit"] = defaults["gross_profit"]
     else:
         ai_data["gross_profit"] = compute_metric_dict(gp.get("curr"), gp.get("prev"))
 
-    if use_screener_strict or (to_float(np_d.get("curr")) == 0 and to_float(np_d.get("prev")) == 0):
+    if to_float(np_d.get("curr")) == 0 and to_float(np_d.get("prev")) == 0:
         ai_data["net_profit"] = defaults["net_profit"]
     else:
         ai_data["net_profit"] = compute_metric_dict(np_d.get("curr"), np_d.get("prev"))
 
-    if use_screener_strict or not ai_data.get("quarter_chart_revenue"):
+    if not ai_data.get("quarter_chart_revenue") or not any(to_float(x) != 0 for x in ai_data.get("quarter_chart_revenue", [])):
         ai_data["quarter_chart_labels"] = screener_info.get("q_labels", [])
         ai_data["quarter_chart_revenue"] = screener_info.get("q_rev", [])
         ai_data["quarter_chart_gross_profit"] = screener_info.get("q_gp", [])
@@ -969,7 +1004,6 @@ def build_smart_fallback_data(company_title, scrip_code, doc_type, source_text, 
         np_g = fallback["net_profit"]["growth"]
         rev_c = fallback["revenue"]["curr"]
         np_c = fallback["net_profit"]["curr"]
-        # High-Search-Volume Title starting with exact keywords people search!
         fallback["seo_title"] = f"{c_name} Share Price Target 2026, Q2 Results (PAT {np_g} YoY) & Latest News"[:105]
         fallback["seo_lead_summary"] = (
             f"Looking for {c_name} share price target 2026, Q2 results, and fundamental analysis? "
@@ -1061,18 +1095,18 @@ def analyze_with_gemini_json(company_title, scrip_code, doc_type, source_text, p
 
     prompt = f"""
 You are India's #1 SEO Financial Journalist and Equity Research Analyst for 'MarketMunafa' (https://marketmunafa.blogspot.com).
-Analyze the attached BSE corporate filing ({doc_type.upper()}) and Screener fundamentals data for {c_clean_name}.
+Analyze the attached BSE corporate filing ({doc_type.upper()}) and Screener Consolidated fundamentals data for {c_clean_name}.
 
-HIGH-TRAFFIC GOOGLE SEARCH & DISCOVER RANKING RULES:
-1. STRONG RESULT FILTER: Set `"skip_stock": false` ONLY IF the company has strong results (e.g., positive YoY Net Profit growth >= 5%, turnaround to profit, strong revenue jump, or major new order win). If results are weak/loss-making/flat, set `"skip_stock": true`.
-2. HIGH-SEARCH-VOLUME TITLE (CRITICAL FOR BLOGGER URL SLUG): Your `seo_title` MUST start with `{c_clean_name} Share Price Target 2026` or `{c_clean_name} Q2 Results` or `{c_clean_name} Share Latest News` so that the Blogger URL matches what 10,000 retail investors search on Google!
-3. NATURALLY INTEGRATE THESE LIVE GOOGLE TRENDING KEYWORDS IN HEADINGS, BODY & FAQs:
+STRICT RULES FOR CONSOLIDATED DATA ACCURACY & HIGH GOOGLE TRAFFIC:
+1. CONSOLIDATED PRIORITY (CRITICAL): Always extract 'Consolidated' financial results (Revenue from Operations, Operating Profit/EBITDA, and Net Profit/PAT) from the attached PDF first! Convert Lakhs into Crores (divide by 100) or Millions into Crores (divide by 10). Only use Screener backup numbers if the PDF has no financial table.
+2. STRONG RESULT FILTER: Set `"skip_stock": false` ONLY IF the company has strong results (positive YoY Net Profit growth >= 5%, turnaround to profit, strong revenue expansion, or major order win). If results are weak/loss-making/flat, set `"skip_stock": true`.
+3. HIGH-SEARCH-VOLUME TITLE (FOR BLOGGER URL SLUG): Your `seo_title` MUST start with `{c_clean_name} Share Price Target 2026` or `{c_clean_name} Q2 Results` or `{c_clean_name} Share Latest News`.
+4. NATURALLY INTEGRATE THESE LIVE GOOGLE TRENDING KEYWORDS IN HEADINGS, BODY & FAQs:
    {kws_str}
-4. 100% ORIGINAL & ADSENSE SAFE: Never copy sentences from the filing. Frame price targets strictly as educational/fundamental valuation projections based on EPS & P/E.
-5. NEVER INVENT DUMMY NUMBERS: Use only {c_clean_name}'s exact figures from the filing or Screener data below.
+5. 100% ORIGINAL & ADSENSE SAFE: Frame price targets strictly as educational/fundamental valuation projections based on EPS & P/E.
 
 Company Name: {c_clean_name} (BSE: {scrip_code})
-Screener Verified Fundamentals:
+Screener Verified Consolidated Fundamentals:
 - Current Share Price: {screener_info['price_str']} (52W High: {screener_info['high_52w']} | 52W Low: {screener_info['low_52w']})
 - Market Cap: {screener_info['market_cap']}
 - Stock P/E: {screener_info['pe_ratio']} | Industry P/E: {screener_info['industry_pe']} | P/B: {screener_info['pb_ratio']}
@@ -1081,24 +1115,27 @@ Screener Verified Fundamentals:
 - Book Value: {screener_info['book_value']} | Div Yield: {screener_info['div_yield']}
 - Algorithmic Valuation Bands: 2026: {screener_info['target_2026']} | 2027: {screener_info['target_2027']} | 2030: {screener_info['target_2030']}
 
-Screener Historical Quarters (in Rs. Cr.):
+Screener Backup Consolidated Quarters (use ONLY if PDF table is unreadable; in Rs. Cr.):
 {screener_info['quarters_text']}
+Backup YoY Revenue: {json.dumps(scr_defaults['revenue'])}
+Backup YoY EBITDA/GP: {json.dumps(scr_defaults['gross_profit'])}
+Backup YoY PAT: {json.dumps(scr_defaults['net_profit'])}
 
-Return ONLY a valid JSON object with this exact structure:
+Return ONLY a valid JSON object with this exact structure (fill in exact Consolidated numbers in Rs. Cr.):
 {{
   "skip_stock": false,
   "seo_title": "{c_clean_name} Share Price Target 2026, Q2 Results (PAT YoY Growth) & Latest News",
-  "seo_lead_summary": "45-60 word high-CTR summary in English starting with '{c_clean_name} Share Price Target 2026 & Q2 Results:' covering exact PAT/Revenue YoY growth or Order value, current price ({screener_info['price_str']}), and valuation impact.",
+  "seo_lead_summary": "45-60 word high-CTR summary in English starting with '{c_clean_name} Share Price Target 2026 & Q2 Results:' covering exact Consolidated PAT/Revenue YoY growth or Order value, current price ({screener_info['price_str']}), and valuation impact.",
   "company_short_name": "{c_clean_name}",
-  "result_date": "November 14, 2026",
+  "result_date": "November 15, 2026",
   "price_display": "{screener_info['price_str']}",
   "quarter_label": "Q2 / Quarterly",
   "curr_period_label": "{scr_defaults['curr_lbl']}",
   "prev_period_label": "{scr_defaults['prev_lbl']}",
   "result_type": "Consolidated",
-  "revenue": {json.dumps(scr_defaults['revenue'])},
-  "gross_profit": {json.dumps(scr_defaults['gross_profit'])},
-  "net_profit": {json.dumps(scr_defaults['net_profit'])},
+  "revenue": {{"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"}},
+  "gross_profit": {{"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"}},
+  "net_profit": {{"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"}},
   "debt_comparison": {{"curr": "{screener_info['curr_debt_num']}", "prev": "{screener_info['prev_debt_num']}"}},
   "order_details": {{
     "client_or_awarder": "Client Name",
@@ -1126,13 +1163,13 @@ Return ONLY a valid JSON object with this exact structure:
   "quarter_chart_gross_profit": {json.dumps(screener_info['q_gp'])},
   "quarter_chart_net_profit": {json.dumps(screener_info['q_np'])},
   "key_highlights": [
-    "Bullet 1 in English: Revenue & PAT YoY growth or Order Book milestone with exact numbers.",
+    "Bullet 1 in English: Consolidated Revenue & PAT YoY growth or Order Book milestone with exact numbers.",
     "Bullet 2 in English: 52-Week High ({screener_info['high_52w']}) & Low ({screener_info['low_52w']}) vs Current Price ({screener_info['price_str']}).",
     "Bullet 3 in English: Total Debt ({screener_info['total_debt']}) and Debt-to-Equity ({screener_info['debt_to_equity']}) analysis.",
     "Bullet 4 in English: Stock P/E ({screener_info['pe_ratio']}) vs Industry P/E ({screener_info['industry_pe']}) and ROE ({screener_info['roe']})."
   ],
   "web_story_hook": [
-    "Punchy Web Story slide 1 about {c_clean_name}'s exact profit jump or order win.",
+    "Punchy Web Story slide 1 about {c_clean_name}'s exact Consolidated profit jump or order win.",
     "Punchy Web Story slide 2 about {c_clean_name}'s Share Price Target 2026 ({screener_info['target_2026']}).",
     "Punchy Web Story slide 3 about Debt-to-Equity ({screener_info['debt_to_equity']}) and ROE ({screener_info['roe']}).",
     "Punchy Web Story slide 4 about Stock P/E ({screener_info['pe_ratio']}) vs Sector P/E ({screener_info['industry_pe']})."
@@ -1140,7 +1177,7 @@ Return ONLY a valid JSON object with this exact structure:
   "seo_article_sections": [
     {{
       "heading": "Why {c_clean_name} Share Price is in Focus Today: Q2 Results & Earnings Breakdown",
-      "body": "140-160 words in English analyzing the exact numbers, YoY profit growth, and operational performance."
+      "body": "140-160 words in English analyzing the exact Consolidated numbers, YoY profit growth, and operational performance."
     }},
     {{
       "heading": "{c_clean_name} Share Price Target 2026, 2027, 2030 & Fundamental Valuation",
@@ -1158,7 +1195,7 @@ Return ONLY a valid JSON object with this exact structure:
     }},
     {{
       "q": "Why is {c_clean_name} share rising or falling after Q2 results?",
-      "a": "Direct 2-sentence answer in English with exact Revenue and Net Profit YoY numbers."
+      "a": "Direct 2-sentence answer in English with exact Consolidated Revenue and Net Profit YoY numbers."
     }},
     {{
       "q": "Is {c_clean_name} a debt-free stock?",
@@ -1196,7 +1233,7 @@ Extracted Text from Filing:
 
 
 # ==========================================
-# 8. VISUAL CHARTS & HIGH-SEO HTML BUILDER
+# 8. VISUAL CHARTS & MOBILE-FRIENDLY HTML BUILDER
 # ==========================================
 def build_quarterly_column_chart_url(comp_name, labels, rev_list, gp_list, np_list):
     datasets = [
@@ -1204,7 +1241,7 @@ def build_quarterly_column_chart_url(comp_name, labels, rev_list, gp_list, np_li
         {"label": "Net Profit", "backgroundColor": "#2563eb", "data": [to_float(x) for x in np_list]},
     ]
     if gp_list and any(to_float(x) != 0 for x in gp_list):
-        datasets.insert(1, {"label": "Gross Profit", "backgroundColor": "#90a4ae", "data": [to_float(x) for x in gp_list]})
+        datasets.insert(1, {"label": "EBITDA", "backgroundColor": "#90a4ae", "data": [to_float(x) for x in gp_list]})
 
     chart_config = {
         "type": "bar",
@@ -1221,7 +1258,7 @@ def build_quarterly_column_chart_url(comp_name, labels, rev_list, gp_list, np_li
 
 
 def build_yoy_comparison_chart_url(comp_name, qtr_lbl, prev_lbl, curr_lbl, rev, gp, np_d, debt_comp):
-    labels = ["Revenue", "Gross Profit", "Net Profit", "Total Debt"]
+    labels = ["Revenue", "EBITDA", "Net Profit", "Total Debt"]
     curr_data = [to_float(rev.get("curr")), to_float(gp.get("curr")), to_float(np_d.get("curr")), to_float(debt_comp.get("curr"))]
     prev_data = [to_float(rev.get("prev")), to_float(gp.get("prev")), to_float(np_d.get("prev")), to_float(debt_comp.get("prev"))]
 
@@ -1272,7 +1309,6 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
     high_52w = html.escape(str(screener_info.get("high_52w", "N/A")))
     low_52w = html.escape(str(screener_info.get("low_52w", "N/A")))
     fund_impact = html.escape(str(data.get("fundamental_impact_note", "")))
-    est_return = html.escape(str(data.get("estimated_stock_return", screener_info.get("target_2026", "N/A"))))
     intraday_sig = html.escape(str(data.get("intraday_signal", "")))
 
     raw_lead = str(data.get("seo_lead_summary") or "").strip()
@@ -1292,27 +1328,27 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
         hook_list = "".join(f"<li style='margin-bottom:8px;'>{html.escape(str(h))}</li>" for h in web_story_hooks if h)
         if hook_list:
             content_blocks.append(f"""
-            <div style="background: linear-gradient(135deg, #1e3a8a, #2563eb); color: white; border-radius: 14px; padding: 18px 22px; margin-bottom: 24px; box-shadow: 0 4px 12px rgba(37, 99, 235, 0.25);">
-              <h2 style="margin: 0 0 12px 0; font-size: 19px; border-bottom: 1px solid #93c5fd; padding-bottom: 8px; color: white;">⚡ {comp_name} Quick Highlights (Web Story Summary)</h2>
-              <ul style="margin: 0; padding-left: 20px; font-size: 15px; font-weight: 500; line-height: 1.65;">
+            <div style="background: linear-gradient(135deg, #1e3a8a, #2563eb); color: white; border-radius: 14px; padding: 18px 20px; margin-bottom: 24px; box-shadow: 0 4px 12px rgba(37, 99, 235, 0.25);">
+              <h2 style="margin: 0 0 12px 0; font-size: 18px; border-bottom: 1px solid #93c5fd; padding-bottom: 8px; color: white;">⚡ {comp_name} Quick Highlights (Web Story Summary)</h2>
+              <ul style="margin: 0; padding-left: 18px; font-size: 14px; font-weight: 500; line-height: 1.65;">
                 {hook_list}
               </ul>
               <p style="margin: 10px 0 0 0; font-size: 12px; text-align: right; color: #dbeafe;"><em>MarketMunafa Equity Research Desk</em></p>
             </div>
             """)
 
-    # 2. RESULT / ORDER TABLE & CHARTS
+    # 2. RESULT / ORDER TABLE (100% MOBILE RESPONSIVE - NO CLIPPING)
     if doc_type == "order":
         ord_info = data.get("order_details", {}) or {}
         order_card = f"""
-        <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 16px; padding: 22px; margin-bottom: 24px;">
-          <h2 style="margin: 0 0 16px 0; font-size: 20px; color: #1e3a8a;">🏆 {comp_name} Latest Order Win &amp; Contract Details</h2>
-          <p style="margin: 8px 0; font-size: 16px;"><strong>Company Name:</strong> {comp_name} ({price_disp})</p>
-          <p style="margin: 8px 0; font-size: 16px;"><strong>Client / Awarding Authority:</strong> {html.escape(str(ord_info.get("client_or_awarder", "Disclosed in Filing")))}</p>
-          <p style="margin: 8px 0; font-size: 16px;"><strong>Order / Contract Value:</strong> <span style="color:#16a34a; font-weight:700;">{html.escape(str(ord_info.get("order_value", "As per BSE Filing")))}</span></p>
-          <p style="margin: 8px 0; font-size: 16px;"><strong>Order Size vs Market Cap:</strong> {html.escape(str(ord_info.get("order_to_mcap_ratio", "Significant Revenue Visibility")))}</p>
-          <p style="margin: 8px 0; font-size: 16px;"><strong>Nature of Work / Scope:</strong> {html.escape(str(ord_info.get("scope_of_work", "Execution of commercial order/contract")))}</p>
-          <p style="margin: 8px 0; font-size: 16px;"><strong>Execution Timeline:</strong> {html.escape(str(ord_info.get("execution_timeline", "As per contract terms")))}</p>
+        <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 16px; padding: 20px; margin-bottom: 24px;">
+          <h2 style="margin: 0 0 14px 0; font-size: 19px; color: #1e3a8a;">🏆 {comp_name} Latest Order Win &amp; Contract Details</h2>
+          <p style="margin: 8px 0; font-size: 15px;"><strong>Company Name:</strong> {comp_name} ({price_disp})</p>
+          <p style="margin: 8px 0; font-size: 15px;"><strong>Client / Awarding Authority:</strong> {html.escape(str(ord_info.get("client_or_awarder", "Disclosed in Filing")))}</p>
+          <p style="margin: 8px 0; font-size: 15px;"><strong>Order / Contract Value:</strong> <span style="color:#16a34a; font-weight:700;">{html.escape(str(ord_info.get("order_value", "As per BSE Filing")))}</span></p>
+          <p style="margin: 8px 0; font-size: 15px;"><strong>Order Size vs Market Cap:</strong> {html.escape(str(ord_info.get("order_to_mcap_ratio", "Significant Revenue Visibility")))}</p>
+          <p style="margin: 8px 0; font-size: 15px;"><strong>Nature of Work / Scope:</strong> {html.escape(str(ord_info.get("scope_of_work", "Execution of commercial order/contract")))}</p>
+          <p style="margin: 8px 0; font-size: 15px;"><strong>Execution Timeline:</strong> {html.escape(str(ord_info.get("execution_timeline", "As per contract terms")))}</p>
         </div>
         """
         content_blocks.append(order_card)
@@ -1335,94 +1371,96 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
             return "#dc2626" if "-" in str(growth_str) else "#16a34a"
 
         result_card = f"""
-        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 18px; box-shadow: 0 4px 14px rgba(0,0,0,0.05); margin-bottom: 24px; overflow-x: auto;">
-          <h2 style="margin: 0 0 12px 0; font-size: 20px; color: #0f172a;">📊 {comp_name} {qtr_lbl} Financial Results Table (YoY)</h2>
-          <div style="display: flex; justify-content: space-between; color: #64748b; font-size: 14px; margin-bottom: 10px;">
-            <span>{res_date} ({res_type})</span>
-            <span>Figures in Rs. Cr.</span>
+        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 14px; box-shadow: 0 4px 14px rgba(0,0,0,0.05); margin-bottom: 24px; box-sizing: border-box;">
+          <h2 style="margin: 0 0 8px 0; font-size: 18px; color: #0f172a; line-height: 1.35;">📊 {comp_name} {qtr_lbl} Results Table ({res_type})</h2>
+          <div style="display: flex; justify-content: space-between; align-items: center; color: #64748b; font-size: 12px; margin-bottom: 10px;">
+            <span>{res_date} | Price: <strong style="color:#0f172a;">{price_disp}</strong></span>
+            <span>Figures in ₹ Cr.</span>
           </div>
-          <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
-            <thead>
-              <tr style="border-top: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0; color: #64748b; font-weight: 600;">
-                <th style="text-align: left; padding: 10px 4px; white-space: nowrap;">Metric</th>
-                <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">{curr_lbl}</th>
-                <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">{prev_lbl}</th>
-                <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">YoY Change</th>
-                <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">YoY Growth %</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr style="border-bottom: 1px solid #f1f5f9;">
-                <td style="padding: 12px 4px; color: #1e293b; font-weight: 600; white-space: nowrap;">Revenue from Operations</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap;">₹{html.escape(str(rev.get('curr', '0')))}</td>
-                <td style="padding: 12px 4px; text-align: right; color: #475569; white-space: nowrap;">₹{html.escape(str(rev.get('prev', '0')))}</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: #0f172a; white-space: nowrap;">{html.escape(str(rev.get('difference', '0')))}</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 700; white-space: nowrap; color: {growth_color(rev.get('growth', ''))};">{html.escape(str(rev.get('growth', '0%')))}</td>
-              </tr>
-              <tr style="border-bottom: 1px solid #f1f5f9;">
-                <td style="padding: 12px 4px; color: #1e293b; font-weight: 600; white-space: nowrap;">Operating Profit (EBITDA)</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap;">₹{html.escape(str(gp.get('curr', '0')))}</td>
-                <td style="padding: 12px 4px; text-align: right; color: #475569; white-space: nowrap;">₹{html.escape(str(gp.get('prev', '0')))}</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: #0f172a; white-space: nowrap;">{html.escape(str(gp.get('difference', '0')))}</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 700; white-space: nowrap; color: {growth_color(gp.get('growth', ''))};">{html.escape(str(gp.get('growth', '0%')))}</td>
-              </tr>
-              <tr>
-                <td style="padding: 12px 4px; color: #1e293b; font-weight: 600; white-space: nowrap;">Net Profit (Consolidated PAT)</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap;">₹{html.escape(str(np_d.get('curr', '0')))}</td>
-                <td style="padding: 12px 4px; text-align: right; color: #475569; white-space: nowrap;">₹{html.escape(str(np_d.get('prev', '0')))}</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: #0f172a; white-space: nowrap;">{html.escape(str(np_d.get('difference', '0')))}</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 700; white-space: nowrap; color: {growth_color(np_d.get('growth', ''))};">{html.escape(str(np_d.get('growth', '0%')))}</td>
-              </tr>
-            </tbody>
-          </table>
+          <div style="width: 100%; overflow-x: auto;">
+            <table style="width: 100%; border-collapse: collapse; font-size: 13px; text-align: right;">
+              <thead>
+                <tr style="border-top: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0; color: #475569; font-weight: 700; background: #f8fafc;">
+                  <th style="text-align: left; padding: 8px 4px;">Metric</th>
+                  <th style="padding: 8px 4px;">{curr_lbl}</th>
+                  <th style="padding: 8px 4px;">{prev_lbl}</th>
+                  <th style="padding: 8px 4px;">Change</th>
+                  <th style="padding: 8px 4px;">YoY %</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr style="border-bottom: 1px solid #f1f5f9;">
+                  <td style="text-align: left; padding: 10px 4px; color: #1e293b; font-weight: 600;">Revenue</td>
+                  <td style="padding: 10px 4px; font-weight: 600;">₹{html.escape(str(rev.get('curr', '0')))}</td>
+                  <td style="padding: 10px 4px; color: #64748b;">₹{html.escape(str(rev.get('prev', '0')))}</td>
+                  <td style="padding: 10px 4px; font-weight: 600;">{html.escape(str(rev.get('difference', '0')))}</td>
+                  <td style="padding: 10px 4px; font-weight: 700; color: {growth_color(rev.get('growth', ''))};">{html.escape(str(rev.get('growth', '0%')))}</td>
+                </tr>
+                <tr style="border-bottom: 1px solid #f1f5f9;">
+                  <td style="text-align: left; padding: 10px 4px; color: #1e293b; font-weight: 600;">EBITDA</td>
+                  <td style="padding: 10px 4px; font-weight: 600;">₹{html.escape(str(gp.get('curr', '0')))}</td>
+                  <td style="padding: 10px 4px; color: #64748b;">₹{html.escape(str(gp.get('prev', '0')))}</td>
+                  <td style="padding: 10px 4px; font-weight: 600;">{html.escape(str(gp.get('difference', '0')))}</td>
+                  <td style="padding: 10px 4px; font-weight: 700; color: {growth_color(gp.get('growth', ''))};">{html.escape(str(gp.get('growth', '0%')))}</td>
+                </tr>
+                <tr>
+                  <td style="text-align: left; padding: 10px 4px; color: #1e293b; font-weight: 600;">Net Profit (PAT)</td>
+                  <td style="padding: 10px 4px; font-weight: 600;">₹{html.escape(str(np_d.get('curr', '0')))}</td>
+                  <td style="padding: 10px 4px; color: #64748b;">₹{html.escape(str(np_d.get('prev', '0')))}</td>
+                  <td style="padding: 10px 4px; font-weight: 600;">{html.escape(str(np_d.get('difference', '0')))}</td>
+                  <td style="padding: 10px 4px; font-weight: 700; color: {growth_color(np_d.get('growth', ''))};">{html.escape(str(np_d.get('growth', '0%')))}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </div>
         
-        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 18px; margin-bottom: 24px; text-align: center;">
-          <h3 style="margin: 0 0 12px 0; font-size: 18px; color: #0f172a;">📈 {comp_name} YoY Revenue, PAT &amp; Debt Chart</h3>
+        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 16px; margin-bottom: 24px; text-align: center;">
+          <h3 style="margin: 0 0 12px 0; font-size: 17px; color: #0f172a;">📈 {comp_name} YoY Revenue, PAT &amp; Debt Chart</h3>
           <img src="{yoy_chart_url}" alt="{comp_name} Q2 Results YoY Chart" width="750" height="420" loading="lazy" style="max-width: 100%; height: auto; border-radius: 8px;" />
         </div>
-        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 18px; margin-bottom: 24px; text-align: center;">
-          <h3 style="margin: 0 0 12px 0; font-size: 18px; color: #0f172a;">📊 {comp_name} Multi-Quarter Earnings Trend</h3>
+        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 16px; margin-bottom: 24px; text-align: center;">
+          <h3 style="margin: 0 0 12px 0; font-size: 17px; color: #0f172a;">📊 {comp_name} Multi-Quarter Earnings Trend</h3>
           <img src="{quarter_chart_url}" alt="{comp_name} Quarterly Profit Trend" width="750" height="420" loading="lazy" style="max-width: 100%; height: auto; border-radius: 8px;" />
         </div>
         """
         content_blocks.append(result_card)
 
-    # 3. HIGH-TRAFFIC SHARE PRICE TARGET & VALUATION OUTLOOK TABLE (2026 - 2030)
+    # 3. SHARE PRICE TARGET TABLE (2026 - 2030)
     if screener_info.get("target_2026") and screener_info["target_2026"] != "N/A":
         target_table_card = f"""
-        <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 16px; padding: 20px; margin-bottom: 24px;">
-          <h2 style="margin: 0 0 12px 0; font-size: 20px; color: #166534;">🎯 {comp_name} Share Price Target 2026, 2027 to 2030 (Fundamental Projection)</h2>
+        <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 16px; padding: 16px; margin-bottom: 24px; box-sizing: border-box;">
+          <h2 style="margin: 0 0 10px 0; font-size: 18px; color: #166534;">🎯 {comp_name} Share Price Target 2026, 2027 to 2030</h2>
           <p style="margin: 0 0 12px 0; font-size: 14px; color: #15803d;">
-            Based on {comp_name}'s trailing EPS of <strong>{eps}</strong>, ROE of <strong>{roe}</strong>, Book Value of <strong>{book_value}</strong>, and current P/E ratio of <strong>{pe_ratio}</strong>, here are the algorithmic fair-value estimation bands:
+            Based on {comp_name}'s EPS of <strong>{eps}</strong>, ROE of <strong>{roe}</strong>, Book Value of <strong>{book_value}</strong>, and P/E of <strong>{pe_ratio}</strong>:
           </p>
-          <table style="width: 100%; border-collapse: collapse; font-size: 14px; background: #ffffff; border-radius: 8px; overflow: hidden;">
+          <table style="width: 100%; border-collapse: collapse; font-size: 13px; background: #ffffff; border-radius: 8px; overflow: hidden;">
             <thead>
               <tr style="background: #dcfce7; color: #14532d; font-weight: 700;">
-                <th style="padding: 10px; text-align: left; border: 1px solid #bbf7d0;">Valuation Horizon</th>
-                <th style="padding: 10px; text-align: right; border: 1px solid #bbf7d0;">Estimated Fair Value Band</th>
-                <th style="padding: 10px; text-align: left; border: 1px solid #bbf7d0;">Primary Fundamental Driver</th>
+                <th style="padding: 8px; text-align: left; border: 1px solid #bbf7d0;">Year</th>
+                <th style="padding: 8px; text-align: right; border: 1px solid #bbf7d0;">Valuation Band</th>
+                <th style="padding: 8px; text-align: left; border: 1px solid #bbf7d0;">Key Driver</th>
               </tr>
             </thead>
             <tbody>
               <tr>
-                <td style="padding: 10px; font-weight: 600; border: 1px solid #e2e8f0;">{comp_name} Share Target 2026</td>
-                <td style="padding: 10px; text-align: right; font-weight: 700; color: #16a34a; border: 1px solid #e2e8f0;">{html.escape(screener_info['target_2026'])}</td>
-                <td style="padding: 10px; border: 1px solid #e2e8f0;">Quarterly PAT growth &amp; order execution</td>
+                <td style="padding: 8px; font-weight: 600; border: 1px solid #e2e8f0;">Target 2026</td>
+                <td style="padding: 8px; text-align: right; font-weight: 700; color: #16a34a; border: 1px solid #e2e8f0;">{html.escape(screener_info['target_2026'])}</td>
+                <td style="padding: 8px; border: 1px solid #e2e8f0;">PAT growth &amp; order execution</td>
               </tr>
               <tr>
-                <td style="padding: 10px; font-weight: 600; border: 1px solid #e2e8f0;">{comp_name} Share Target 2027</td>
-                <td style="padding: 10px; text-align: right; font-weight: 700; color: #16a34a; border: 1px solid #e2e8f0;">{html.escape(screener_info['target_2027'])}</td>
-                <td style="padding: 10px; border: 1px solid #e2e8f0;">Operating margin expansion &amp; ROE compounding</td>
+                <td style="padding: 8px; font-weight: 600; border: 1px solid #e2e8f0;">Target 2027</td>
+                <td style="padding: 8px; text-align: right; font-weight: 700; color: #16a34a; border: 1px solid #e2e8f0;">{html.escape(screener_info['target_2027'])}</td>
+                <td style="padding: 8px; border: 1px solid #e2e8f0;">Margin expansion &amp; ROE</td>
               </tr>
               <tr>
-                <td style="padding: 10px; font-weight: 600; border: 1px solid #e2e8f0;">{comp_name} Share Target 2030</td>
-                <td style="padding: 10px; text-align: right; font-weight: 700; color: #16a34a; border: 1px solid #e2e8f0;">{html.escape(screener_info['target_2030'])}</td>
-                <td style="padding: 10px; border: 1px solid #e2e8f0;">Long-term earnings compounding &amp; debt reduction</td>
+                <td style="padding: 8px; font-weight: 600; border: 1px solid #e2e8f0;">Target 2030</td>
+                <td style="padding: 8px; text-align: right; font-weight: 700; color: #16a34a; border: 1px solid #e2e8f0;">{html.escape(screener_info['target_2030'])}</td>
+                <td style="padding: 8px; border: 1px solid #e2e8f0;">Long-term compounding</td>
               </tr>
             </tbody>
           </table>
-          <p style="margin: 8px 0 0 0; font-size: 12px; color: #475569;"><em>*Note: These are algorithmic valuation models based on historical earnings multiples for educational reference, not buy/sell recommendations.</em></p>
+          <p style="margin: 8px 0 0 0; font-size: 12px; color: #475569;"><em>*Educational valuation estimates based on earnings multiples, not investment advice.</em></p>
         </div>
         """
         content_blocks.append(target_table_card)
@@ -1432,42 +1470,42 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
     if highlights and isinstance(highlights, list):
         li_items = "".join(f"<li style='margin-bottom: 8px; color: #1e293b; line-height: 1.6;'>{html.escape(str(h))}</li>" for h in highlights if h)
         highlights_card = f"""
-        <div style="background: #f8fafc; border-left: 4px solid #2563eb; border-radius: 8px; padding: 16px 20px; margin-bottom: 24px;">
-          <h2 style="margin: 0 0 10px 0; font-size: 18px; color: #0f172a;">📌 Key Financial Highlights for Retail Investors</h2>
-          <ul style="margin: 0; padding-left: 20px; font-size: 15px;">{li_items}</ul>
+        <div style="background: #f8fafc; border-left: 4px solid #2563eb; border-radius: 8px; padding: 16px 18px; margin-bottom: 24px;">
+          <h2 style="margin: 0 0 10px 0; font-size: 18px; color: #0f172a;">📌 Key Financial Highlights for Investors</h2>
+          <ul style="margin: 0; padding-left: 18px; font-size: 14px;">{li_items}</ul>
         </div>
         """
         content_blocks.append(highlights_card)
 
-    # 5. FUNDAMENTAL RATIOS TABLE (WITH 52W HIGH/LOW)
+    # 5. FUNDAMENTAL RATIOS TABLE
     fundamentals_card = f"""
-    <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 20px; box-shadow: 0 4px 14px rgba(0,0,0,0.05); margin-bottom: 24px;">
-      <h2 style="margin: 0 0 16px 0; font-size: 20px; color: #0f172a;">🔍 {comp_name} Fundamental Ratios, Debt &amp; 52-Week High/Low</h2>
-      <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+    <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 16px; box-shadow: 0 4px 14px rgba(0,0,0,0.05); margin-bottom: 24px; box-sizing: border-box;">
+      <h2 style="margin: 0 0 14px 0; font-size: 18px; color: #0f172a;">🔍 {comp_name} Fundamental Ratios &amp; 52W High/Low</h2>
+      <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
         <tbody>
           <tr style="border-bottom: 1px solid #f1f5f9;">
-            <td style="padding: 10px 4px; color: #64748b;">Current Share Price</td><td style="padding: 10px 8px 10px 4px; text-align: right; font-weight: 700; color: #0f172a;">{price_disp}</td>
-            <td style="padding: 10px 4px 10px 8px; color: #64748b; border-left: 1px solid #f1f5f9;">52-Week High / Low</td><td style="padding: 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{high_52w} / {low_52w}</td>
+            <td style="padding: 8px 4px; color: #64748b;">Share Price</td><td style="padding: 8px 4px; text-align: right; font-weight: 700; color: #0f172a;">{price_disp}</td>
+            <td style="padding: 8px 4px; color: #64748b; border-left: 1px solid #f1f5f9;">52W High / Low</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{high_52w} / {low_52w}</td>
           </tr>
           <tr style="border-bottom: 1px solid #f1f5f9;">
-            <td style="padding: 10px 4px; color: #64748b;">Market Cap</td><td style="padding: 10px 8px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{mkt_cap}</td>
-            <td style="padding: 10px 4px 10px 8px; color: #64748b; border-left: 1px solid #f1f5f9;">Return on Equity (ROE)</td><td style="padding: 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{roe}</td>
+            <td style="padding: 8px 4px; color: #64748b;">Market Cap</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{mkt_cap}</td>
+            <td style="padding: 8px 4px; color: #64748b; border-left: 1px solid #f1f5f9;">ROE</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{roe}</td>
           </tr>
           <tr style="border-bottom: 1px solid #f1f5f9;">
-            <td style="padding: 10px 4px; color: #64748b;">Stock P/E (TTM)</td><td style="padding: 10px 8px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{pe_ratio}</td>
-            <td style="padding: 10px 4px 10px 8px; color: #64748b; border-left: 1px solid #f1f5f9;">Industry P/E</td><td style="padding: 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{ind_pe}</td>
+            <td style="padding: 8px 4px; color: #64748b;">Stock P/E</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{pe_ratio}</td>
+            <td style="padding: 8px 4px; color: #64748b; border-left: 1px solid #f1f5f9;">Industry P/E</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{ind_pe}</td>
           </tr>
           <tr style="border-bottom: 1px solid #f1f5f9;">
-            <td style="padding: 10px 4px; color: #64748b;">EPS (TTM)</td><td style="padding: 10px 8px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{eps}</td>
-            <td style="padding: 10px 4px 10px 8px; color: #64748b; border-left: 1px solid #f1f5f9;">Book Value / P/B</td><td style="padding: 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{book_value} ({pb_ratio}x)</td>
+            <td style="padding: 8px 4px; color: #64748b;">EPS (TTM)</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{eps}</td>
+            <td style="padding: 8px 4px; color: #64748b; border-left: 1px solid #f1f5f9;">Book Value</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{book_value} ({pb_ratio}x)</td>
           </tr>
           <tr>
-            <td style="padding: 10px 4px; color: #64748b;">Debt to Equity</td><td style="padding: 10px 8px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{de_ratio} ({total_debt})</td>
-            <td style="padding: 10px 4px 10px 8px; color: #64748b; border-left: 1px solid #f1f5f9;">Dividend Yield / FV</td><td style="padding: 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{div_yield} (FV: ₹{face_val})</td>
+            <td style="padding: 8px 4px; color: #64748b;">Debt / Equity</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{de_ratio} ({total_debt})</td>
+            <td style="padding: 8px 4px; color: #64748b; border-left: 1px solid #f1f5f9;">Div Yield / FV</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{div_yield} (₹{face_val})</td>
           </tr>
         </tbody>
       </table>
-      <p style="margin: 12px 0 0 0; font-size: 14px; color: #334155;"><strong>Technical &amp; Fundamental View:</strong> {intraday_sig} {fund_impact}</p>
+      <p style="margin: 10px 0 0 0; font-size: 13px; color: #334155;"><strong>Analysis:</strong> {intraday_sig} {fund_impact}</p>
     </div>
     """
     content_blocks.append(fundamentals_card)
@@ -1481,8 +1519,8 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
                 b_txt = html.escape(str(sec.get("body", "")))
                 if b_txt:
                     article_html_parts.append(
-                        f"<h2 style='font-size: 19px; color: #0f172a; margin: 22px 0 10px 0;'>📝 {h_txt}</h2>"
-                        f"<p style='color:#334155; font-size:16px; line-height:1.75; margin-bottom:16px;'>{b_txt}</p>"
+                        f"<h2 style='font-size: 18px; color: #0f172a; margin: 22px 0 10px 0;'>📝 {h_txt}</h2>"
+                        f"<p style='color:#334155; font-size:15px; line-height:1.75; margin-bottom:16px;'>{b_txt}</p>"
                     )
 
     faqs = data.get("faqs") or []
@@ -1493,29 +1531,28 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
             q_clean = str(f_item["q"]).strip()
             a_clean = str(f_item["a"]).strip()
             faq_html_items.append(
-                f"<details style='background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:12px 16px; margin-bottom:10px;'>"
-                f"<summary style='font-weight:600; color:#0f172a; cursor:pointer; font-size:15px;'>{html.escape(q_clean)}</summary>"
-                f"<p style='margin:10px 0 0 0; color:#334155; font-size:15px; line-height:1.6;'>{html.escape(a_clean)}</p>"
+                f"<details style='background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:12px 14px; margin-bottom:10px;'>"
+                f"<summary style='font-weight:600; color:#0f172a; cursor:pointer; font-size:14px;'>{html.escape(q_clean)}</summary>"
+                f"<p style='margin:10px 0 0 0; color:#334155; font-size:14px; line-height:1.6;'>{html.escape(a_clean)}</p>"
                 f"</details>"
             )
             faq_schema_entities.append({"@type": "Question", "name": q_clean, "acceptedAnswer": {"@type": "Answer", "text": a_clean}})
 
-    faq_block_html = f"<div style='margin: 26px 0;'><h2 style='font-size: 19px; color: #0f172a; margin-bottom: 14px;'>❓ Frequently Asked Questions ({comp_name} Share FAQs)</h2>{''.join(faq_html_items)}</div>" if faq_html_items else ""
+    faq_block_html = f"<div style='margin: 26px 0;'><h2 style='font-size: 18px; color: #0f172a; margin-bottom: 14px;'>❓ Frequently Asked Questions ({comp_name} Share FAQs)</h2>{''.join(faq_html_items)}</div>" if faq_html_items else ""
 
-    # 6. TRENDING GOOGLE SEARCH TAGS BLOCK (FOR LONG-TAIL ORGANIC SEARCH TRAFFIC)
     kw_badges = "".join(
-        f"<span style='display:inline-block; background:#f1f5f9; color:#334155; border:1px solid #cbd5e1; border-radius:20px; padding:4px 12px; font-size:13px; margin:4px;'>{html.escape(k)}</span>"
+        f"<span style='display:inline-block; background:#f1f5f9; color:#334155; border:1px solid #cbd5e1; border-radius:20px; padding:4px 10px; font-size:12px; margin:3px;'>{html.escape(k)}</span>"
         for k in (trending_kws or [])
     )
     trending_kw_html = f"""
     <div style="margin: 22px 0; padding: 14px; background: #f8fafc; border-radius: 10px; border: 1px solid #e2e8f0;">
-      <strong style="font-size: 14px; color: #0f172a; display: block; margin-bottom: 8px;">🔥 Trending Investor Searches on Google:</strong>
+      <strong style="font-size: 13px; color: #0f172a; display: block; margin-bottom: 8px;">🔥 Trending Investor Searches on Google:</strong>
       {kw_badges}
     </div>
     """ if kw_badges else ""
 
     internal_links_html = f"""
-    <div style="background: #eff6ff; border: 1px dashed #60a5fa; border-radius: 10px; padding: 14px 18px; margin: 22px 0; font-size: 14px; color: #1e3a8a;">
+    <div style="background: #eff6ff; border: 1px dashed #60a5fa; border-radius: 10px; padding: 14px 16px; margin: 22px 0; font-size: 14px; color: #1e3a8a;">
       <strong>🔗 Explore More High-Growth Stocks on MarketMunafa:</strong>
       <ul style="margin: 8px 0 0 0; padding-left: 18px; line-height: 1.8;">
         <li><a href="{BLOG_BASE_URL}/search/label/STOCK%20RESULT" style="color:#1d4ed8; font-weight:600; text-decoration:none;">📊 Latest Q2 &amp; Quarterly Stock Results Analysis</a></li>
@@ -1543,16 +1580,16 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
 
     html_body = f"""
     {meta_comment}
-    <article itemscope itemtype="https://schema.org/NewsArticle" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 740px; margin: 0 auto; color: #1e293b;">
-      <div style="font-size: 13px; color: #64748b; margin-bottom: 12px; font-weight: 500;">
+    <article itemscope itemtype="https://schema.org/NewsArticle" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 740px; margin: 0 auto; color: #1e293b; box-sizing: border-box;">
+      <div style="font-size: 12px; color: #64748b; margin-bottom: 12px; font-weight: 500;">
         📅 Published on: <time itemprop="datePublished" datetime="{iso_time}">{ist_time_str}</time> | By <span itemprop="author">MarketMunafa Equity Research Desk</span>
       </div>
-      <p style="font-size: 16px; line-height: 1.75; color: #0f172a; background: #f8fafc; padding: 14px 16px; border-radius: 10px; border: 1px solid #e2e8f0; margin-bottom: 18px;">
+      <p style="font-size: 15px; line-height: 1.7; color: #0f172a; background: #f8fafc; padding: 14px; border-radius: 10px; border: 1px solid #e2e8f0; margin-bottom: 18px;">
         <strong>Executive Summary:</strong> {lead_html}
       </p>
       <figure style="margin: 0 0 22px 0; text-align: center;">
         <img itemprop="image" src="{thumb_url}" alt="{comp_name} Share Price Target 2026 and {qtr_lbl} Results" width="1200" height="675" fetchpriority="high" style="width: 100%; height: auto; aspect-ratio: 16/9; object-fit: cover; border-radius: 12px;" />
-        <figcaption style="font-size: 13px; color: #64748b; margin-top: 6px;">{comp_name} (BSE: {html.escape(str(scrip_code or 'Listed'))}) Share Price Target &amp; Equity Research | MarketMunafa</figcaption>
+        <figcaption style="font-size: 12px; color: #64748b; margin-top: 6px;">{comp_name} (BSE: {html.escape(str(scrip_code or 'Listed'))}) Share Price Target &amp; Equity Research | MarketMunafa</figcaption>
       </figure>
       <!--more-->
       {"".join(content_blocks)}
@@ -1613,7 +1650,7 @@ def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, 
             f"({html.escape(str(ord_info.get('client_or_awarder', '-')))})\n\n"
         )
     else:
-        header_title = f"📊 <b>{comp_name} - {qtr_lbl} રિઝલ્ટ અપડેટ</b>"
+        header_title = f"📊 <b>{comp_name} - {qtr_lbl} Consolidated રિઝલ્ટ</b>"
         rev = data.get("revenue", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
         np_d = data.get("net_profit", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
         dynamic_block_gu = (
@@ -1868,7 +1905,6 @@ def run():
             if doc_type == "result" and not screener_info["q_all_rev"] and pdf_text_len < 200:
                 continue
 
-            # Fetch Real-Time Google Autocomplete Trending Keywords for this Stock!
             c_search_name = screener_info.get("screener_company_name") or comp_basis
             trending_kws = fetch_live_google_keywords(c_search_name)
 
@@ -1876,7 +1912,6 @@ def run():
                 item["title"], scrip_code, doc_type, source_text, pdf_bytes, screener_info, trending_kws, pdf_text_len
             )
 
-            # 🛑 STRONG RESULT FILTER: માત્ર સારા પરિણામ કે મોટા ઓર્ડર વાળા શેર જ પોસ્ટ થશે
             if ai_data.get("skip_stock") is True:
                 log.info("Skipping stock due to weak/flat financial results: %s", item["title"])
                 continue
