@@ -48,8 +48,8 @@ for _ek in re.split(r"[,\s]+", os.getenv("GEMINI_API_KEY", "").strip()):
         GEMINI_API_KEYS.append(_ek)
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
-GEMINI_MAX_RPM = 15
-GEMINI_MAX_TPM = 250000
+GEMINI_MAX_RPM = 12        # સેફ મોડ: 12 RPM જેથી ક્યારેય 429 ન આવે અને PDF શાંતિથી વંચાય
+GEMINI_MAX_TPM = 240000
 GEMINI_MAX_RPD = 500
 
 # ---------------- OPENROUTER BACKUP KEYS (2 KEYS: 5 RPM, 20 RPD) ----------------
@@ -62,10 +62,10 @@ OPENROUTER_MAX_RPD = 20
 
 RATE_WINDOW_SECONDS = 60.0
 
-# ---------------- QUALITY & TRAFFIC FILTERS ----------------
+# ---------------- QUALITY & ACCURACY FILTERS ----------------
 MIN_MARKET_CAP_CR = float(os.getenv("MIN_MARKET_CAP_CR", "100.0"))
 MIN_STOCK_PRICE = float(os.getenv("MIN_STOCK_PRICE", "10.0"))
-MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "12"))
+MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "10"))
 
 FEEDS = {
     "result": "https://www.bseindia.com/Data/XML/FinancialResultsFeed.aspx",
@@ -75,9 +75,9 @@ FEEDS = {
 DB_PATH = os.getenv("DB_PATH", "marketmunafa_seen.sqlite3")
 MAX_ITEMS_PER_FEED = int(os.getenv("MAX_ITEMS_PER_FEED", "100"))
 MAX_BLOG_POSTS_TO_SCAN = int(os.getenv("MAX_BLOG_POSTS_TO_SCAN", "500"))
-MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "12"))
-MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "15000"))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
+MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "20"))
+MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "20000"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "35"))
 POST_TO_BLOGGER = os.getenv("POST_TO_BLOGGER", "true").lower() == "true"
 SEND_TO_TELEGRAM = os.getenv("SEND_TO_TELEGRAM", "true").lower() == "true"
 
@@ -89,10 +89,10 @@ log = logging.getLogger("marketmunafa")
 
 
 # ==========================================
-# 2. MULTI-KEY ROTATOR (RPM + TPM + RPD)
+# 2. MULTI-KEY ROTATOR (PATIENT WAIT MODE)
 # ==========================================
 class MultiKeyRotator:
-    def __init__(self, name, keys, max_per_min, max_per_day, max_tpm=250000, window_sec=60.0):
+    def __init__(self, name, keys, max_per_min, max_per_day, max_tpm=240000, window_sec=60.0):
         self.name = name
         self.keys = [k.strip() for k in keys if k and k.strip()]
         self.max_per_min = max_per_min
@@ -105,12 +105,13 @@ class MultiKeyRotator:
         self.exhausted_today = set()
         self.next_idx = 0
 
-    def acquire_key(self, estimated_tokens=4000):
+    def acquire_key(self, estimated_tokens=6000):
         num_keys = len(self.keys)
         if num_keys == 0:
             return None, None
 
-        for _ in range(2):
+        # Patiently wait up to 4 cycles if keys are in per-minute cooldown
+        for _ in range(4):
             if len(self.exhausted_today) >= num_keys:
                 log.warning("All %s keys have reached their daily quota (%d/day).", self.name, self.max_per_day)
                 return None, None
@@ -155,13 +156,15 @@ class MultiKeyRotator:
                     )
                     return idx, self.keys[idx]
                 else:
-                    w = (self.usage_history[idx][0][0] + self.window_sec) - now + 1.0
+                    w = (self.usage_history[idx][0][0] + self.window_sec) - now + 1.5
                     earliest_wait = w if earliest_wait is None else min(earliest_wait, w)
 
             if len(self.exhausted_today) >= num_keys:
                 return None, None
 
-            time.sleep(max(1.0, min(earliest_wait or 5.0, 15.0)))
+            wait_sec = max(3.0, min(earliest_wait or 10.0, 35.0))
+            log.info("Waiting %.1fs for %s rate-limit window so PDF is analyzed accurately...", wait_sec, self.name)
+            time.sleep(wait_sec)
 
         return None, None
 
@@ -189,7 +192,7 @@ OPENROUTER_ROTATOR = MultiKeyRotator(
     OPENROUTER_KEYS,
     max_per_min=OPENROUTER_MAX_RPM,
     max_per_day=OPENROUTER_MAX_RPD,
-    max_tpm=250000,
+    max_tpm=240000,
     window_sec=RATE_WINDOW_SECONDS,
 )
 
@@ -405,8 +408,35 @@ def fmt_num(val):
     return f"{num:,.2f}"
 
 
+def shorten_period_label(lbl):
+    """
+    લાંબી તારીખો (જેમ કે 'September 30, 2026' અથવા '30.09.2026') ને 'Sep 2026' માં ફેરવે છે
+    જેથી મોબાઈલ ટેબલમાં એક પણ શબ્દ તૂટે નહીં.
+    """
+    s = str(lbl or "").strip()
+    if not s:
+        return "Current"
+    m_date = re.search(r"(?:30|31|28|29)?[\s./-]*(0?3|0?6|0?9|12)[\s./-]*(20\d{2}|\d{2})\b", s)
+    if m_date:
+        mm = int(m_date.group(1))
+        yy = m_date.group(2)
+        if len(yy) == 2:
+            yy = "20" + yy
+        month_map = {3: "Mar", 6: "Jun", 9: "Sep", 12: "Dec"}
+        return f"{month_map.get(mm, 'Sep')} {yy}"
+
+    m_word = re.search(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s,/-]*(\d{1,2}[\s,/-]*)?(20\d{2}|\d{2})\b", s, flags=re.I)
+    if m_word:
+        mon = m_word.group(1).capitalize()[:3]
+        yy = m_word.group(3)
+        if len(yy) == 2:
+            yy = "20" + yy
+        return f"{mon} {yy}"
+    return s[:12]
+
+
 # ==========================================
-# 5. SCREENER FUNDAMENTALS (CONSOLIDATED PRIORITY)
+# 5. SCREENER FUNDAMENTALS (STRICT SCRIP VERIFICATION)
 # ==========================================
 def _extract_quarters_from_soup(soup):
     q_data = {
@@ -432,12 +462,12 @@ def _extract_quarters_from_soup(soup):
         if not headers and len(cols) > 3:
             headers = cols[1:]
             q_data["q_all_labels"] = headers
-            q_data["q_labels"] = headers[-6:]
+            q_data["q_labels"] = headers[-5:]
             continue
 
         r_title = cols[0].lower().replace("+", "").strip()
         all_nums = [to_float(c_val) for c_val in cols[1:]]
-        nums = all_nums[-6:]
+        nums = all_nums[-5:]
 
         if r_title in ("sales", "revenue", "revenue from operations", "interest earned") and any(all_nums):
             q_data["q_all_rev"], q_data["q_rev"] = all_nums, nums
@@ -464,8 +494,6 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
         queries.append(str(scrip_code).strip())
     if clean_name:
         queries.append(clean_name)
-    if len(words) >= 2:
-        queries.append(" ".join(words[:2]))
 
     info = {
         "screener_company_name": "",
@@ -524,7 +552,6 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
                 base_clean_url = re.sub(r"/consolidated/?$", "/", raw_url)
                 cons_url = base_clean_url.rstrip("/") + "/consolidated/"
 
-                # 1. હંમેશા પહેલાં Consolidated પેજ ચેક કરો (જેથી Rajesh Exports જેવા શેરમાં સાચા Consolidated આંકડા જ આવે)
                 c_res = c_requests.get("https://www.screener.in" + cons_url, impersonate="chrome120", timeout=15)
                 if c_res.status_code != 200:
                     c_res = c_requests.get("https://www.screener.in" + raw_url, impersonate="chrome120", timeout=15)
@@ -532,14 +559,14 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
                     continue
 
                 page_html = c_res.text
-                if scrip_code and f"/{scrip_code}/" not in page_html and f"BSE: {scrip_code}" not in page_html:
-                    if q != scrip_code:
-                        continue
+                # STRICT BSE SCRIP CODE CHECK: જો BSE Scrip Code પેજ પર ન હોય તો ખોટી કંપની ગણીને સ્કીપ કરો
+                if scrip_code and not re.search(rf"\b{re.escape(str(scrip_code))}\b", page_html):
+                    log.info("Screener page %s does not match BSE Scrip Code %s. Skipping mismatch.", hit_name, scrip_code)
+                    continue
 
                 soup = BeautifulSoup(c_res.content, "html.parser")
                 q_extracted = _extract_quarters_from_soup(soup)
 
-                # જો Consolidated પેજમાં ત્રિમાસિક આંકડા ખાલી હોય, તો Standalone પેજ પરથી આંકડા લો
                 if not any(q_extracted["q_all_rev"]) and not any(q_extracted["q_all_np"]):
                     st_res = c_requests.get("https://www.screener.in" + base_clean_url, impersonate="chrome120", timeout=15)
                     if st_res.status_code == 200:
@@ -786,84 +813,65 @@ def compute_metric_dict(curr_val, prev_val):
     return {"curr": fmt_num(c), "prev": fmt_num(p), "difference": diff_str, "growth": g_str}
 
 
-def get_screener_yoy_defaults(screener_info):
-    q_rev_all = screener_info.get("q_all_rev", [])
-    q_gp_all = screener_info.get("q_all_gp", [])
-    q_np_all = screener_info.get("q_all_np", [])
-    q_lbl_all = screener_info.get("q_all_labels", [])
-
-    def pick_curr_prev(arr):
-        if len(arr) >= 5:
-            return arr[-1], arr[-5]
-        elif len(arr) >= 2:
-            return arr[-1], arr[-2]
-        elif len(arr) == 1:
-            return arr[0], arr[0]
-        return 0, 0
-
-    curr_lbl = q_lbl_all[-1] if len(q_lbl_all) >= 1 else "Current"
-    prev_lbl = q_lbl_all[-5] if len(q_lbl_all) >= 5 else (q_lbl_all[-2] if len(q_lbl_all) >= 2 else "Previous YoY")
-
-    r_c, r_p = pick_curr_prev(q_rev_all)
-    g_c, g_p = pick_curr_prev(q_gp_all)
-    n_c, n_p = pick_curr_prev(q_np_all)
-
-    return {
-        "curr_lbl": curr_lbl,
-        "prev_lbl": prev_lbl,
-        "revenue": compute_metric_dict(r_c, r_p),
-        "gross_profit": compute_metric_dict(g_c, g_p),
-        "net_profit": compute_metric_dict(n_c, n_p),
-    }
-
-
-def ensure_valid_result_numbers(ai_data, screener_info, pdf_text_len=0):
-    defaults = get_screener_yoy_defaults(screener_info)
+def verify_and_normalize_pdf_result_numbers(ai_data, screener_info):
+    """
+    PDF માંથી Gemini એ કાઢેલા આંકડાનું ગણિત (Change અને YoY %) Python દ્વારા 100% ચોકસાઈથી ફરી ગણે છે
+    અને Multi-Quarter Chart માં લેટેસ્ટ PDF ક્વાર્ટરનો ઉમેરો કરે છે.
+    """
     rev = ai_data.get("revenue") or {}
     gp = ai_data.get("gross_profit") or {}
     np_d = ai_data.get("net_profit") or {}
 
-    if str(ai_data.get("curr_period_label", "")).upper() in ("", "N/A", "CURRENT"):
-        ai_data["curr_period_label"] = defaults["curr_lbl"]
-    if str(ai_data.get("prev_period_label", "")).upper() in ("", "N/A", "PREVIOUS", "PREVIOUS YOY"):
-        ai_data["prev_period_label"] = defaults["prev_lbl"]
+    curr_lbl = shorten_period_label(ai_data.get("curr_period_label", "Sep 2026"))
+    prev_lbl = shorten_period_label(ai_data.get("prev_period_label", "Sep 2025"))
+    ai_data["curr_period_label"] = curr_lbl
+    ai_data["prev_period_label"] = prev_lbl
 
-    # જો Gemini એ PDF માંથી સાચા આંકડા કાઢ્યા હોય (0 ન હોય), તો તેને જ રાખો; માત્ર 0 હોય ત્યારે જ Screener વાપરો
-    if to_float(rev.get("curr")) == 0 and to_float(rev.get("prev")) == 0:
-        ai_data["revenue"] = defaults["revenue"]
-    else:
-        ai_data["revenue"] = compute_metric_dict(rev.get("curr"), rev.get("prev"))
+    ai_data["revenue"] = compute_metric_dict(rev.get("curr"), rev.get("prev"))
+    ai_data["gross_profit"] = compute_metric_dict(gp.get("curr"), gp.get("prev"))
+    ai_data["net_profit"] = compute_metric_dict(np_d.get("curr"), np_d.get("prev"))
 
-    if to_float(gp.get("curr")) == 0 and to_float(gp.get("prev")) == 0:
-        ai_data["gross_profit"] = defaults["gross_profit"]
-    else:
-        ai_data["gross_profit"] = compute_metric_dict(gp.get("curr"), gp.get("prev"))
+    # Multi-Quarter Chart માં Screener ના જૂના ક્વાર્ટર્સની પાછળ આ નવા PDF ક્વાર્ટરના સાચા આંકડા જોડો
+    q_labels = list(screener_info.get("q_labels", []))
+    q_rev = list(screener_info.get("q_rev", []))
+    q_gp = list(screener_info.get("q_gp", []))
+    q_np = list(screener_info.get("q_np", []))
 
-    if to_float(np_d.get("curr")) == 0 and to_float(np_d.get("prev")) == 0:
-        ai_data["net_profit"] = defaults["net_profit"]
-    else:
-        ai_data["net_profit"] = compute_metric_dict(np_d.get("curr"), np_d.get("prev"))
+    r_c = to_float(ai_data["revenue"]["curr"])
+    g_c = to_float(ai_data["gross_profit"]["curr"])
+    n_c = to_float(ai_data["net_profit"]["curr"])
 
-    if not ai_data.get("quarter_chart_revenue") or not any(to_float(x) != 0 for x in ai_data.get("quarter_chart_revenue", [])):
-        ai_data["quarter_chart_labels"] = screener_info.get("q_labels", [])
-        ai_data["quarter_chart_revenue"] = screener_info.get("q_rev", [])
-        ai_data["quarter_chart_gross_profit"] = screener_info.get("q_gp", [])
-        ai_data["quarter_chart_net_profit"] = screener_info.get("q_np", [])
+    if curr_lbl and r_c > 0:
+        if not q_labels or shorten_period_label(q_labels[-1]).lower() != curr_lbl.lower():
+            q_labels.append(curr_lbl)
+            q_rev.append(r_c)
+            q_gp.append(g_c)
+            q_np.append(n_c)
+        else:
+            q_rev[-1] = r_c
+            q_gp[-1] = g_c
+            q_np[-1] = n_c
+
+    ai_data["quarter_chart_labels"] = q_labels[-6:] if q_labels else [prev_lbl, curr_lbl]
+    ai_data["quarter_chart_revenue"] = q_rev[-6:] if q_rev else [to_float(ai_data["revenue"]["prev"]), r_c]
+    ai_data["quarter_chart_gross_profit"] = q_gp[-6:] if q_gp else [to_float(ai_data["gross_profit"]["prev"]), g_c]
+    ai_data["quarter_chart_net_profit"] = q_np[-6:] if q_np else [to_float(ai_data["net_profit"]["prev"]), n_c]
 
     return ai_data
 
 
 # ==========================================
-# 7. AI API CALL & HIGH-TRAFFIC SEO GENERATOR
+# 7. AI API CALL (PATIENT MULTIMODAL PDF READER)
 # ==========================================
 class DummyResponse:
     def __init__(self, text):
         self.text = text
 
 
-def call_ai_api(prompt_text, pdf_bytes=None):
-    est_tokens = max(2500, int(len(prompt_text) / 3.5) + (3000 if pdf_bytes else 0))
+def call_ai_api(prompt_text, pdf_bytes=None, require_pdf_vision=False):
+    est_tokens = max(3000, int(len(prompt_text) / 3.5) + (4000 if pdf_bytes else 0))
 
+    # 2 full rounds across Gemini keys with patient sleep if rate-limited, because PDF accuracy is top priority
     if GEMINI_API_KEYS:
         gemini_models = [GEMINI_MODEL, "gemini-3.5-flash-lite", "gemini-2.0-flash"]
         seen_m = []
@@ -871,36 +879,41 @@ def call_ai_api(prompt_text, pdf_bytes=None):
             if m and m not in seen_m:
                 seen_m.append(m)
 
-        for _ in range(len(GEMINI_ROTATOR.keys)):
-            key_idx, active_key = GEMINI_ROTATOR.acquire_key(estimated_tokens=est_tokens)
-            if active_key is None:
-                break
-            try:
-                genai.configure(api_key=active_key)
-            except Exception:
-                pass
-
-            key_error = False
-            for m_name in seen_m:
+        for attempt_round in range(2):
+            for _ in range(len(GEMINI_ROTATOR.keys)):
+                key_idx, active_key = GEMINI_ROTATOR.acquire_key(estimated_tokens=est_tokens)
+                if active_key is None:
+                    break
                 try:
-                    model = genai.GenerativeModel(m_name)
-                    if pdf_bytes and len(pdf_bytes) < 18 * 1024 * 1024:
-                        resp = model.generate_content([prompt_text, {"mime_type": "application/pdf", "data": pdf_bytes}])
-                    else:
-                        resp = model.generate_content(prompt_text)
-                    if resp and getattr(resp, "text", None):
-                        log.info("Gemini success using model: %s", m_name)
-                        return resp
-                except Exception as exc:
-                    err_str = str(exc).lower()
-                    if any(w in err_str for w in ("429", "quota", "rate", "depleted", "exhausted", "invalid", "400", "403")):
-                        GEMINI_ROTATOR.mark_key_rate_limited(key_idx, str(exc), 65.0)
-                        key_error = True
-                        break
-            if not key_error:
-                break
+                    genai.configure(api_key=active_key)
+                except Exception:
+                    pass
 
-    if OpenAI is not None and OPENROUTER_KEYS:
+                key_error = False
+                for m_name in seen_m:
+                    try:
+                        model = genai.GenerativeModel(m_name)
+                        if pdf_bytes and len(pdf_bytes) < 19 * 1024 * 1024:
+                            resp = model.generate_content([prompt_text, {"mime_type": "application/pdf", "data": pdf_bytes}])
+                        else:
+                            resp = model.generate_content(prompt_text)
+                        if resp and getattr(resp, "text", None):
+                            log.info("Gemini PDF Vision analysis success using model: %s", m_name)
+                            return resp
+                    except Exception as exc:
+                        err_str = str(exc).lower()
+                        if any(w in err_str for w in ("429", "quota", "rate", "depleted", "exhausted", "invalid", "400", "403")):
+                            GEMINI_ROTATOR.mark_key_rate_limited(key_idx, str(exc), 45.0)
+                            key_error = True
+                            break
+                if not key_error:
+                    break
+            if attempt_round == 0:
+                log.info("Pausing 25s to retry Gemini PDF Vision for 100% accurate extraction...")
+                time.sleep(25)
+
+    # OpenRouter Backup ONLY if PDF text was already extracted by PyPDF2 (not a scanned image PDF)
+    if not require_pdf_vision and OpenAI is not None and OPENROUTER_KEYS:
         or_models = ["google/gemini-3.5-flash-lite", "google/gemini-2.0-flash-lite-preview-02-05:free", "google/gemma-3-27b-it:free"]
         for _ in range(len(OPENROUTER_ROTATOR.keys)):
             or_idx, or_key = OPENROUTER_ROTATOR.acquire_key(estimated_tokens=est_tokens)
@@ -912,7 +925,7 @@ def call_ai_api(prompt_text, pdf_bytes=None):
                     completion = client.chat.completions.create(
                         model=or_model,
                         messages=[{"role": "user", "content": prompt_text}],
-                        temperature=0.3,
+                        temperature=0.2,
                         max_tokens=4000,
                     )
                     txt = completion.choices[0].message.content
@@ -928,185 +941,48 @@ def call_ai_api(prompt_text, pdf_bytes=None):
     return None
 
 
-def extract_order_value_from_text(source_text):
-    patterns = [
-        r"(?:rs\.?|inr|₹)\s*([\d,]+(?:\.\d+)?)\s*(?:crore|crores|cr\.?)\b",
-        r"([\d,]+(?:\.\d+)?)\s*(?:crore|crores|cr\.?)\b",
-        r"(?:rs\.?|inr|₹)\s*([\d,]+(?:\.\d+)?)\s*(?:million|mn)\b",
-    ]
-    for pat in patterns:
-        m = re.search(pat, source_text, flags=re.I)
-        if m:
-            val = m.group(1).replace(",", "")
-            if "million" in pat or "mn" in pat:
-                try:
-                    return f"₹{float(val)/10.0:,.2f} Cr"
-                except Exception:
-                    pass
-            return f"₹{val} Cr"
-    return "Disclosed in BSE Filing"
-
-
-def build_smart_fallback_data(company_title, scrip_code, doc_type, source_text, screener_info, trending_kws, pdf_text_len=0):
-    c_name = screener_info.get("screener_company_name") or re.sub(r"\(\d+\)", "", company_title).split("-")[0].strip()
-    ist_date_str = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%B %d, %Y")
-    ord_val_extracted = extract_order_value_from_text(source_text) if doc_type == "order" else ""
-    scr_defaults = get_screener_yoy_defaults(screener_info)
-
-    np_growth_num = to_float(scr_defaults["net_profit"]["growth"])
-    rev_growth_num = to_float(scr_defaults["revenue"]["growth"])
-    skip_flag = False
-    if doc_type == "result" and np_growth_num < 0 and rev_growth_num < 5 and len(screener_info.get("q_all_np", [])) >= 2:
-        skip_flag = True
-
-    fallback = {
-        "skip_stock": skip_flag,
-        "company_short_name": c_name,
-        "result_date": ist_date_str,
-        "price_display": screener_info["price_str"],
-        "quarter_label": f"Q2 / Quarterly ({scr_defaults['curr_lbl']})",
-        "curr_period_label": scr_defaults["curr_lbl"],
-        "prev_period_label": scr_defaults["prev_lbl"],
-        "result_type": "Consolidated",
-        "revenue": scr_defaults["revenue"],
-        "gross_profit": scr_defaults["gross_profit"],
-        "net_profit": scr_defaults["net_profit"],
-        "debt_comparison": {"curr": screener_info["curr_debt_num"], "prev": screener_info["prev_debt_num"]},
-        "order_details": {
-            "client_or_awarder": "Institutional / Corporate Client (As per BSE Filing)",
-            "order_value": ord_val_extracted or "As per Official Exchange Filing",
-            "order_to_mcap_ratio": f"Backed by Market Cap of {screener_info['market_cap']}",
-            "scope_of_work": f"Commercial execution of contract as disclosed by {c_name} on BSE",
-            "execution_timeline": "As per contract schedule",
-        },
-        "market_cap": screener_info["market_cap"],
-        "pe_ratio": screener_info["pe_ratio"],
-        "pb_ratio": screener_info["pb_ratio"],
-        "industry_pe": screener_info["industry_pe"],
-        "roe": screener_info["roe"],
-        "eps": screener_info["eps"],
-        "div_yield": screener_info["div_yield"],
-        "book_value": screener_info["book_value"],
-        "total_debt": screener_info["total_debt"],
-        "debt_to_equity": screener_info["debt_to_equity"],
-        "face_value": screener_info["face_value"],
-        "fundamental_impact_note": f"{c_name} maintains a Debt-to-Equity ratio of {screener_info['debt_to_equity']} with ROE at {screener_info['roe']}.",
-        "estimated_stock_return": f"{screener_info['target_2026']} (2026 Valuation Outlook)",
-        "intraday_signal": f"Strong search interest around {c_name} ({screener_info['price_str']}) with 52-Week High at {screener_info['high_52w']} and Low at {screener_info['low_52w']}.",
-        "quarter_chart_labels": screener_info["q_labels"],
-        "quarter_chart_revenue": screener_info["q_rev"],
-        "quarter_chart_gross_profit": screener_info["q_gp"],
-        "quarter_chart_net_profit": screener_info["q_np"],
-    }
-
-    if doc_type == "result":
-        fallback = ensure_valid_result_numbers(fallback, screener_info, pdf_text_len)
-        np_g = fallback["net_profit"]["growth"]
-        rev_c = fallback["revenue"]["curr"]
-        np_c = fallback["net_profit"]["curr"]
-        fallback["seo_title"] = f"{c_name} Share Price Target 2026, Q2 Results (PAT {np_g} YoY) & Latest News"[:105]
-        fallback["seo_lead_summary"] = (
-            f"Looking for {c_name} share price target 2026, Q2 results, and fundamental analysis? "
-            f"{c_name} (BSE: {scrip_code}) declared Consolidated Revenue of ₹{rev_c} Cr and Net Profit (PAT) of "
-            f"₹{np_c} Cr ({np_g} YoY). Trading near {screener_info['price_str']}, check its 2026-2030 valuation outlook."
-        )
-        fallback["gujarati_summary"] = (
-            f"{c_name} કંપનીએ તેના ત્રિમાસિક પરિણામો જાહેર કર્યા છે, જેમાં કંપનીની આવક ₹{rev_c} કરોડ અને "
-            f"ચોખ્ખો નફો (PAT) ₹{np_c} કરોડ ({np_g} YoY) નોંધાયો છે."
-        )
-    else:
-        fallback["seo_title"] = f"{c_name} Share Latest News: Bags {ord_val_extracted} Order | Share Price Target 2026"[:105]
-        fallback["seo_lead_summary"] = (
-            f"Why is {c_name} share price in focus today? {c_name} (BSE: {scrip_code}) has bagged a new order worth "
-            f"{ord_val_extracted}. Trading at {screener_info['price_str']} with a Market Cap of {screener_info['market_cap']}, "
-            f"check {c_name} share price target 2026, order book, and fundamental analysis."
-        )
-        fallback["gujarati_summary"] = (
-            f"{c_name} કંપનીને નવો કોન્ટ્રેક્ટ / ઓર્ડર ({ord_val_extracted}) મળ્યો છે, જેનાથી કંપનીની ઓર્ડર બુક અને આવનારા ક્વાર્ટરની આવકમાં મજબૂત વધારો થશે."
-        )
-
-    fallback["gujarati_intraday_view"] = (
-        f"કંપનીનો Debt-to-Equity રેશિયો {screener_info['debt_to_equity']} અને ROE {screener_info['roe']} છે, જે મધ્યમથી લાંબા ગાળા માટે મજબૂત ફંડામેન્ટલ્સ દર્શાવે છે."
-    )
-    fallback["key_highlights"] = [
-        f"{c_name} Share Price & 52W Range: Currently trading at {screener_info['price_str']} (52-Week High: {screener_info['high_52w']} | 52-Week Low: {screener_info['low_52w']}).",
-        f"Quarterly Earnings / Order Catalyst: {'Revenue at ₹' + fallback['revenue']['curr'] + ' Cr & Consolidated PAT at ₹' + fallback['net_profit']['curr'] + ' Cr (' + fallback['net_profit']['growth'] + ' YoY)' if doc_type=='result' else 'New Order Win of ' + ord_val_extracted}.",
-        f"Balance Sheet & Debt Status: Total Debt stands at {screener_info['total_debt']} with a Debt-to-Equity ratio of {screener_info['debt_to_equity']}.",
-        f"Valuation Comparison: Stock P/E is {screener_info['pe_ratio']} vs Industry P/E of {screener_info['industry_pe']}, supported by ROE of {screener_info['roe']} and Book Value of {screener_info['book_value']}.",
-    ]
-    fallback["web_story_hook"] = [
-        f"{c_name} ({screener_info['price_str']}) reports Revenue of ₹{fallback['revenue']['curr']} Cr ({fallback['revenue']['growth']} YoY)!" if doc_type == "result" else f"{c_name} ({screener_info['price_str']}) wins new order ({ord_val_extracted})!",
-        f"Consolidated Net Profit (PAT) at ₹{fallback['net_profit']['curr']} Cr ({fallback['net_profit']['growth']} YoY) with ROE of {screener_info['roe']}." if doc_type == "result" else f"Market Cap stands at {screener_info['market_cap']} with ROE of {screener_info['roe']}.",
-        f"52-Week High/Low range at {screener_info['high_52w']} / {screener_info['low_52w']} with {screener_info['debt_to_equity']} Debt-to-Equity.",
-        f"2026 Fundamental Valuation Target range estimated at {screener_info['target_2026']} based on earnings trajectory.",
-    ]
-    fallback["seo_article_sections"] = [
-        {
-            "heading": f"Why {c_name} Share is in Focus Today: Quarterly Results & Order Book Breakdown",
-            "body": (
-                f"{c_name} (BSE: {scrip_code}) has captured strong investor search interest following its latest corporate filing. "
-                f"With a market capitalization of {screener_info['market_cap']}, the company recorded top-line revenue of "
-                f"₹{fallback['revenue']['curr']} Cr ({fallback['revenue']['growth']} YoY) and Net Profit of ₹{fallback['net_profit']['curr']} Cr ({fallback['net_profit']['growth']} YoY)."
-            ),
-        },
-        {
-            "heading": f"{c_name} Share Price Target 2026, 2027, 2030 & Valuation Analysis",
-            "body": (
-                f"Investors searching for the {c_name} share price target should evaluate its earnings multiple and balance sheet strength. "
-                f"Trading at {screener_info['price_str']} against a Book Value of {screener_info['book_value']}, the stock commands a P/E of "
-                f"{screener_info['pe_ratio']} compared to its Industry P/E of {screener_info['industry_pe']}. Based on its EPS (TTM) of "
-                f"{screener_info['eps']} and ROE of {screener_info['roe']}, its fundamental valuation band for 2026 is projected around {screener_info['target_2026']}."
-            ),
-        },
-        {
-            "heading": f"Is {c_name} Share a Good Buy for Long Term? Debt & ROE Check",
-            "body": (
-                f"For long-term portfolio investors, balance sheet leverage is a critical filter. {c_name} carries total borrowings of "
-                f"{screener_info['total_debt']} with a Debt-to-Equity ratio of {screener_info['debt_to_equity']}. Combined with a dividend yield of "
-                f"{screener_info['div_yield']} and 52-week high/low bounds of {screener_info['high_52w']} / {screener_info['low_52w']}, retail investors should track upcoming quarterly margin expansion."
-            ),
-        },
-    ]
-    fallback["faqs"] = [
-        {
-            "q": f"What is the {c_name} share price target for 2026 and 2027?",
-            "a": f"Based on current EPS (TTM) of {screener_info['eps']}, ROE of {screener_info['roe']}, and P/E valuation of {screener_info['pe_ratio']}, {c_name}'s fundamental valuation range is estimated at {screener_info['target_2026']} for 2026 and {screener_info['target_2027']} for 2027.",
-        },
-        {
-            "q": f"Why is {c_name} share price rising or falling today?",
-            "a": f"{c_name} share is reacting to its latest BSE filing where Consolidated Net Profit stood at ₹{fallback['net_profit']['curr']} Cr ({fallback['net_profit']['growth']} YoY) on Revenue of ₹{fallback['revenue']['curr']} Cr.",
-        },
-        {
-            "q": f"Is {c_name} a debt-free company?",
-            "a": f"{c_name} has a total debt of {screener_info['total_debt']} and a Debt-to-Equity ratio of {screener_info['debt_to_equity']}.",
-        },
-        {
-            "q": f"Is {c_name} share a good buy for long term investment?",
-            "a": f"With a Market Cap of {screener_info['market_cap']}, ROE of {screener_info['roe']}, and Stock P/E of {screener_info['pe_ratio']} (vs Industry P/E {screener_info['industry_pe']}), {c_name} offers solid fundamental metrics for long-term tracking.",
-        },
-    ]
-    return fallback
-
-
 def analyze_with_gemini_json(company_title, scrip_code, doc_type, source_text, pdf_bytes, screener_info, trending_kws, pdf_text_len=0):
-    scr_defaults = get_screener_yoy_defaults(screener_info)
     c_clean_name = screener_info.get("screener_company_name") or re.sub(r"\(\d+\)", "", company_title).split("-")[0].strip()
     kws_str = ", ".join(trending_kws)
+    ist_today_str = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%B %d, %Y")
 
     prompt = f"""
-You are India's #1 SEO Financial Journalist and Equity Research Analyst for 'MarketMunafa' (https://marketmunafa.blogspot.com).
-Analyze the attached BSE corporate filing ({doc_type.upper()}) and Screener Consolidated fundamentals data for {c_clean_name}.
+You are India's #1 Chartered Accountant (CA), Equity Research Analyst, and SEO Financial Journalist for 'MarketMunafa' (https://marketmunafa.blogspot.com).
+Carefully inspect EVERY PAGE of the attached BSE Corporate Filing PDF ({doc_type.upper()}) for {c_clean_name} (BSE: {scrip_code}).
 
-STRICT RULES FOR CONSOLIDATED DATA ACCURACY & HIGH GOOGLE TRAFFIC:
-1. CONSOLIDATED PRIORITY (CRITICAL): Always extract 'Consolidated' financial results (Revenue from Operations, Operating Profit/EBITDA, and Net Profit/PAT) from the attached PDF first! Convert Lakhs into Crores (divide by 100) or Millions into Crores (divide by 10). Only use Screener backup numbers if the PDF has no financial table.
-2. STRONG RESULT FILTER: Set `"skip_stock": false` ONLY IF the company has strong results (positive YoY Net Profit growth >= 5%, turnaround to profit, strong revenue expansion, or major order win). If results are weak/loss-making/flat, set `"skip_stock": true`.
-3. HIGH-SEARCH-VOLUME TITLE (FOR BLOGGER URL SLUG): Your `seo_title` MUST start with `{c_clean_name} Share Price Target 2026` or `{c_clean_name} Q2 Results` or `{c_clean_name} Share Latest News`.
-4. NATURALLY INTEGRATE THESE LIVE GOOGLE TRENDING KEYWORDS IN HEADINGS, BODY & FAQs:
-   {kws_str}
-5. 100% ORIGINAL & ADSENSE SAFE: Frame price targets strictly as educational/fundamental valuation projections based on EPS & P/E.
+CRITICAL RULES FOR 100% ACCURATE PDF EXTRACTION (DO NOT VIOLATE):
+1. THE ATTACHED PDF IS THE SINGLE SOURCE OF TRUTH FOR FINANCIAL RESULT NUMBERS:
+   - Read the financial results table directly from the attached PDF document (including scanned image tables).
+   - NEVER use old quarters like 'Jun 2026' or 'Mar 2026' if the PDF is for 'Sep 2026' (Quarter ended 30.09.2026)!
+2. CONSOLIDATED vs STANDALONE:
+   - If the PDF contains BOTH Consolidated and Standalone financial results, strictly extract **Consolidated** figures and set `"result_type": "Consolidated"`.
+   - If the PDF contains ONLY Standalone financial results, extract **Standalone** figures and set `"result_type": "Standalone"`.
+3. EXACT COLUMN SELECTION (YEAR-ON-YEAR / YoY COMPARISON):
+   - Look at the **"Quarter Ended" (3 Months)** columns in the PDF table:
+     * `curr_period_label`: The latest quarter ended in the PDF (format strictly as `"Sep 2026"` for 30.09.2026).
+     * `prev_period_label`: The **SAME QUARTER LAST YEAR (YoY)** in the PDF (format strictly as `"Sep 2025"` for 30.09.2025).
+   - DO NOT compare `Sep 2026` with `Jun 2026` or `Mar 2026` unless the `Sep 2025` column is completely absent in the PDF (e.g. SME Half-Yearly filing where only 6-month columns exist).
+   - Do NOT pick 6-Month (Half-Yearly) or 12-Month (Yearly) columns when 3-Month (Quarterly) columns are present!
+4. EXACT UNIT CONVERSION TO Rs. CRORES (₹ Cr):
+   - First check the unit written at the top of the PDF table (`Rs. in Lakhs`, `Rs. in Crores`, `Rs. in Millions`, `Rs. in Thousands`).
+   - Convert every figure accurately into **Rs. Crores (₹ Cr)**:
+     * If `Rs. in Lakhs`: Divide by `100` (e.g. `10,363.00 Lakhs` = `103.63` Cr; `467.00 Lakhs` = `4.67` Cr).
+     * If `Rs. in Millions`: Divide by `10` (e.g. `1,036.30 Millions` = `103.63` Cr).
+     * If `Rs. in Thousands`: Divide by `10,000`.
+     * If `Rs. in Crores`: Keep exact value.
+5. EXACT ROWS TO EXTRACT FROM THE PDF TABLE:
+   - `revenue`: **Revenue from Operations** (or Total Income if Revenue from Operations is not separate).
+   - `gross_profit`: **EBITDA / Operating Profit** = Calculate `Profit Before Exceptional Items & Tax (PBT) + Finance Costs + Depreciation & Amortization` from the PDF table!
+   - `net_profit`: **Net Profit (PAT)** = `Profit / (Loss) for the period (after tax)`.
+6. STRONG RESULT FILTER:
+   - Set `"skip_stock": false` ONLY IF the PDF shows strong performance (positive YoY Net Profit growth >= 5%, turnaround from loss to profit, strong revenue growth >= 15%, or a new order win). If the result is weak, loss-making, or unreadable, set `"skip_stock": true`.
+   - If you cannot read the financial table in the PDF clearly, set `"pdf_table_verified": false` and `"skip_stock": true`. Never guess numbers!
+7. HIGH-SEARCH-VOLUME SEO TITLE & KEYWORDS:
+   - `seo_title` MUST start with `{c_clean_name} Share Price Target 2026` or `{c_clean_name} Q2 Results` or `{c_clean_name} Share Latest News`.
+   - Naturally weave these live Google trending keywords into headings, body, and FAQs: {kws_str}
 
 Company Name: {c_clean_name} (BSE: {scrip_code})
-Screener Verified Consolidated Fundamentals:
+Screener Verified Valuation Ratios (Use ONLY for Valuation/Fundamental sections, NOT for the Q2 Result Table):
 - Current Share Price: {screener_info['price_str']} (52W High: {screener_info['high_52w']} | 52W Low: {screener_info['low_52w']})
 - Market Cap: {screener_info['market_cap']}
 - Stock P/E: {screener_info['pe_ratio']} | Industry P/E: {screener_info['industry_pe']} | P/B: {screener_info['pb_ratio']}
@@ -1115,34 +991,30 @@ Screener Verified Consolidated Fundamentals:
 - Book Value: {screener_info['book_value']} | Div Yield: {screener_info['div_yield']}
 - Algorithmic Valuation Bands: 2026: {screener_info['target_2026']} | 2027: {screener_info['target_2027']} | 2030: {screener_info['target_2030']}
 
-Screener Backup Consolidated Quarters (use ONLY if PDF table is unreadable; in Rs. Cr.):
-{screener_info['quarters_text']}
-Backup YoY Revenue: {json.dumps(scr_defaults['revenue'])}
-Backup YoY EBITDA/GP: {json.dumps(scr_defaults['gross_profit'])}
-Backup YoY PAT: {json.dumps(scr_defaults['net_profit'])}
-
-Return ONLY a valid JSON object with this exact structure (fill in exact Consolidated numbers in Rs. Cr.):
+Return ONLY a valid JSON object with this exact structure:
 {{
+  "pdf_table_verified": true,
+  "pdf_original_unit": "Lakhs or Crores or Millions",
   "skip_stock": false,
   "seo_title": "{c_clean_name} Share Price Target 2026, Q2 Results (PAT YoY Growth) & Latest News",
-  "seo_lead_summary": "45-60 word high-CTR summary in English starting with '{c_clean_name} Share Price Target 2026 & Q2 Results:' covering exact Consolidated PAT/Revenue YoY growth or Order value, current price ({screener_info['price_str']}), and valuation impact.",
+  "seo_lead_summary": "45-60 word high-CTR summary in English starting with '{c_clean_name} Share Price Target 2026 & Q2 Results:' covering exact PDF PAT/Revenue YoY growth or Order value, current price ({screener_info['price_str']}), and valuation impact.",
   "company_short_name": "{c_clean_name}",
-  "result_date": "November 15, 2026",
+  "result_date": "{ist_today_str}",
   "price_display": "{screener_info['price_str']}",
-  "quarter_label": "Q2 / Quarterly",
-  "curr_period_label": "{scr_defaults['curr_lbl']}",
-  "prev_period_label": "{scr_defaults['prev_lbl']}",
+  "quarter_label": "Q2 FY27 (Quarterly)",
+  "curr_period_label": "Sep 2026",
+  "prev_period_label": "Sep 2025",
   "result_type": "Consolidated",
   "revenue": {{"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"}},
   "gross_profit": {{"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"}},
   "net_profit": {{"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"}},
   "debt_comparison": {{"curr": "{screener_info['curr_debt_num']}", "prev": "{screener_info['prev_debt_num']}"}},
   "order_details": {{
-    "client_or_awarder": "Client Name",
-    "order_value": "Order Value in Rs. Cr.",
+    "client_or_awarder": "Client Name from PDF",
+    "order_value": "Order Value in Rs. Cr. from PDF",
     "order_to_mcap_ratio": "Order Value as % of Market Cap",
-    "scope_of_work": "Project scope",
-    "execution_timeline": "Execution timeline"
+    "scope_of_work": "Project scope from PDF",
+    "execution_timeline": "Execution timeline from PDF"
   }},
   "market_cap": "{screener_info['market_cap']}",
   "pe_ratio": "{screener_info['pe_ratio']}",
@@ -1158,26 +1030,22 @@ Return ONLY a valid JSON object with this exact structure (fill in exact Consoli
   "fundamental_impact_note": "1-2 sentences in English explaining what changed in {c_clean_name}'s fundamentals.",
   "estimated_stock_return": "{screener_info['target_2026']} (Medium-Term Valuation Band)",
   "intraday_signal": "1-2 sentences in English covering 52-week high/low ({screener_info['high_52w']} / {screener_info['low_52w']}) and momentum.",
-  "quarter_chart_labels": {json.dumps(screener_info['q_labels'])},
-  "quarter_chart_revenue": {json.dumps(screener_info['q_rev'])},
-  "quarter_chart_gross_profit": {json.dumps(screener_info['q_gp'])},
-  "quarter_chart_net_profit": {json.dumps(screener_info['q_np'])},
   "key_highlights": [
-    "Bullet 1 in English: Consolidated Revenue & PAT YoY growth or Order Book milestone with exact numbers.",
+    "Bullet 1 in English: Exact PDF Revenue & PAT YoY growth (in ₹ Cr) or Order Book milestone.",
     "Bullet 2 in English: 52-Week High ({screener_info['high_52w']}) & Low ({screener_info['low_52w']}) vs Current Price ({screener_info['price_str']}).",
     "Bullet 3 in English: Total Debt ({screener_info['total_debt']}) and Debt-to-Equity ({screener_info['debt_to_equity']}) analysis.",
     "Bullet 4 in English: Stock P/E ({screener_info['pe_ratio']}) vs Industry P/E ({screener_info['industry_pe']}) and ROE ({screener_info['roe']})."
   ],
   "web_story_hook": [
-    "Punchy Web Story slide 1 about {c_clean_name}'s exact Consolidated profit jump or order win.",
+    "Punchy Web Story slide 1 with {c_clean_name}'s exact PDF revenue & profit jump or order win.",
     "Punchy Web Story slide 2 about {c_clean_name}'s Share Price Target 2026 ({screener_info['target_2026']}).",
     "Punchy Web Story slide 3 about Debt-to-Equity ({screener_info['debt_to_equity']}) and ROE ({screener_info['roe']}).",
     "Punchy Web Story slide 4 about Stock P/E ({screener_info['pe_ratio']}) vs Sector P/E ({screener_info['industry_pe']})."
   ],
   "seo_article_sections": [
     {{
-      "heading": "Why {c_clean_name} Share Price is in Focus Today: Q2 Results & Earnings Breakdown",
-      "body": "140-160 words in English analyzing the exact Consolidated numbers, YoY profit growth, and operational performance."
+      "heading": "Why {c_clean_name} Share Price is in Focus Today: Q2 Results & PDF Earnings Breakdown",
+      "body": "140-160 words in English analyzing the exact numbers extracted from the BSE PDF, YoY profit growth, and operational margins."
     }},
     {{
       "heading": "{c_clean_name} Share Price Target 2026, 2027, 2030 & Fundamental Valuation",
@@ -1185,7 +1053,7 @@ Return ONLY a valid JSON object with this exact structure (fill in exact Consoli
     }},
     {{
       "heading": "Is {c_clean_name} Share a Good Buy for Long Term? Debt-to-Equity & ROE Analysis",
-      "body": "120-140 words in English evaluating Total Debt ({screener_info['total_debt']}), Debt-to-Equity ({screener_info['debt_to_equity']}), ROE ({screener_info['roe']}), and key risks."
+      "body": "120-140 words in English evaluating Total Debt ({screener_info['total_debt']}), Debt-to-Equity ({screener_info['debt_to_equity']}), ROE ({screener_info['roe']}), and key triggers."
     }}
   ],
   "faqs": [
@@ -1194,8 +1062,8 @@ Return ONLY a valid JSON object with this exact structure (fill in exact Consoli
       "a": "Direct 2-sentence answer in English citing valuation bands ({screener_info['target_2026']} for 2026 and {screener_info['target_2030']} for 2030) based on EPS and ROE."
     }},
     {{
-      "q": "Why is {c_clean_name} share rising or falling after Q2 results?",
-      "a": "Direct 2-sentence answer in English with exact Consolidated Revenue and Net Profit YoY numbers."
+      "q": "How were {c_clean_name} Q2 results according to the official BSE PDF?",
+      "a": "Direct 2-sentence answer in English with exact Revenue, EBITDA, and Net Profit YoY numbers from the PDF."
     }},
     {{
       "q": "Is {c_clean_name} a debt-free stock?",
@@ -1206,14 +1074,15 @@ Return ONLY a valid JSON object with this exact structure (fill in exact Consoli
       "a": "Direct answer in English comparing Stock P/E ({screener_info['pe_ratio']}) with Industry P/E ({screener_info['industry_pe']}) and ROE ({screener_info['roe']})."
     }}
   ],
-  "gujarati_summary": "2-3 sentences in natural Gujarati summarizing {c_clean_name}'s exact Consolidated result (YoY) or new order.",
+  "gujarati_summary": "2-3 sentences in natural Gujarati summarizing {c_clean_name}'s exact PDF result (YoY) or new order.",
   "gujarati_intraday_view": "1-2 sentences in natural Gujarati explaining debt, valuation, and expected return."
 }}
 
-Extracted Text from Filing:
+Supplementary Extracted Text from Filing (if any):
 {source_text[:MAX_TEXT_CHARS]}
 """
-    response = call_ai_api(prompt, pdf_bytes)
+    require_vision = (pdf_bytes is not None and pdf_text_len < 400)
+    response = call_ai_api(prompt, pdf_bytes, require_pdf_vision=require_vision)
 
     if response and getattr(response, "text", None):
         raw = response.text.strip()
@@ -1224,16 +1093,16 @@ Extracted Text from Filing:
                 if isinstance(parsed.get("web_story_hook"), str):
                     parsed["web_story_hook"] = [parsed["web_story_hook"]]
                 if doc_type == "result":
-                    parsed = ensure_valid_result_numbers(parsed, screener_info, pdf_text_len)
+                    parsed = verify_and_normalize_pdf_result_numbers(parsed, screener_info)
                 return parsed
             except Exception as exc:
-                log.warning("JSON parse warning, using smart fallback: %s", exc)
+                log.warning("JSON parse error for %s: %s", company_title, exc)
 
-    return build_smart_fallback_data(company_title, scrip_code, doc_type, source_text, screener_info, trending_kws, pdf_text_len)
+    return None
 
 
 # ==========================================
-# 8. VISUAL CHARTS & MOBILE-FRIENDLY HTML BUILDER
+# 8. VISUAL CHARTS & MOBILE-PERFECT HTML BUILDER
 # ==========================================
 def build_quarterly_column_chart_url(comp_name, labels, rev_list, gp_list, np_list):
     datasets = [
@@ -1273,7 +1142,7 @@ def build_yoy_comparison_chart_url(comp_name, qtr_lbl, prev_lbl, curr_lbl, rev, 
         },
         "options": {
             "layout": {"padding": {"top": 26, "right": 14, "left": 10, "bottom": 8}},
-            "title": {"display": True, "text": f"{comp_name} - {qtr_lbl} YoY (Rs.Cr.)", "fontSize": 17, "fontColor": "#475569", "padding": 14},
+            "title": {"display": True, "text": f"{comp_name} - {curr_lbl} vs {prev_lbl} YoY (Rs.Cr.)", "fontSize": 16, "fontColor": "#475569", "padding": 14},
             "legend": {"display": True, "position": "top", "labels": {"fontSize": 13, "fontColor": "#475569"}},
             "scales": {"yAxes": [{"ticks": {"beginAtZero": True, "padding": 6}}], "xAxes": [{"ticks": {"fontSize": 13, "fontColor": "#475569"}}]},
             "plugins": {"datalabels": {"display": True, "anchor": "end", "align": "top", "offset": 2, "clip": False, "color": "#000000", "font": {"weight": "bold", "size": 12}}},
@@ -1291,8 +1160,8 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
 
     price_disp = html.escape(str(data.get("price_display", screener_info["price_str"])))
     qtr_lbl = html.escape(str(data.get("quarter_label", "Q2 / Quarterly")))
-    curr_lbl = html.escape(str(data.get("curr_period_label", "Current")))
-    prev_lbl = html.escape(str(data.get("prev_period_label", "Previous")))
+    curr_lbl = html.escape(shorten_period_label(data.get("curr_period_label", "Sep 2026")))
+    prev_lbl = html.escape(shorten_period_label(data.get("prev_period_label", "Sep 2025")))
     res_type = html.escape(str(data.get("result_type", "Consolidated")))
 
     mkt_cap = html.escape(str(data.get("market_cap") or screener_info["market_cap"]))
@@ -1337,7 +1206,7 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
             </div>
             """)
 
-    # 2. RESULT / ORDER TABLE (100% MOBILE RESPONSIVE - NO CLIPPING)
+    # 2. RESULT / ORDER TABLE (NO WRAPPING OR CLIPPING ON MOBILE)
     if doc_type == "order":
         ord_info = data.get("order_details", {}) or {}
         order_card = f"""
@@ -1359,10 +1228,10 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
         np_d = data.get("net_profit", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
         debt_comp = data.get("debt_comparison") or {"curr": screener_info["curr_debt_num"], "prev": screener_info["prev_debt_num"]}
 
-        q_labels = data.get("quarter_chart_labels") or screener_info["q_labels"] or [prev_lbl, curr_lbl]
-        q_rev = data.get("quarter_chart_revenue") or screener_info["q_rev"] or [to_float(rev.get("prev")), to_float(rev.get("curr"))]
-        q_gp = data.get("quarter_chart_gross_profit") or screener_info["q_gp"] or [to_float(gp.get("prev")), to_float(gp.get("curr"))]
-        q_np = data.get("quarter_chart_net_profit") or screener_info["q_np"] or [to_float(np_d.get("prev")), to_float(np_d.get("curr"))]
+        q_labels = data.get("quarter_chart_labels") or [prev_lbl, curr_lbl]
+        q_rev = data.get("quarter_chart_revenue") or [to_float(rev.get("prev")), to_float(rev.get("curr"))]
+        q_gp = data.get("quarter_chart_gross_profit") or [to_float(gp.get("prev")), to_float(gp.get("curr"))]
+        q_np = data.get("quarter_chart_net_profit") or [to_float(np_d.get("prev")), to_float(np_d.get("curr"))]
 
         quarter_chart_url = build_quarterly_column_chart_url(comp_name, q_labels, q_rev, q_gp, q_np)
         yoy_chart_url = build_yoy_comparison_chart_url(comp_name, qtr_lbl, prev_lbl, curr_lbl, rev, gp, np_d, debt_comp)
@@ -1378,37 +1247,37 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
             <span>Figures in ₹ Cr.</span>
           </div>
           <div style="width: 100%; overflow-x: auto;">
-            <table style="width: 100%; border-collapse: collapse; font-size: 13px; text-align: right;">
+            <table style="width: 100%; border-collapse: collapse; font-size: 12.5px; text-align: right;">
               <thead>
                 <tr style="border-top: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0; color: #475569; font-weight: 700; background: #f8fafc;">
-                  <th style="text-align: left; padding: 8px 4px;">Metric</th>
-                  <th style="padding: 8px 4px;">{curr_lbl}</th>
-                  <th style="padding: 8px 4px;">{prev_lbl}</th>
-                  <th style="padding: 8px 4px;">Change</th>
-                  <th style="padding: 8px 4px;">YoY %</th>
+                  <th style="text-align: left; padding: 8px 4px; white-space: nowrap;">Metric</th>
+                  <th style="padding: 8px 4px; white-space: nowrap;">{curr_lbl}</th>
+                  <th style="padding: 8px 4px; white-space: nowrap;">{prev_lbl}</th>
+                  <th style="padding: 8px 4px; white-space: nowrap;">Change</th>
+                  <th style="padding: 8px 4px; white-space: nowrap;">YoY %</th>
                 </tr>
               </thead>
               <tbody>
                 <tr style="border-bottom: 1px solid #f1f5f9;">
-                  <td style="text-align: left; padding: 10px 4px; color: #1e293b; font-weight: 600;">Revenue</td>
-                  <td style="padding: 10px 4px; font-weight: 600;">₹{html.escape(str(rev.get('curr', '0')))}</td>
-                  <td style="padding: 10px 4px; color: #64748b;">₹{html.escape(str(rev.get('prev', '0')))}</td>
-                  <td style="padding: 10px 4px; font-weight: 600;">{html.escape(str(rev.get('difference', '0')))}</td>
-                  <td style="padding: 10px 4px; font-weight: 700; color: {growth_color(rev.get('growth', ''))};">{html.escape(str(rev.get('growth', '0%')))}</td>
+                  <td style="text-align: left; padding: 10px 4px; color: #1e293b; font-weight: 600; white-space: nowrap;">Revenue</td>
+                  <td style="padding: 10px 4px; font-weight: 600; white-space: nowrap;">₹{html.escape(str(rev.get('curr', '0')))}</td>
+                  <td style="padding: 10px 4px; color: #64748b; white-space: nowrap;">₹{html.escape(str(rev.get('prev', '0')))}</td>
+                  <td style="padding: 10px 4px; font-weight: 600; white-space: nowrap;">{html.escape(str(rev.get('difference', '0')))}</td>
+                  <td style="padding: 10px 4px; font-weight: 700; white-space: nowrap; color: {growth_color(rev.get('growth', ''))};">{html.escape(str(rev.get('growth', '0%')))}</td>
                 </tr>
                 <tr style="border-bottom: 1px solid #f1f5f9;">
-                  <td style="text-align: left; padding: 10px 4px; color: #1e293b; font-weight: 600;">EBITDA</td>
-                  <td style="padding: 10px 4px; font-weight: 600;">₹{html.escape(str(gp.get('curr', '0')))}</td>
-                  <td style="padding: 10px 4px; color: #64748b;">₹{html.escape(str(gp.get('prev', '0')))}</td>
-                  <td style="padding: 10px 4px; font-weight: 600;">{html.escape(str(gp.get('difference', '0')))}</td>
-                  <td style="padding: 10px 4px; font-weight: 700; color: {growth_color(gp.get('growth', ''))};">{html.escape(str(gp.get('growth', '0%')))}</td>
+                  <td style="text-align: left; padding: 10px 4px; color: #1e293b; font-weight: 600; white-space: nowrap;">EBITDA</td>
+                  <td style="padding: 10px 4px; font-weight: 600; white-space: nowrap;">₹{html.escape(str(gp.get('curr', '0')))}</td>
+                  <td style="padding: 10px 4px; color: #64748b; white-space: nowrap;">₹{html.escape(str(gp.get('prev', '0')))}</td>
+                  <td style="padding: 10px 4px; font-weight: 600; white-space: nowrap;">{html.escape(str(gp.get('difference', '0')))}</td>
+                  <td style="padding: 10px 4px; font-weight: 700; white-space: nowrap; color: {growth_color(gp.get('growth', ''))};">{html.escape(str(gp.get('growth', '0%')))}</td>
                 </tr>
                 <tr>
-                  <td style="text-align: left; padding: 10px 4px; color: #1e293b; font-weight: 600;">Net Profit (PAT)</td>
-                  <td style="padding: 10px 4px; font-weight: 600;">₹{html.escape(str(np_d.get('curr', '0')))}</td>
-                  <td style="padding: 10px 4px; color: #64748b;">₹{html.escape(str(np_d.get('prev', '0')))}</td>
-                  <td style="padding: 10px 4px; font-weight: 600;">{html.escape(str(np_d.get('difference', '0')))}</td>
-                  <td style="padding: 10px 4px; font-weight: 700; color: {growth_color(np_d.get('growth', ''))};">{html.escape(str(np_d.get('growth', '0%')))}</td>
+                  <td style="text-align: left; padding: 10px 4px; color: #1e293b; font-weight: 600; white-space: nowrap;">Net Profit</td>
+                  <td style="padding: 10px 4px; font-weight: 600; white-space: nowrap;">₹{html.escape(str(np_d.get('curr', '0')))}</td>
+                  <td style="padding: 10px 4px; color: #64748b; white-space: nowrap;">₹{html.escape(str(np_d.get('prev', '0')))}</td>
+                  <td style="padding: 10px 4px; font-weight: 600; white-space: nowrap;">{html.escape(str(np_d.get('difference', '0')))}</td>
+                  <td style="padding: 10px 4px; font-weight: 700; white-space: nowrap; color: {growth_color(np_d.get('growth', ''))};">{html.escape(str(np_d.get('growth', '0%')))}</td>
                 </tr>
               </tbody>
             </table>
@@ -1631,8 +1500,8 @@ def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, 
     res_date = html.escape(str(data.get("result_date", "")))
     price_disp = html.escape(str(data.get("price_display", screener_info["price_str"])))
     qtr_lbl = html.escape(str(data.get("quarter_label", "Quarterly")))
-    curr_lbl = html.escape(str(data.get("curr_period_label", "Current")))
-    prev_lbl = html.escape(str(data.get("prev_period_label", "Previous")))
+    curr_lbl = html.escape(shorten_period_label(data.get("curr_period_label", "Sep 2026")))
+    prev_lbl = html.escape(shorten_period_label(data.get("prev_period_label", "Sep 2025")))
     mkt_cap = html.escape(str(data.get("market_cap") or screener_info["market_cap"]))
     pe_ratio = html.escape(str(data.get("pe_ratio") or screener_info["pe_ratio"]))
     roe = html.escape(str(data.get("roe") or screener_info["roe"]))
@@ -1650,12 +1519,14 @@ def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, 
             f"({html.escape(str(ord_info.get('client_or_awarder', '-')))})\n\n"
         )
     else:
-        header_title = f"📊 <b>{comp_name} - {qtr_lbl} Consolidated રિઝલ્ટ</b>"
+        header_title = f"📊 <b>{comp_name} - {qtr_lbl} સાચા PDF રિઝલ્ટ અપડેટ</b>"
         rev = data.get("revenue", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
+        gp = data.get("gross_profit", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
         np_d = data.get("net_profit", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
         dynamic_block_gu = (
             f"📈 <b>નાણાકીય કામગીરી ({curr_lbl} vs {prev_lbl}):</b>\n"
             f"• <b>આવક (Revenue):</b> ₹{html.escape(str(rev.get('curr', '0')))} Cr ({html.escape(str(rev.get('growth', '0%')))} YoY)\n"
+            f"• <b>EBITDA:</b> ₹{html.escape(str(gp.get('curr', '0')))} Cr ({html.escape(str(gp.get('growth', '0%')))} YoY)\n"
             f"• <b>ચોખ્ખો નફો (PAT):</b> ₹{html.escape(str(np_d.get('curr', '0')))} Cr (<b>{html.escape(str(np_d.get('growth', '0%')))} YoY</b>)\n\n"
         )
 
@@ -1838,7 +1709,7 @@ def publish_item(item, doc_type, ai_data, screener_info, trending_kws, item_id, 
         else:
             blog_url = res_url
             mark_posted(item_id, comp_key, scrip_key, file_key, item["title"], source_url)
-            log.info("✅ Published High-SEO Post (%s): %s", doc_type, blog_url)
+            log.info("✅ Published 100%% PDF-Verified Post (%s): %s", doc_type, blog_url)
             ping_search_engines()
 
     send_telegram_gujarati(ai_data, doc_type, screener_info, blog_url, source_url, yoy_chart_url)
@@ -1846,7 +1717,7 @@ def publish_item(item, doc_type, ai_data, screener_info, trending_kws, item_id, 
 
 
 # ==========================================
-# 10. MAIN RUNNER
+# 10. MAIN RUNNER (ACCURACY-FIRST PIPELINE)
 # ==========================================
 def run():
     init_db()
@@ -1891,7 +1762,7 @@ def run():
             screener_info = get_screener_fundamentals(item["title"], scrip_code=scrip_code)
 
             if not screener_info["is_eligible_stock"]:
-                log.info("Skipping Penny/Unlisted Stock (Mkt Cap: %s): %s", screener_info["market_cap"], item["title"])
+                log.info("Skipping Penny/Unlisted/Mismatched Stock (Mkt Cap: %s): %s", screener_info["market_cap"], item["title"])
                 continue
 
             if screener_info.get("screener_company_name"):
@@ -1902,7 +1773,9 @@ def run():
             source_text, pdf_bytes, pdf_text_len = get_document_payload(item)
             file_key = extract_file_key(item["link"]) or file_key
 
-            if doc_type == "result" and not screener_info["q_all_rev"] and pdf_text_len < 200:
+            # 🛑 MANDATORY PDF REQUIREMENT: જો BSE ની PDF ડાઉનલોડ ન થઈ હોય, તો અંદાજિત આંકડાથી પોસ્ટ ન કરો
+            if not pdf_bytes:
+                log.warning("Skipping %s because official BSE PDF could not be downloaded.", item["title"])
                 continue
 
             c_search_name = screener_info.get("screener_company_name") or comp_basis
@@ -1912,14 +1785,18 @@ def run():
                 item["title"], scrip_code, doc_type, source_text, pdf_bytes, screener_info, trending_kws, pdf_text_len
             )
 
-            if ai_data.get("skip_stock") is True:
-                log.info("Skipping stock due to weak/flat financial results: %s", item["title"])
+            # જો AI એ PDF ન વાંચી હોય અથવા પરિણામ નબળું હોય તો સ્કીપ કરો
+            if not ai_data or ai_data.get("pdf_table_verified") is False or ai_data.get("skip_stock") is True:
+                log.info("Skipping stock (weak result or unverified PDF table): %s", item["title"])
                 continue
 
             if doc_type == "result":
                 r_curr = to_float(ai_data.get("revenue", {}).get("curr"))
                 np_curr = to_float(ai_data.get("net_profit", {}).get("curr"))
-                if r_curr == 0 and np_curr == 0:
+                curr_p = str(ai_data.get("curr_period_label", "")).lower()
+                # જૂના ક્વાર્ટર (Jun 2026 / Mar 2026) જો ભૂલથી આવી ગયા હોય તો પોસ્ટ ન થવા દો
+                if (r_curr == 0 and np_curr == 0) or any(old_q in curr_p for old_q in ("jun 2026", "mar 2026", "dec 2025")):
+                    log.warning("Skipping result post due to old period (%s) or zero figures: %s", curr_p, item["title"])
                     continue
 
             ai_comp_name = str(ai_data.get("company_short_name") or "").strip()
@@ -1954,7 +1831,8 @@ def run():
             if not blogger_ok:
                 break
 
-            time.sleep(12)
+            # બે પોસ્ટ વચ્ચે 15 સેકન્ડનો વિરામ જેથી Gemini અને Blogger બંને શાંતિથી અને ચોકસાઈથી કામ કરે
+            time.sleep(15)
         except Exception:
             log.exception("Item processing failed: %s", item["title"])
 
