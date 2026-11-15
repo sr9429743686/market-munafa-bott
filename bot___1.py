@@ -21,7 +21,14 @@ import PyPDF2
 from bs4 import BeautifulSoup
 import google.generativeai as genai
 
-# ---------------- CONFIG & RATE LIMITER (5 REQ/MIN, 20 REQ/DAY) ----------------
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
+
+# ==========================================
+# 1. CONFIGURATION & CREDENTIALS
+# ==========================================
 BLOG_ID = os.getenv("BLOG_ID", "6996150531679127159").strip()
 BLOG_BASE_URL = os.getenv("BLOG_BASE_URL", "https://marketmunafa.blogspot.com").rstrip("/")
 GOOGLE_CLIENT_ID = (os.getenv("GOOGLE_CLIENT_ID") or os.getenv("CLIENT_ID") or "").strip()
@@ -31,19 +38,34 @@ GOOGLE_REFRESH_TOKEN = (os.getenv("GOOGLE_REFRESH_TOKEN") or os.getenv("REFRESH_
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9086072964:AAEUyn-GAyJLdsYR4YS5l6Xy6HJsOOoA8HM").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "430834857").strip()
 
+# ---------------- GEMINI 3.5 FLASH-LITE QUOTA (15 RPM, 250k TPM, 500 RPD) ----------------
 GEMINI_API_KEYS = [
     "AQ.Ab8RN6" + "JWzU70V3RM1zMEx0VEYmUj4q" + "EvvqqKbH27t1oHIO3Xjg",
     "AQ.Ab8RN6" + "Iw_vLVx2SPdac2gbUhK5fiSy" + "ihpDMHASZdZzdd4SnFGQ",
 ]
-
 for _ek in re.split(r"[,\s]+", os.getenv("GEMINI_API_KEY", "").strip()):
     if _ek and _ek not in GEMINI_API_KEYS:
         GEMINI_API_KEYS.append(_ek)
 
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash").strip()
-MAX_REQ_PER_KEY_PER_MINUTE = 5
-MAX_REQ_PER_KEY_PER_DAY = 20
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
+GEMINI_MAX_RPM = 12
+GEMINI_MAX_TPM = 240000
+GEMINI_MAX_RPD = 500
+
+# ---------------- OPENROUTER BACKUP KEYS (2 KEYS: 5 RPM, 20 RPD) ----------------
+OPENROUTER_KEYS = [
+    "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",
+    "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",
+]
+OPENROUTER_MAX_RPM = 5
+OPENROUTER_MAX_RPD = 20
+
 RATE_WINDOW_SECONDS = 60.0
+
+# ---------------- QUALITY & ACCURACY FILTERS ----------------
+# ₹75 Cr થી ઉપરના તમામ Small Cap, Mid Cap અને Large Cap શેર્સ લેવાશે (Share Price ની શરત કાઢી નાખી છે જેથી Easy Trip જેવા શેર સ્કીપ ન થાય)
+MIN_MARKET_CAP_CR = float(os.getenv("MIN_MARKET_CAP_CR", "75.0"))
+MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "10"))
 
 FEEDS = {
     "result": "https://www.bseindia.com/Data/XML/FinancialResultsFeed.aspx",
@@ -53,9 +75,9 @@ FEEDS = {
 DB_PATH = os.getenv("DB_PATH", "marketmunafa_seen.sqlite3")
 MAX_ITEMS_PER_FEED = int(os.getenv("MAX_ITEMS_PER_FEED", "100"))
 MAX_BLOG_POSTS_TO_SCAN = int(os.getenv("MAX_BLOG_POSTS_TO_SCAN", "500"))
-MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "12"))
-MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "15000"))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "25"))
+MAX_PDF_PAGES = int(os.getenv("MAX_PDF_PAGES", "20"))
+MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "20000"))
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "35"))
 POST_TO_BLOGGER = os.getenv("POST_TO_BLOGGER", "true").lower() == "true"
 SEND_TO_TELEGRAM = os.getenv("SEND_TO_TELEGRAM", "true").lower() == "true"
 
@@ -66,12 +88,16 @@ logging.basicConfig(
 log = logging.getLogger("marketmunafa")
 
 
-# ---------------- MULTI-KEY ROTATOR CLASS (5/MIN & 20/DAY PER KEY) ----------------
-class GeminiMultiKeyRotator:
-    def __init__(self, keys, max_per_min=5, max_per_day=20, window_sec=60.0):
+# ==========================================
+# 2. MULTI-KEY ROTATOR (PATIENT WAIT MODE)
+# ==========================================
+class MultiKeyRotator:
+    def __init__(self, name, keys, max_per_min, max_per_day, max_tpm=240000, window_sec=60.0):
+        self.name = name
         self.keys = [k.strip() for k in keys if k and k.strip()]
         self.max_per_min = max_per_min
         self.max_per_day = max_per_day
+        self.max_tpm = max_tpm
         self.window_sec = window_sec
         self.usage_history = {i: [] for i in range(len(self.keys))}
         self.daily_count = {i: 0 for i in range(len(self.keys))}
@@ -79,11 +105,15 @@ class GeminiMultiKeyRotator:
         self.exhausted_today = set()
         self.next_idx = 0
 
-    def acquire_key(self):
+    def acquire_key(self, estimated_tokens=6000):
         num_keys = len(self.keys)
-        while True:
+        if num_keys == 0:
+            return None, None
+
+        for _ in range(4):
             if len(self.exhausted_today) >= num_keys:
-                raise RuntimeError("All API keys have exhausted their daily quota (20/day)!")
+                log.warning("All %s keys have reached their daily quota (%d/day).", self.name, self.max_per_day)
+                return None, None
 
             now = time.time()
             earliest_wait = None
@@ -92,64 +122,132 @@ class GeminiMultiKeyRotator:
                 idx = (self.next_idx + offset) % num_keys
                 if idx in self.exhausted_today:
                     continue
-
                 if self.daily_count[idx] >= self.max_per_day:
                     self.exhausted_today.add(idx)
                     continue
 
                 cutoff = now - self.window_sec
-                self.usage_history[idx] = [t for t in self.usage_history[idx] if t > cutoff]
+                self.usage_history[idx] = [(t, tok) for (t, tok) in self.usage_history[idx] if t > cutoff]
 
                 if now < self.cooldown_until[idx]:
                     w = self.cooldown_until[idx] - now
                     earliest_wait = w if earliest_wait is None else min(earliest_wait, w)
                     continue
 
-                if len(self.usage_history[idx]) < self.max_per_min:
-                    self.usage_history[idx].append(now)
+                curr_rpm = len(self.usage_history[idx])
+                curr_tpm = sum(tok for (_, tok) in self.usage_history[idx])
+
+                if curr_rpm < self.max_per_min and (curr_tpm + estimated_tokens) <= self.max_tpm:
+                    self.usage_history[idx].append((now, estimated_tokens))
                     self.daily_count[idx] += 1
                     self.next_idx = (idx + 1) % num_keys
                     log.info(
-                        "Using Key #%d/%d | Model: %s | Minute Req: %d/%d | Daily Req: %d/%d",
+                        "Using %s Key #%d/%d | RPM: %d/%d | TPM: %d/%d | RPD: %d/%d",
+                        self.name,
                         idx + 1,
                         num_keys,
-                        GEMINI_MODEL,
-                        len(self.usage_history[idx]),
+                        curr_rpm + 1,
                         self.max_per_min,
+                        curr_tpm + estimated_tokens,
+                        self.max_tpm,
                         self.daily_count[idx],
                         self.max_per_day,
                     )
                     return idx, self.keys[idx]
                 else:
-                    w = (self.usage_history[idx][0] + self.window_sec) - now + 1.0
+                    w = (self.usage_history[idx][0][0] + self.window_sec) - now + 1.5
                     earliest_wait = w if earliest_wait is None else min(earliest_wait, w)
 
             if len(self.exhausted_today) >= num_keys:
-                raise RuntimeError("All API keys have reached their daily limit!")
+                return None, None
 
-            sleep_s = max(3.0, min(earliest_wait or 10.0, 62.0))
-            time.sleep(sleep_s)
+            wait_sec = max(3.0, min(earliest_wait or 10.0, 35.0))
+            log.info("Waiting %.1fs for %s rate-limit window so PDF is analyzed accurately...", wait_sec, self.name)
+            time.sleep(wait_sec)
+
+        return None, None
 
     def mark_key_rate_limited(self, idx, err_msg="", cooldown_sec=65.0):
+        if idx is None:
+            return
         e_low = str(err_msg).lower()
-        if any(w in e_low for w in ("depleted", "prepayment", "daily", "per_day", "invalid", "api_key_invalid")):
+        if any(w in e_low for w in ("depleted", "daily", "per_day", "invalid", "api_key_invalid", "unauthorized", "401")):
             self.exhausted_today.add(idx)
         else:
             self.cooldown_until[idx] = time.time() + cooldown_sec
 
 
-KEY_ROTATOR = GeminiMultiKeyRotator(
+GEMINI_ROTATOR = MultiKeyRotator(
+    "Gemini (gemini-3.5-flash-lite)",
     GEMINI_API_KEYS,
-    max_per_min=MAX_REQ_PER_KEY_PER_MINUTE,
-    max_per_day=MAX_REQ_PER_KEY_PER_DAY,
+    max_per_min=GEMINI_MAX_RPM,
+    max_per_day=GEMINI_MAX_RPD,
+    max_tpm=GEMINI_MAX_TPM,
+    window_sec=RATE_WINDOW_SECONDS,
+)
+
+OPENROUTER_ROTATOR = MultiKeyRotator(
+    "OpenRouter Backup",
+    OPENROUTER_KEYS,
+    max_per_min=OPENROUTER_MAX_RPM,
+    max_per_day=OPENROUTER_MAX_RPD,
+    max_tpm=240000,
     window_sec=RATE_WINDOW_SECONDS,
 )
 
 
-# ---------------- STRICT DUPLICATE PROTECTION & COMPANY KEY NORMALIZATION ----------------
+# ==========================================
+# 3. LIVE GOOGLE AUTOCOMPLETE KEYWORD ENGINE
+# ==========================================
+def fetch_live_google_keywords(company_name):
+    short_name = re.sub(r"\b(ltd|limited|india|industries|corp|corporation|pvt)\b", "", company_name, flags=re.I).strip()
+    seed_queries = [
+        f"{short_name} share ",
+        f"{short_name} share price target ",
+        f"why {short_name} share ",
+        f"{short_name} q2 results ",
+    ]
+    found_keywords = []
+    seen = set()
+
+    for q in seed_queries:
+        try:
+            url = f"https://suggestqueries.google.com/complete/search?client=firefox&gl=in&hl=en&q={urllib.parse.quote(q)}"
+            res = c_requests.get(url, impersonate="chrome120", timeout=6)
+            if res.status_code == 200:
+                data = res.json()
+                if isinstance(data, list) and len(data) > 1 and isinstance(data[1], list):
+                    for kw in data[1]:
+                        kw_clean = str(kw).strip()
+                        if kw_clean and kw_clean.lower() not in seen and len(kw_clean) > 8:
+                            seen.add(kw_clean.lower())
+                            found_keywords.append(kw_clean)
+        except Exception:
+            pass
+
+    high_vol_defaults = [
+        f"{short_name} share price target 2026",
+        f"{short_name} share price target 2027 to 2030",
+        f"{short_name} Q2 results 2026 analysis",
+        f"Why {short_name} share price is rising today",
+        f"Is {short_name} share a good buy for long term",
+        f"{short_name} share latest news and order book",
+        f"{short_name} dividend record date and history",
+        f"{short_name} debt to equity and ROE fundamental review",
+    ]
+    for d_kw in high_vol_defaults:
+        if d_kw.lower() not in seen:
+            seen.add(d_kw.lower())
+            found_keywords.append(d_kw)
+
+    return found_keywords[:10]
+
+
+# ==========================================
+# 4. DUPLICATE PROTECTION & HELPERS
+# ==========================================
 STOP_WORDS_REGEX = re.compile(
-    r"\b("
-    r"q1|q2|q3|q4|fy\d+|fy\d{2}-\d{2}|h1|h2|9m|results|result|order|orders|contract|contracts|"
+    r"\b(q1|q2|q3|q4|fy\d+|fy\d{2}-\d{2}|h1|h2|9m|results|result|order|orders|contract|contracts|"
     r"consolidated|standalone|pat|net|profit|revenue|sales|income|ebitda|growth|yoy|qoq|"
     r"jumps|surges|rises|soars|falls|drops|declines|slips|reports|posts|posted|announces|declared|"
     r"bags|wins|secures|receives|received|awarded|award|worth|rs|inr|cr|crore|crores|lakh|lakhs|"
@@ -157,15 +255,38 @@ STOP_WORDS_REGEX = re.compile(
     r"ltd|limited|india|indian|industries|industry|pvt|private|corp|corporation|company|co|"
     r"enterprises|enterprise|international|global|solutions|technologies|technology|tech|"
     r"finance|financial|services|projects|infra|infrastructure|power|energy|pharma|pharmaceuticals|"
-    r"chemicals|chemical|steel|motors|motor|bank|holding|holdings|group|commercial|trading|exports"
-    r")\b",
+    r"chemicals|chemical|steel|motors|motor|bank|holding|holdings|group|commercial|trading|exports)\b",
     flags=re.I,
 )
 
 
+def local_name(tag):
+    return tag.rsplit("}", 1)[-1].lower()
+
+
+def child_text(node, names):
+    for child in list(node):
+        if local_name(child.tag) in names and child.text:
+            return child.text.strip()
+    return ""
+
+
+def is_mutual_fund_nav_spam(title, description, scripcode=""):
+    t_low = (title + " " + description).lower()
+    if str(scripcode).startswith("90") and len(str(scripcode)) >= 6:
+        return True
+    spam_phrases = (
+        "nav as on", "nav as of", "current expense ratio", "monthly portfolio",
+        "idcw reinvest", "direct plan - growth", "regular plan - growth",
+    )
+    return any(p in t_low for p in spam_phrases)
+
+
+def clean_text(value):
+    return re.sub(r"\n{3,}", "\n\n", re.sub(r"[ \t]+", " ", str(value).replace("\x00", " "))).strip()
+
+
 def extract_scrip_code(text):
-    if not text:
-        return ""
     m = re.search(r"\b(5\d{5})\b", str(text))
     return m.group(1) if m else ""
 
@@ -198,9 +319,7 @@ def extract_file_key(url):
         return ""
     path = urlparse(url).path.lower()
     fname = path.rsplit("/", 1)[-1].strip()
-    if fname.endswith((".pdf", ".xml", ".xbrl")):
-        return fname
-    return ""
+    return fname if fname.endswith((".pdf", ".xml", ".xbrl")) else ""
 
 
 def init_db():
@@ -227,13 +346,8 @@ def init_db():
 def was_posted_in_db(item_id, comp_key, scrip_key, file_key):
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            """
-            SELECT 1 FROM posted 
-            WHERE item_id = ? 
-               OR (file_key != '' AND file_key = ?)
-               OR (company_key != '' AND company_key = ?)
-               OR (scrip_key != '' AND scrip_key = ?)
-            """,
+            """SELECT 1 FROM posted WHERE item_id = ? OR (file_key != '' AND file_key = ?)
+               OR (company_key != '' AND company_key = ?) OR (scrip_key != '' AND scrip_key = ?)""",
             (item_id, file_key, comp_key, scrip_key),
         ).fetchone()
         return row is not None
@@ -242,19 +356,15 @@ def was_posted_in_db(item_id, comp_key, scrip_key, file_key):
 def mark_posted(item_id, comp_key, scrip_key, file_key, title, source_url):
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            """
-            INSERT OR IGNORE INTO posted(item_id, company_key, scrip_key, file_key, title, source_url, posted_at)
-            VALUES(?, ?, ?, ?, ?, ?, ?)
-            """,
+            "INSERT OR IGNORE INTO posted(item_id, company_key, scrip_key, file_key, title, source_url, posted_at) VALUES(?, ?, ?, ?, ?, ?, ?)",
             (item_id, comp_key, scrip_key, file_key, title, source_url, datetime.now(timezone.utc).isoformat()),
         )
         conn.commit()
 
 
 def get_url(url, extra_headers=None):
-    last_error = None
     profiles = ["chrome120", "chrome110", "edge101", "chrome104"]
-
+    last_err = None
     for attempt in range(3):
         try:
             profile = profiles[attempt % len(profiles)]
@@ -267,18 +377,13 @@ def get_url(url, extra_headers=None):
             if extra_headers:
                 headers.update(extra_headers)
             response = c_requests.get(url, impersonate=profile, headers=headers, timeout=REQUEST_TIMEOUT)
-            if response.status_code in (403, 429):
-                raise requests.HTTPError(
-                    f"Server returned {response.status_code}",
-                    response=response,
-                )
             response.raise_for_status()
             return response
         except Exception as exc:
-            last_error = exc
+            last_err = exc
             if attempt < 2:
                 time.sleep(2 * (attempt + 1))
-    raise RuntimeError(f"Could not fetch {url}: {last_error}")
+    raise RuntimeError(f"Could not fetch {url}: {last_err}")
 
 
 def to_float(val):
@@ -302,29 +407,104 @@ def fmt_num(val):
     return f"{num:,.2f}"
 
 
-# ---------------- SCREENER FUNDAMENTALS & MID/LARGE CAP FILTER ----------------
-def get_screener_fundamentals(comp_title):
-    clean_name = re.sub(r"\(\d+\)", "", comp_title)
-    clean_name = clean_name.split("-")[0].strip()
+def shorten_period_label(lbl):
+    s = str(lbl or "").strip()
+    if not s:
+        return "Current"
+    m_date = re.search(r"(?:30|31|28|29)?[\s./-]*(0?3|0?6|0?9|12)[\s./-]*(20\d{2}|\d{2})\b", s)
+    if m_date:
+        mm = int(m_date.group(1))
+        yy = m_date.group(2)
+        if len(yy) == 2:
+            yy = "20" + yy
+        month_map = {3: "Mar", 6: "Jun", 9: "Sep", 12: "Dec"}
+        return f"{month_map.get(mm, 'Sep')} {yy}"
+
+    m_word = re.search(r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[\s,/-]*(\d{1,2}[\s,/-]*)?(20\d{2}|\d{2})\b", s, flags=re.I)
+    if m_word:
+        mon = m_word.group(1).capitalize()[:3]
+        yy = m_word.group(3)
+        if len(yy) == 2:
+            yy = "20" + yy
+        return f"{mon} {yy}"
+    return s[:12]
+
+
+# ==========================================
+# 5. SCREENER FUNDAMENTALS (CONSOLIDATED PRIORITY)
+# ==========================================
+def _extract_quarters_from_soup(soup):
+    q_data = {
+        "quarters_text": "",
+        "q_all_labels": [],
+        "q_all_rev": [],
+        "q_all_gp": [],
+        "q_all_np": [],
+        "q_labels": [],
+        "q_rev": [],
+        "q_gp": [],
+        "q_np": [],
+    }
+    q_sec = soup.find("section", id="quarters")
+    if not q_sec:
+        return q_data
+
+    q_lines, headers = [], []
+    for row in q_sec.find_all("tr"):
+        cols = [" ".join(c.get_text(" ", strip=True).split()) for c in row.find_all(["th", "td"])]
+        if not cols:
+            continue
+        if not headers and len(cols) > 3:
+            headers = cols[1:]
+            q_data["q_all_labels"] = headers
+            q_data["q_labels"] = headers[-5:]
+            continue
+
+        r_title = cols[0].lower().replace("+", "").strip()
+        all_nums = [to_float(c_val) for c_val in cols[1:]]
+        nums = all_nums[-5:]
+
+        if r_title in ("sales", "revenue", "revenue from operations", "interest earned") and any(all_nums):
+            q_data["q_all_rev"], q_data["q_rev"] = all_nums, nums
+            q_lines.append(" | ".join(cols))
+        elif r_title in ("operating profit", "ebitda", "financing profit") and any(all_nums):
+            q_data["q_all_gp"], q_data["q_gp"] = all_nums, nums
+            q_lines.append(" | ".join(cols))
+        elif r_title in ("net profit", "profit after tax") and any(all_nums):
+            q_data["q_all_np"], q_data["q_np"] = all_nums, nums
+            q_lines.append(" | ".join(cols))
+
+    if headers and q_lines:
+        q_data["quarters_text"] = "Quarters Header: " + " | ".join(headers) + "\n" + "\n".join(q_lines)
+    return q_data
+
+
+def get_screener_fundamentals(comp_title, scrip_code=""):
+    clean_name = re.sub(r"\(\d+\)", "", comp_title).split("-")[0].strip()
     clean_name = re.sub(r"\b(ltd|limited|india|industries|corp|corporation|pvt)\b", "", clean_name, flags=re.I).strip()
     words = [w for w in clean_name.split() if len(w) > 1]
 
-    queries = [clean_name]
-    if len(words) >= 2:
-        queries.append(" ".join(words[:2]))
-    if words:
-        queries.append(words[0])
+    queries = []
+    if scrip_code:
+        queries.append(str(scrip_code).strip())
+    if clean_name:
+        queries.append(clean_name)
 
     info = {
         "screener_company_name": "",
+        "nse_bse_symbol": scrip_code or "BSE",
         "price_str": "Live on BSE",
-        "market_cap": "0",
+        "price_num": 0.0,
+        "high_52w": "N/A",
+        "low_52w": "N/A",
+        "market_cap": "N/A",
         "market_cap_num": 0.0,
-        "is_mid_large_cap": False,
+        "is_eligible_stock": False,
         "pe_ratio": "N/A",
         "pb_ratio": "N/A",
         "industry_pe": "N/A",
         "roe": "N/A",
+        "roce": "N/A",
         "eps": "N/A",
         "div_yield": "N/A",
         "book_value": "N/A",
@@ -334,7 +514,6 @@ def get_screener_fundamentals(comp_title):
         "debt_to_equity": "0.00",
         "face_value": "N/A",
         "quarters_text": "",
-        "annual_text": "",
         "q_all_labels": [],
         "q_all_rev": [],
         "q_all_gp": [],
@@ -343,9 +522,9 @@ def get_screener_fundamentals(comp_title):
         "q_rev": [],
         "q_gp": [],
         "q_np": [],
-        "y_labels": [],
-        "y_rev": [],
-        "y_np": [],
+        "target_2026": "N/A",
+        "target_2027": "N/A",
+        "target_2030": "N/A",
     }
 
     seen_q = set()
@@ -358,22 +537,55 @@ def get_screener_fundamentals(comp_title):
             res = c_requests.get(search_url, impersonate="chrome120", timeout=12)
             if res.status_code == 200 and isinstance(res.json(), list) and len(res.json()) > 0:
                 first_hit = res.json()[0]
-                info["screener_company_name"] = str(first_hit.get("name") or "").strip()
-                comp_url = "https://www.screener.in" + first_hit["url"]
-                c_res = c_requests.get(comp_url, impersonate="chrome120", timeout=15)
+                hit_name = str(first_hit.get("name") or "").strip()
+
+                if q != scrip_code and words:
+                    if words[0].lower() not in hit_name.lower():
+                        continue
+
+                raw_url = str(first_hit["url"]).strip()
+                base_clean_url = re.sub(r"/consolidated/?$", "/", raw_url)
+                cons_url = base_clean_url.rstrip("/") + "/consolidated/"
+
+                c_res = c_requests.get("https://www.screener.in" + cons_url, impersonate="chrome120", timeout=15)
+                if c_res.status_code != 200:
+                    c_res = c_requests.get("https://www.screener.in" + raw_url, impersonate="chrome120", timeout=15)
                 if c_res.status_code != 200:
                     continue
+
+                page_html = c_res.text
+                if scrip_code and not re.search(rf"\b{re.escape(str(scrip_code))}\b", page_html):
+                    log.info("Screener page %s does not match BSE Scrip Code %s. Skipping mismatch.", hit_name, scrip_code)
+                    continue
+
                 soup = BeautifulSoup(c_res.content, "html.parser")
+                q_extracted = _extract_quarters_from_soup(soup)
+
+                if not any(q_extracted["q_all_rev"]) and not any(q_extracted["q_all_np"]):
+                    st_res = c_requests.get("https://www.screener.in" + base_clean_url, impersonate="chrome120", timeout=15)
+                    if st_res.status_code == 200:
+                        st_soup = BeautifulSoup(st_res.content, "html.parser")
+                        st_q = _extract_quarters_from_soup(st_soup)
+                        if any(st_q["q_all_rev"]) or any(st_q["q_all_np"]):
+                            soup = st_soup
+                            q_extracted = st_q
+
+                info.update(q_extracted)
+                info["screener_company_name"] = hit_name
 
                 top_ratios = soup.find("ul", id="top-ratios")
                 if top_ratios:
                     for li in top_ratios.find_all("li"):
                         t = " ".join(li.get_text(" ", strip=True).split())
-                        num_span = li.find("span", class_="number")
-                        num_txt = num_span.get_text(strip=True) if num_span else ""
+                        nums = [s.get_text(strip=True) for s in li.find_all("span", class_="number") if s.get_text(strip=True)]
+                        num_txt = nums[0] if nums else ""
 
                         if "Current Price" in t and num_txt:
                             info["price_str"] = f"₹{num_txt}"
+                            info["price_num"] = to_float(num_txt)
+                        elif "High / Low" in t and len(nums) >= 2:
+                            info["high_52w"] = f"₹{nums[0]}"
+                            info["low_52w"] = f"₹{nums[1]}"
                         elif "Market Cap" in t and num_txt:
                             info["market_cap"] = f"₹{num_txt} Cr"
                             info["market_cap_num"] = to_float(num_txt)
@@ -383,6 +595,8 @@ def get_screener_fundamentals(comp_title):
                             info["book_value"] = f"₹{num_txt}"
                         elif "Div Yield" in t and num_txt:
                             info["div_yield"] = f"{num_txt}%"
+                        elif "ROCE" in t and num_txt:
+                            info["roce"] = f"{num_txt}%"
                         elif "ROE" in t and num_txt:
                             info["roe"] = f"{num_txt}%"
                         elif "Face Value" in t and num_txt:
@@ -396,9 +610,15 @@ def get_screener_fundamentals(comp_title):
                         elif ("P/B" in t or "Price to book" in t) and num_txt:
                             info["pb_ratio"] = num_txt
 
-                # Mid Cap & Large Cap Filter (Market Cap >= ₹5,000 Cr)
-                if info["market_cap_num"] >= 5000.0:
-                    info["is_mid_large_cap"] = True
+                # ₹75 Cr થી ઉપરના તમામ શેર્સ માન્ય ગણાશે (ભાવ ₹10 થી ઓછો હોય તો પણ જો માર્કેટ કેપ ₹75 Cr+ હોય તો સ્કીપ નહીં થાય)
+                if info["market_cap_num"] >= MIN_MARKET_CAP_CR:
+                    info["is_eligible_stock"] = True
+
+                if info["price_num"] > 0:
+                    p = info["price_num"]
+                    info["target_2026"] = f"₹{round(p * 1.15, 1):,} to ₹{round(p * 1.24, 1):,}"
+                    info["target_2027"] = f"₹{round(p * 1.35, 1):,} to ₹{round(p * 1.50, 1):,}"
+                    info["target_2030"] = f"₹{round(p * 1.90, 1):,} to ₹{round(p * 2.40, 1):,}"
 
                 borrowings, equity = None, None
                 bs_sec = soup.find("section", id="balance-sheet")
@@ -423,439 +643,413 @@ def get_screener_fundamentals(comp_title):
 
                 if info["debt_to_equity"] in ("N/A", "0.00") and borrowings is not None and equity and equity > 0:
                     info["debt_to_equity"] = f"{(borrowings / equity):.2f}"
-
-                q_sec = soup.find("section", id="quarters")
-                if q_sec:
-                    q_lines = []
-                    headers = []
-                    for row in q_sec.find_all("tr"):
-                        cols = [" ".join(c.get_text(" ", strip=True).split()) for c in row.find_all(["th", "td"])]
-                        if not cols:
-                            continue
-                        if not headers and len(cols) > 3:
-                            headers = cols[1:]
-                            info["q_all_labels"] = headers
-                            info["q_labels"] = headers[-6:]
-                        r_title = cols[0].lower()
-                        if any(k in r_title for k in ["sales", "revenue", "operating profit", "ebitda", "net profit", "eps"]):
-                            q_lines.append(" | ".join(cols))
-                            all_nums = [to_float(c_val) for c_val in cols[1:]]
-                            nums = all_nums[-6:]
-                            if "sales" in r_title or "revenue" in r_title:
-                                info["q_all_rev"] = all_nums
-                                info["q_rev"] = nums
-                            elif "operating profit" in r_title or "ebitda" in r_title:
-                                info["q_all_gp"] = all_nums
-                                info["q_gp"] = nums
-                            elif "net profit" in r_title:
-                                info["q_all_np"] = all_nums
-                                info["q_np"] = nums
-                    if headers:
-                        info["quarters_text"] = "Quarters Header: " + " | ".join(headers) + "\n" + "\n".join(q_lines)
                 break
         except Exception as exc:
             log.warning("Screener lookup warning for %s: %s", q, exc)
     return info
 
 
-# ---------------- BSE DIRECT JSON API + XML FEED PARSING ----------------
-def local_name(tag):
-    return tag.rsplit("}", 1)[-1].lower()
+# ==========================================
+# 6. BSE API, SCRIP PDF RESOLVER & FEEDS
+# ==========================================
+def fetch_bse_pdf_url_by_scrip(scrip_code):
+    """
+    જ્યારે XML ફીડમાં સીધી PDF લિંક ન હોય (જેમ કે Panchsheel Organics 531726 કે Ameenji Rubber 544555),
+    ત્યારે BSE JSON API માંથી તેનો Scrip Code સર્ચ કરીને સાચી PDF લિંક શોધી કાઢે છે.
+    """
+    if not scrip_code:
+        return "", ""
+    ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    today_str = ist_now.strftime("%Y%m%d")
+    prev_str = (ist_now - timedelta(days=5)).strftime("%Y%m%d")
 
-
-def child_text(node, names):
-    for child in list(node):
-        if local_name(child.tag) in names and child.text:
-            return child.text.strip()
-    return ""
-
-
-def extract_links_from_xml_item(item):
-    found = []
-    for node in item.iter():
-        tag = local_name(node.tag)
-        href = node.attrib.get("href") or node.attrib.get("url")
-        if href and tag in ("link", "enclosure"):
-            found.append(href.strip())
-        if tag == "link" and node.text and node.text.strip().startswith("http"):
-            found.append(node.text.strip())
-    return list(dict.fromkeys(found))
-
-
-def is_mutual_fund_nav_spam(title, description, scripcode=""):
-    t_low = (title + " " + description).lower()
-    if str(scripcode).startswith("90") and len(str(scripcode)) >= 6:
-        return True
-    spam_phrases = (
-        "nav as on", "nav as of", "current expense ratio", "monthly portfolio",
-        "idcw reinvest", "direct plan - growth", "regular plan - growth",
-    )
-    return any(p in t_low for p in spam_phrases)
+    for cat in ("Result", "-1"):
+        api_url = (
+            f"https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
+            f"?pageno=1&strCat={cat}&strPrevDate={prev_str}&strScrip={scrip_code}&strSearch=P&strToDate={today_str}&strType=C&subcategory=-1"
+        )
+        try:
+            res = get_url(api_url)
+            rows = res.json().get("Table", []) if isinstance(res.json(), dict) else []
+            for r in rows:
+                attach = str(r.get("ATTACHMENTNAME") or "").strip()
+                if attach and attach.lower().endswith(".pdf"):
+                    return f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{attach}", attach
+        except Exception:
+            pass
+    return "", ""
 
 
 def fetch_bse_json_announcements():
     ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
     today_str = ist_now.strftime("%Y%m%d")
-    prev_str = (ist_now - timedelta(days=1)).strftime("%Y%m%d")
-
-    categories = [
-        ("result", "Result"),
-        ("announcement", "Company+Update"),
-    ]
+    prev_str = (ist_now - timedelta(days=2)).strftime("%Y%m%d")
     output = []
 
-    for kind, cat in categories:
-        api_url = (
-            f"https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
-            f"?pageno=1&strCat={cat}&strPrevDate={prev_str}&strScrip=&strSearch=P&strToDate={today_str}&strType=C&subcategory=-1"
-        )
-        try:
-            res = get_url(api_url)
-            data = res.json()
-            rows = data.get("Table", []) if isinstance(data, dict) else []
-            count = 0
-            for r in rows:
-                comp = str(r.get("SLONGNAME") or "").strip()
-                scrip = str(r.get("SCRIP_CD") or "").strip()
-                sub = str(r.get("NEWSSUB") or "").strip()
-                head = str(r.get("HEADLINE") or "").strip()
-                more = str(r.get("MORE") or "").strip()
-                subcat = str(r.get("SUBCATNAME") or "").strip()
-                attach = str(r.get("ATTACHMENTNAME") or "").strip()
-                news_id = str(r.get("NEWSID") or "").strip()
-
-                title = f"{comp} ({scrip}) - {sub}" if comp else sub
-                desc = " | ".join(filter(None, [subcat, head, more]))
-
-                if not title or is_mutual_fund_nav_spam(title, desc, scrip):
-                    continue
-
-                pdf_link = f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{attach}" if attach else ""
-                item_kind = "result" if (kind == "result" or "result" in subcat.lower()) else "announcement"
-
-                output.append({
-                    "kind": item_kind,
-                    "title": html.unescape(re.sub(r"<[^>]+>", " ", title)).strip(),
-                    "company_raw": comp,
-                    "scrip_code": scrip,
-                    "description": html.unescape(re.sub(r"<[^>]+>", " ", desc)).strip(),
-                    "link": pdf_link,
-                    "attachment_name": attach,
-                    "guid": news_id or pdf_link or title,
-                    "published": str(r.get("DissemDT") or r.get("NEWS_DT") or ""),
-                })
-                count += 1
+    for kind, cat in [("result", "Result"), ("announcement", "Company+Update")]:
+        count = 0
+        for page_no in (1, 2, 3):
+            api_url = (
+                f"https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
+                f"?pageno={page_no}&strCat={cat}&strPrevDate={prev_str}&strScrip=&strSearch=P&strToDate={today_str}&strType=C&subcategory=-1"
+            )
+            try:
+                res = get_url(api_url)
+                rows = res.json().get("Table", []) if isinstance(res.json(), dict) else []
+                if not rows:
+                    break
+                for r in rows:
+                    comp = str(r.get("SLONGNAME") or "").strip()
+                    scrip = str(r.get("SCRIP_CD") or "").strip()
+                    sub = str(r.get("NEWSSUB") or "").strip()
+                    head = str(r.get("HEADLINE") or "").strip()
+                    more = str(r.get("MORE") or "").strip()
+                    subcat = str(r.get("SUBCATNAME") or "").strip()
+                    attach = str(r.get("ATTACHMENTNAME") or "").strip()
+                    news_id = str(r.get("NEWSID") or "").strip()
+                    title = f"{comp} ({scrip}) - {sub}" if comp else sub
+                    desc = " | ".join(filter(None, [subcat, head, more]))
+                    if not title or is_mutual_fund_nav_spam(title, desc, scrip):
+                        continue
+                    pdf_link = f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{attach}" if attach else ""
+                    item_kind = "result" if (kind == "result" or "result" in subcat.lower()) else "announcement"
+                    output.append({
+                        "kind": item_kind,
+                        "title": html.unescape(re.sub(r"<[^>]+>", " ", title)).strip(),
+                        "company_raw": comp,
+                        "scrip_code": scrip,
+                        "description": html.unescape(re.sub(r"<[^>]+>", " ", desc)).strip(),
+                        "link": pdf_link,
+                        "attachment_name": attach,
+                        "guid": news_id or pdf_link or title,
+                    })
+                    count += 1
+                    if count >= MAX_ITEMS_PER_FEED:
+                        break
                 if count >= MAX_ITEMS_PER_FEED:
                     break
-            log.info("BSE JSON API (%s): %d items fetched", cat, count)
-        except Exception as exc:
-            log.warning("BSE JSON API warning (%s): %s", cat, exc)
-
+            except Exception as exc:
+                log.warning("BSE JSON API warning (%s p%d): %s", cat, page_no, exc)
+                break
+        log.info("BSE JSON API (%s): %d items fetched", cat, count)
     return output
 
 
 def parse_feed(feed_url, feed_kind):
     response = get_url(feed_url)
     root = ET.fromstring(response.content)
-    items = [n for n in root.iter() if local_name(n.tag) in ("item", "entry")]
     output = []
-
-    for node in items:
+    for node in [n for n in root.iter() if local_name(n.tag) in ("item", "entry")]:
         title = child_text(node, {"title"})
         description = child_text(node, {"description", "summary", "content", "encoded"})
         scrip = child_text(node, {"scripcode"}) or extract_scrip_code(title)
-        guid = child_text(node, {"guid", "id"})
-        links = extract_links_from_xml_item(node)
-
+        links = []
+        for n in node.iter():
+            if local_name(n.tag) in ("link", "enclosure") and (n.attrib.get("href") or n.attrib.get("url")):
+                links.append((n.attrib.get("href") or n.attrib.get("url")).strip())
+            elif local_name(n.tag) == "link" and n.text and str(n.text).strip().startswith("http"):
+                links.append(str(n.text).strip())
         if not title or is_mutual_fund_nav_spam(title, description, scrip):
             continue
-
-        link = ""
         direct = [u for u in links if urlparse(u).path.lower().endswith((".pdf", ".xml", ".xbrl", ".html", ".htm"))]
-        if direct:
-            link = direct[0]
-        elif links:
-            link = links[0]
-
+        link = direct[0] if direct else (links[0] if links else "")
         clean_t = html.unescape(re.sub(r"<[^>]+>", " ", title)).strip()
-        comp_raw = clean_t.split("-")[0].split(":")[0].strip()
-
         output.append({
             "kind": feed_kind,
             "title": clean_t,
-            "company_raw": comp_raw,
+            "company_raw": clean_t.split("(")[0].split("-")[0].split(":")[0].strip(),
             "scrip_code": str(scrip).strip(),
             "description": html.unescape(re.sub(r"<[^>]+>", " ", description)).strip(),
             "link": urljoin(feed_url, link) if link else "",
-            "attachment_name": "",
-            "guid": guid or link or title,
-            "published": child_text(node, {"pubdate", "published", "updated", "date"}),
+            "guid": child_text(node, {"guid", "id"}) or link or title,
         })
         if len(output) >= MAX_ITEMS_PER_FEED:
             break
     return output
 
 
-# ---------------- DOCUMENT EXTRACTION ----------------
-def clean_text(value):
-    value = value.replace("\x00", " ")
-    value = re.sub(r"[ \t]+", " ", value)
-    value = re.sub(r"\n{3,}", "\n\n", value)
-    return value.strip()
-
-
-def extract_xml_text(content_bytes):
-    root = ET.fromstring(content_bytes)
-    values = []
-    for element in root.iter():
-        if element.text and element.text.strip():
-            values.append(element.text.strip())
-    return clean_text(" ".join(values))[:MAX_TEXT_CHARS]
-
-
-def extract_html_text(html_str):
-    soup = BeautifulSoup(html_str, "html.parser")
-    for tag in soup(["script", "style"]):
-        tag.decompose()
-    return clean_text(soup.get_text(separator=" "))[:MAX_TEXT_CHARS]
-
-
-def get_document_payload(item):
+def get_document_payload(item, scrip_code=""):
     parts = [f"COMPANY TITLE: {item['title']}"]
     pdf_bytes = None
+    extracted_pdf_text = ""
     if item["description"]:
         parts.append("FEED DESCRIPTION:\n" + item["description"])
 
-    url = item["link"]
-    attach_name = item.get("attachment_name", "")
+    url = item.get("link") or ""
+    attach_name = item.get("attachment_name") or ""
 
-    if url:
-        path = urlparse(url).path.lower()
+    # જો XML ફીડમાં સીધી PDF લિંક ન હોય, તો BSE API માં Scrip Code થી PDF શોધો
+    if not url or not urlparse(url).path.lower().endswith(".pdf"):
+        resolved_url, resolved_attach = fetch_bse_pdf_url_by_scrip(scrip_code)
+        if resolved_url:
+            url = resolved_url
+            attach_name = resolved_attach
+            item["link"] = resolved_url
+            item["attachment_name"] = resolved_attach
+            log.info("Resolved official BSE PDF for %s (%s): %s", item["title"], scrip_code, attach_name)
+
+    if url and urlparse(url).path.lower().endswith(".pdf"):
         try:
-            if path.endswith(".pdf"):
-                try:
+            try:
+                response = get_url(url)
+            except Exception:
+                if attach_name and "AttachLive" in url:
+                    url = f"https://www.bseindia.com/xml-data/corpfiling/AttachHis/{attach_name}"
                     response = get_url(url)
-                except Exception:
-                    if attach_name and "AttachLive" in url:
-                        fallback_url = f"https://www.bseindia.com/xml-data/corpfiling/AttachHis/{attach_name}"
-                        response = get_url(fallback_url)
-                        item["link"] = fallback_url
-                    else:
-                        raise
-                pdf_bytes = response.content
-                text_parts = []
-                with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
-                    tmp.write(pdf_bytes)
-                    tmp.flush()
-                    with open(tmp.name, "rb") as f:
-                        reader = PyPDF2.PdfReader(f)
-                        for page in reader.pages[:MAX_PDF_PAGES]:
-                            text_parts.append(page.extract_text() or "")
-                extracted = clean_text("\n".join(text_parts))[:MAX_TEXT_CHARS]
-                if extracted:
-                    parts.append("EXTRACTED PDF TEXT:\n" + extracted)
-            elif path.endswith((".xml", ".xbrl")):
-                response = get_url(url)
-                extracted = extract_xml_text(response.content)
-                if extracted:
-                    parts.append("EXTRACTED XML TEXT:\n" + extracted)
-            elif path.endswith((".html", ".htm")):
-                response = get_url(url)
-                extracted = extract_html_text(response.text)
-                if extracted:
-                    parts.append("EXTRACTED HTML TEXT:\n" + extracted)
+                    item["link"] = url
+                else:
+                    raise
+            pdf_bytes = response.content
+            text_parts = []
+            with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
+                tmp.write(pdf_bytes)
+                tmp.flush()
+                with open(tmp.name, "rb") as f:
+                    for page in PyPDF2.PdfReader(f).pages[:MAX_PDF_PAGES]:
+                        text_parts.append(page.extract_text() or "")
+            extracted_pdf_text = clean_text("\n".join(text_parts))[:MAX_TEXT_CHARS]
+            if extracted_pdf_text:
+                parts.append("EXTRACTED PDF TEXT:\n" + extracted_pdf_text)
         except Exception as exc:
             log.warning("Attachment download warning for %s: %s", url, exc)
-
-    return clean_text("\n\n".join(parts))[:MAX_TEXT_CHARS], pdf_bytes
-
-
-# ---------------- CLASSIFICATION / AI CALL ----------------
-RESULT_WORDS = (
-    "financial result", "unaudited financial", "audited financial",
-    "quarterly result", "half year result", "annual result", "financial results",
-    "standalone result", "consolidated result", "standalone and consolidated",
-)
-ORDER_WORDS = (
-    "award_of_order", "receipt_of_order", "award of order", "receipt of order",
-    "receiving of orders", "received an order", "work order", "purchase order",
-    "letter of acceptance", "letter of award", "loa from", "contract worth",
-    "order worth", "orders worth", "bagged an order", "secured an order",
-    "arbitral award", "orders / contracts", "order / contract",
-)
-IGNORE_NON_RESULT_PHRASES = (
-    "analyst / investor meet", "investor meet", "earning call", "earnings call",
-    "conference call", "audio recording", "transcript of", "prior intimation",
-    "is scheduled on", "newspaper publication", "newspaper advertisement",
-    "closure of trading window", "trading window", "loss of share certificate",
-    "postal ballot", "scrutinizer report", "annual report", "related party transactions",
-)
+    return clean_text("\n\n".join(parts))[:MAX_TEXT_CHARS], pdf_bytes, len(extracted_pdf_text)
 
 
 def classify_item(item):
-    title_desc = (item["title"] + " " + item["description"]).lower()
-    if any(word in title_desc for word in ORDER_WORDS):
+    td = (item["title"] + " " + item["description"]).lower()
+    order_words = (
+        "award_of_order", "receipt_of_order", "award of order", "receipt of order",
+        "receiving of orders", "received an order", "work order", "purchase order",
+        "letter of acceptance", "letter of award", "loa from", "contract worth",
+        "order worth", "orders worth", "bagged an order", "secured an order",
+        "orders / contracts", "order / contract",
+    )
+    ignore_words = (
+        "investor meet", "earning call", "earnings call", "conference call",
+        "audio recording", "transcript of", "prior intimation", "newspaper publication",
+        "trading window", "loss of share", "postal ballot", "scrutinizer report",
+    )
+    result_words = (
+        "financial result", "unaudited financial", "audited financial",
+        "quarterly result", "half year result", "annual result", "financial results",
+        "standalone result", "consolidated result",
+    )
+    if any(w in td for w in order_words):
         return "order"
-    if any(bad in title_desc for bad in IGNORE_NON_RESULT_PHRASES):
+    if any(w in td for w in ignore_words):
         return ""
-    if item["kind"] == "result" or any(word in title_desc for word in RESULT_WORDS):
+    if item["kind"] == "result" or any(w in td for w in result_words):
         return "result"
     return ""
 
 
 def make_item_id(comp_key, file_key, item):
-    basis = file_key or comp_key or item["guid"] or item["title"]
-    return hashlib.sha256(basis.encode("utf-8")).hexdigest()
+    return hashlib.sha256((file_key or comp_key or item["guid"] or item["title"]).encode("utf-8")).hexdigest()
 
 
 def compute_metric_dict(curr_val, prev_val):
-    c = to_float(curr_val)
-    p = to_float(prev_val)
+    c, p = to_float(curr_val), to_float(prev_val)
     diff = round(c - p, 2)
-    diff_sign = "+" if diff > 0 else ""
-    diff_str = f"{diff_sign}{fmt_num(diff)} Cr"
-    if p != 0:
-        g_pct = ((c - p) / abs(p)) * 100.0
-        g_sign = "+" if g_pct > 0 else ""
-        g_str = f"{g_sign}{g_pct:.1f}%"
-    else:
-        g_str = "0.0%"
-    return {
-        "curr": fmt_num(c),
-        "prev": fmt_num(p),
-        "difference": diff_str,
-        "growth": g_str,
-    }
+    diff_str = f"{'+' if diff > 0 else ''}{fmt_num(diff)} Cr"
+    g_str = f"{'+' if ((c - p) / abs(p)) * 100 > 0 else ''}{((c - p) / abs(p)) * 100:.1f}%" if p != 0 else "0.0%"
+    return {"curr": fmt_num(c), "prev": fmt_num(p), "difference": diff_str, "growth": g_str}
 
 
-def ensure_valid_result_numbers(ai_data, screener_info):
+def verify_and_normalize_pdf_result_numbers(ai_data, screener_info):
     rev = ai_data.get("revenue") or {}
     gp = ai_data.get("gross_profit") or {}
     np_d = ai_data.get("net_profit") or {}
 
-    q_rev_all = screener_info.get("q_all_rev", [])
-    q_gp_all = screener_info.get("q_all_gp", [])
-    q_np_all = screener_info.get("q_all_np", [])
-    q_lbl_all = screener_info.get("q_all_labels", [])
+    curr_lbl = shorten_period_label(ai_data.get("curr_period_label", "Sep 2026"))
+    prev_lbl = shorten_period_label(ai_data.get("prev_period_label", "Sep 2025"))
+    ai_data["curr_period_label"] = curr_lbl
+    ai_data["prev_period_label"] = prev_lbl
 
-    def pick_curr_prev(arr):
-        if len(arr) >= 5:
-            return arr[-1], arr[-5]
-        elif len(arr) >= 2:
-            return arr[-1], arr[-2]
-        elif len(arr) == 1:
-            return arr[0], arr[0]
-        return 0, 0
+    ai_data["revenue"] = compute_metric_dict(rev.get("curr"), rev.get("prev"))
+    ai_data["gross_profit"] = compute_metric_dict(gp.get("curr"), gp.get("prev"))
+    ai_data["net_profit"] = compute_metric_dict(np_d.get("curr"), np_d.get("prev"))
 
-    if len(q_lbl_all) >= 5:
-        if str(ai_data.get("curr_period_label", "")).upper() in ("", "N/A", "CURRENT"):
-            ai_data["curr_period_label"] = q_lbl_all[-1]
-        if str(ai_data.get("prev_period_label", "")).upper() in ("", "N/A", "PREVIOUS"):
-            ai_data["prev_period_label"] = q_lbl_all[-5]
+    q_labels = list(screener_info.get("q_labels", []))
+    q_rev = list(screener_info.get("q_rev", []))
+    q_gp = list(screener_info.get("q_gp", []))
+    q_np = list(screener_info.get("q_np", []))
 
-    if to_float(rev.get("curr")) == 0 and to_float(rev.get("prev")) == 0 and q_rev_all:
-        c_val, p_val = pick_curr_prev(q_rev_all)
-        ai_data["revenue"] = compute_metric_dict(c_val, p_val)
-    else:
-        ai_data["revenue"] = compute_metric_dict(rev.get("curr"), rev.get("prev"))
+    r_c = to_float(ai_data["revenue"]["curr"])
+    g_c = to_float(ai_data["gross_profit"]["curr"])
+    n_c = to_float(ai_data["net_profit"]["curr"])
 
-    if to_float(gp.get("curr")) == 0 and to_float(gp.get("prev")) == 0 and q_gp_all:
-        c_val, p_val = pick_curr_prev(q_gp_all)
-        ai_data["gross_profit"] = compute_metric_dict(c_val, p_val)
-    else:
-        ai_data["gross_profit"] = compute_metric_dict(gp.get("curr"), gp.get("prev"))
+    if curr_lbl and r_c > 0:
+        if not q_labels or shorten_period_label(q_labels[-1]).lower() != curr_lbl.lower():
+            q_labels.append(curr_lbl)
+            q_rev.append(r_c)
+            q_gp.append(g_c)
+            q_np.append(n_c)
+        else:
+            q_rev[-1] = r_c
+            q_gp[-1] = g_c
+            q_np[-1] = n_c
 
-    if to_float(np_d.get("curr")) == 0 and to_float(np_d.get("prev")) == 0 and q_np_all:
-        c_val, p_val = pick_curr_prev(q_np_all)
-        ai_data["net_profit"] = compute_metric_dict(c_val, p_val)
-    else:
-        ai_data["net_profit"] = compute_metric_dict(np_d.get("curr"), np_d.get("prev"))
+    ai_data["quarter_chart_labels"] = q_labels[-6:] if q_labels else [prev_lbl, curr_lbl]
+    ai_data["quarter_chart_revenue"] = q_rev[-6:] if q_rev else [to_float(ai_data["revenue"]["prev"]), r_c]
+    ai_data["quarter_chart_gross_profit"] = q_gp[-6:] if q_gp else [to_float(ai_data["gross_profit"]["prev"]), g_c]
+    ai_data["quarter_chart_net_profit"] = q_np[-6:] if q_np else [to_float(ai_data["net_profit"]["prev"]), n_c]
 
     return ai_data
 
 
-def call_gemini_with_fallback(contents):
-    models_to_try = [GEMINI_MODEL, "gemini-2.5-flash", "gemini-2.0-flash", "gemini-flash-latest"]
-    last_err = None
-    max_attempts = len(KEY_ROTATOR.keys)
+# ==========================================
+# 7. AI API CALL (PATIENT MULTIMODAL PDF READER)
+# ==========================================
+class DummyResponse:
+    def __init__(self, text):
+        self.text = text
 
-    for _ in range(max_attempts):
-        key_idx, active_key = KEY_ROTATOR.acquire_key()
-        genai.configure(api_key=active_key)
 
-        key_error = False
-        for m_name in models_to_try:
-            try:
-                model = genai.GenerativeModel(m_name)
-                resp = model.generate_content(contents)
-                return resp
-            except Exception as exc:
-                last_err = exc
-                err_str = str(exc).lower()
-                if any(w in err_str for w in ("429", "quota", "rate", "depleted", "exhausted")):
-                    KEY_ROTATOR.mark_key_rate_limited(key_idx, str(exc), 65.0)
-                    key_error = True
+def call_ai_api(prompt_text, pdf_bytes=None, require_pdf_vision=False):
+    est_tokens = max(3000, int(len(prompt_text) / 3.5) + (4000 if pdf_bytes else 0))
+
+    if GEMINI_API_KEYS:
+        gemini_models = [GEMINI_MODEL, "gemini-3.5-flash-lite", "gemini-2.0-flash"]
+        seen_m = []
+        for m in gemini_models:
+            if m and m not in seen_m:
+                seen_m.append(m)
+
+        for attempt_round in range(2):
+            for _ in range(len(GEMINI_ROTATOR.keys)):
+                key_idx, active_key = GEMINI_ROTATOR.acquire_key(estimated_tokens=est_tokens)
+                if active_key is None:
                     break
-        if not key_error:
-            break
-    raise RuntimeError(f"All Gemini models & keys failed: {last_err}")
+                try:
+                    genai.configure(api_key=active_key)
+                except Exception:
+                    pass
+
+                key_error = False
+                for m_name in seen_m:
+                    try:
+                        model = genai.GenerativeModel(m_name)
+                        if pdf_bytes and len(pdf_bytes) < 19 * 1024 * 1024:
+                            resp = model.generate_content([prompt_text, {"mime_type": "application/pdf", "data": pdf_bytes}])
+                        else:
+                            resp = model.generate_content(prompt_text)
+                        if resp and getattr(resp, "text", None):
+                            log.info("Gemini PDF Vision analysis success using model: %s", m_name)
+                            return resp
+                    except Exception as exc:
+                        err_str = str(exc).lower()
+                        if any(w in err_str for w in ("429", "quota", "rate", "depleted", "exhausted", "invalid", "400", "403")):
+                            GEMINI_ROTATOR.mark_key_rate_limited(key_idx, str(exc), 45.0)
+                            key_error = True
+                            break
+                if not key_error:
+                    break
+            if attempt_round == 0:
+                log.info("Pausing 25s to retry Gemini PDF Vision for 100% accurate extraction...")
+                time.sleep(25)
+
+    if not require_pdf_vision and OpenAI is not None and OPENROUTER_KEYS:
+        or_models = ["google/gemini-3.5-flash-lite", "google/gemini-2.0-flash-lite-preview-02-05:free", "google/gemma-3-27b-it:free"]
+        for _ in range(len(OPENROUTER_ROTATOR.keys)):
+            or_idx, or_key = OPENROUTER_ROTATOR.acquire_key(estimated_tokens=est_tokens)
+            if or_key is None:
+                break
+            for or_model in or_models:
+                try:
+                    client = OpenAI(base_url="https://openrouter.ai/api/v1", api_key=or_key)
+                    completion = client.chat.completions.create(
+                        model=or_model,
+                        messages=[{"role": "user", "content": prompt_text}],
+                        temperature=0.2,
+                        max_tokens=4000,
+                    )
+                    txt = completion.choices[0].message.content
+                    if txt and "{" in txt:
+                        log.info("OpenRouter backup success using model: %s", or_model)
+                        return DummyResponse(txt)
+                except Exception as exc:
+                    err_s = str(exc).lower()
+                    if any(w in err_s for w in ("401", "402", "403", "429", "rate", "quota", "credits", "invalid")):
+                        OPENROUTER_ROTATOR.mark_key_rate_limited(or_idx, str(exc), 65.0)
+                        break
+                    continue
+    return None
 
 
-def analyze_with_gemini_json(company_title, scrip_code, doc_type, source_text, pdf_bytes, screener_info):
+def analyze_with_gemini_json(company_title, scrip_code, doc_type, source_text, pdf_bytes, screener_info, trending_kws, pdf_text_len=0):
+    c_clean_name = screener_info.get("screener_company_name") or re.sub(r"\(\d+\)", "", company_title).split("-")[0].strip()
+    kws_str = ", ".join(trending_kws)
+    ist_today_str = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%B %d, %Y")
+
     prompt = f"""
-You are the Chief Equity Research Analyst and SEO Editor for 'MarketMunafa' (https://marketmunafa.blogspot.com).
-Analyze the attached BSE corporate filing ({doc_type.upper()}) and Screener fundamentals data.
+You are India's #1 Chartered Accountant (CA), Equity Research Analyst, and SEO Financial Journalist for 'MarketMunafa' (https://marketmunafa.blogspot.com).
+Carefully inspect EVERY PAGE of the attached BSE Corporate Filing PDF ({doc_type.upper()}) for {c_clean_name} (BSE: {scrip_code}).
 
-STRICT RULES FOR 100% COPYRIGHT-FREE SEO CONTENT & CONSOLIDATED YOY DATA:
-1. 100% ORIGINAL & COPYRIGHT-FREE WRITING: Write all analysis in your own original equity-research voice. Never copy sentences verbatim from the filing. Transform raw numbers into insightful financial commentary that passes Google's Helpful Content and E-E-A-T guidelines.
-2. EXCLUDE STANDALONE: Completely ignore 'Standalone' figures if 'Consolidated' figures exist in the PDF. Always prioritize 'Consolidated Financial Results'. Only use Standalone if the company has no subsidiaries.
-3. FOCUS ON CONSOLIDATED PAT & YOY GROWTH: For 'net_profit', strictly extract Consolidated Profit After Tax (PAT). Compare the latest quarter ('curr') against the SAME QUARTER LAST YEAR ('prev' - Year-on-Year / YoY).
-4. UNIT CONVERSION: If the PDF table reports in "(Rs. in Lakhs)" or "(Rs. in Lacs)", divide every number by 100 to convert into Rs. Crores (e.g., 3,450 Lakhs = 34.50 Cr). If "(Rs. in Millions)", divide by 10.
-5. NEVER return "N/A" for Revenue, Gross Profit, or Net Profit in a 'result' filing. If Gross Profit is not explicitly labeled, compute (Revenue minus Cost of Materials/Operating Expenses) or use EBITDA / PBT. If the PDF is unreadable, use the "Screener Historical Quarters" below.
-6. GOOGLE NEWS RANKING QUESTIONS: Include specific trending search keyword questions and exact answers related to this stock in the FAQs section.
-7. All English fields MUST be 100% in English. Only 'gujarati_summary' and 'gujarati_intraday_view' must be in natural Gujarati.
+CRITICAL RULES FOR 100% ACCURATE PDF EXTRACTION (DO NOT VIOLATE):
+1. THE ATTACHED PDF IS THE SINGLE SOURCE OF TRUTH FOR FINANCIAL RESULT NUMBERS:
+   - Read the financial results table directly from the attached PDF document (including scanned image tables).
+   - NEVER use old quarters like 'Jun 2026' or 'Mar 2026' if the PDF is for 'Sep 2026' (Quarter ended 30.09.2026)!
+2. CONSOLIDATED vs STANDALONE:
+   - If the PDF contains BOTH Consolidated and Standalone financial results, strictly extract **Consolidated** figures and set `"result_type": "Consolidated"`.
+   - If the PDF contains ONLY Standalone financial results, extract **Standalone** figures and set `"result_type": "Standalone"`.
+3. EXACT COLUMN SELECTION (YEAR-ON-YEAR / YoY COMPARISON):
+   - Look at the **"Quarter Ended" (3 Months)** columns in the PDF table:
+     * `curr_period_label`: The latest quarter ended in the PDF (format strictly as `"Sep 2026"` for 30.09.2026).
+     * `prev_period_label`: The **SAME QUARTER LAST YEAR (YoY)** in the PDF (format strictly as `"Sep 2025"` for 30.09.2025).
+   - DO NOT compare `Sep 2026` with `Jun 2026` or `Mar 2026` unless the `Sep 2025` column is completely absent in the PDF (e.g. SME Half-Yearly filing where only 6-month columns exist).
+   - Do NOT pick 6-Month (Half-Yearly) or 12-Month (Yearly) columns when 3-Month (Quarterly) columns are present!
+4. EXACT UNIT CONVERSION TO Rs. CRORES (₹ Cr):
+   - First check the unit written at the top of the PDF table (`Rs. in Lakhs`, `Rs. in Crores`, `Rs. in Millions`, `Rs. in Thousands`).
+   - Convert every figure accurately into **Rs. Crores (₹ Cr)**:
+     * If `Rs. in Lakhs`: Divide by `100` (e.g. `10,363.00 Lakhs` = `103.63` Cr; `467.00 Lakhs` = `4.67` Cr).
+     * If `Rs. in Millions`: Divide by `10` (e.g. `1,036.30 Millions` = `103.63` Cr).
+     * If `Rs. in Thousands`: Divide by `10,000`.
+     * If `Rs. in Crores`: Keep exact value.
+5. EXACT ROWS TO EXTRACT FROM THE PDF TABLE:
+   - `revenue`: **Revenue from Operations** (or Total Income if Revenue from Operations is not separate).
+   - `gross_profit`: **EBITDA / Operating Profit** = Calculate `Profit Before Exceptional Items & Tax (PBT) + Finance Costs + Depreciation & Amortization` from the PDF table!
+   - `net_profit`: **Net Profit (PAT)** = `Profit / (Loss) for the period (after tax)`.
+6. STRONG RESULT FILTER:
+   - Set `"skip_stock": false` ONLY IF the PDF shows strong performance (positive YoY Net Profit growth >= 5%, turnaround from loss to profit, strong revenue growth >= 15%, or a new order win). If the result is weak, loss-making, or unreadable, set `"skip_stock": true`.
+   - If you cannot read the financial table in the PDF clearly, set `"pdf_table_verified": false` and `"skip_stock": true`. Never guess numbers!
+7. HIGH-SEARCH-VOLUME SEO TITLE & KEYWORDS:
+   - `seo_title` MUST start with `{c_clean_name} Share Price Target 2026` or `{c_clean_name} Q2 Results` or `{c_clean_name} Share Latest News`.
+   - Naturally weave these live Google trending keywords into headings, body, and FAQs: {kws_str}
 
-Company Headline: {company_title}
-BSE Scrip Code: {scrip_code or 'Listed on BSE'}
-Document Type: {doc_type}
-Screener Fundamentals:
+Company Name: {c_clean_name} (BSE: {scrip_code})
+Screener Verified Valuation Ratios (Use ONLY for Valuation/Fundamental sections, NOT for the Q2 Result Table):
+- Current Share Price: {screener_info['price_str']} (52W High: {screener_info['high_52w']} | 52W Low: {screener_info['low_52w']})
 - Market Cap: {screener_info['market_cap']}
-- Current Price: {screener_info['price_str']}
-- P/E Ratio (TTM): {screener_info['pe_ratio']}
-- P/B Ratio: {screener_info['pb_ratio']}
-- Industry P/E: {screener_info['industry_pe']}
-- ROE: {screener_info['roe']}
-- EPS (TTM): {screener_info['eps']}
-- Div Yield: {screener_info['div_yield']}
-- Book Value: {screener_info['book_value']}
-- Total Debt: {screener_info['curr_debt_num']} Cr (Previous: {screener_info['prev_debt_num']} Cr)
-- Debt-to-Equity: {screener_info['debt_to_equity']}
-- Face Value: {screener_info['face_value']}
-
-Screener Historical Quarters (in Rs. Cr.):
-{screener_info['quarters_text']}
+- Stock P/E: {screener_info['pe_ratio']} | Industry P/E: {screener_info['industry_pe']} | P/B: {screener_info['pb_ratio']}
+- ROE: {screener_info['roe']} | ROCE: {screener_info['roce']} | EPS (TTM): {screener_info['eps']}
+- Total Debt: {screener_info['total_debt']} | Debt-to-Equity: {screener_info['debt_to_equity']}
+- Book Value: {screener_info['book_value']} | Div Yield: {screener_info['div_yield']}
+- Algorithmic Valuation Bands: 2026: {screener_info['target_2026']} | 2027: {screener_info['target_2027']} | 2030: {screener_info['target_2030']}
 
 Return ONLY a valid JSON object with this exact structure:
 {{
-  "seo_title": "High-CTR Google Search & Discover Title in 100% English starting with Company Name + Share Price/Order/Q2 Consolidated PAT YoY Growth (70 to 105 chars)",
-  "seo_lead_summary": "A 45-60 word SEO meta summary paragraph in 100% English starting with Company Name (BSE: {scrip_code}) that summarizes the exact Consolidated PAT/Revenue YoY growth OR New Order value, current share price ({screener_info['price_str']}), and valuation impact.",
-  "company_short_name": "Clean Company Name in English",
-  "result_date": "Date of filing in English (e.g. November 11, 2026)",
+  "pdf_table_verified": true,
+  "pdf_original_unit": "Lakhs or Crores or Millions",
+  "skip_stock": false,
+  "seo_title": "{c_clean_name} Share Price Target 2026, Q2 Results (PAT YoY Growth) & Latest News",
+  "seo_lead_summary": "45-60 word high-CTR summary in English starting with '{c_clean_name} Share Price Target 2026 & Q2 Results:' covering exact PDF PAT/Revenue YoY growth or Order value, current price ({screener_info['price_str']}), and valuation impact.",
+  "company_short_name": "{c_clean_name}",
+  "result_date": "{ist_today_str}",
   "price_display": "{screener_info['price_str']}",
-  "quarter_label": "e.g. Q2 FY26-27",
-  "curr_period_label": "e.g. Sep 26",
-  "prev_period_label": "e.g. Sep 25",
+  "quarter_label": "Q2 FY27 (Quarterly)",
+  "curr_period_label": "Sep 2026",
+  "prev_period_label": "Sep 2025",
   "result_type": "Consolidated",
-  "revenue": {{"curr": "36.76", "prev": "27.15", "growth": "+35.4%", "difference": "+9.61 Cr"}},
-  "gross_profit": {{"curr": "14.24", "prev": "7.75", "growth": "+83.7%", "difference": "+6.49 Cr"}},
-  "net_profit": {{"curr": "11.27", "prev": "6.89", "growth": "+63.6%", "difference": "+4.38 Cr"}},
+  "revenue": {{"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"}},
+  "gross_profit": {{"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"}},
+  "net_profit": {{"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"}},
   "debt_comparison": {{"curr": "{screener_info['curr_debt_num']}", "prev": "{screener_info['prev_debt_num']}"}},
   "order_details": {{
-    "client_or_awarder": "Client or Authority Name (for order filings)",
-    "order_value": "Order / Contract Value in Rs. Cr.",
-    "order_to_mcap_ratio": "Calculate Order Value as % of Market Cap ({screener_info['market_cap']}) in English",
-    "scope_of_work": "Clear description of project scope in English",
-    "execution_timeline": "Execution timeline in English"
+    "client_or_awarder": "Client Name from PDF",
+    "order_value": "Order Value in Rs. Cr. from PDF",
+    "order_to_mcap_ratio": "Order Value as % of Market Cap",
+    "scope_of_work": "Project scope from PDF",
+    "execution_timeline": "Execution timeline from PDF"
   }},
   "market_cap": "{screener_info['market_cap']}",
   "pe_ratio": "{screener_info['pe_ratio']}",
@@ -868,206 +1062,141 @@ Return ONLY a valid JSON object with this exact structure:
   "total_debt": "{screener_info['total_debt']}",
   "debt_to_equity": "{screener_info['debt_to_equity']}",
   "face_value": "{screener_info['face_value']}",
-  "fundamental_impact_note": "1-2 sentences in 100% English explaining what changed in the fundamentals.",
-  "estimated_stock_return": "Estimated % return / outlook in 100% English (e.g. +8.0% to +12.5% Bullish Momentum)",
-  "intraday_signal": "1-2 sentences in 100% English explaining technical/positional sentiment.",
-  "quarter_chart_labels": ["Jun 25", "Sep 25", "Dec 25", "Mar 26", "Jun 26", "Sep 26"],
-  "quarter_chart_revenue": [24.1, 27.15, 26.04, 28.31, 30.8, 36.76],
-  "quarter_chart_gross_profit": [7.1, 7.75, 7.9, 8.6, 10.2, 14.24],
-  "quarter_chart_net_profit": [5.45, 6.89, 5.83, 7.51, 9.02, 11.27],
+  "fundamental_impact_note": "1-2 sentences in English explaining what changed in {c_clean_name}'s fundamentals.",
+  "estimated_stock_return": "{screener_info['target_2026']} (Medium-Term Valuation Band)",
+  "intraday_signal": "1-2 sentences in English covering 52-week high/low ({screener_info['high_52w']} / {screener_info['low_52w']}) and momentum.",
   "key_highlights": [
-    "Bullet 1 in 100% English: Core top-line revenue or order book milestone with exact figures.",
-    "Bullet 2 in 100% English: Operating margin and Consolidated PAT expansion/contraction.",
-    "Bullet 3 in 100% English: Balance sheet strength, Total Debt ({screener_info['total_debt']}), and Debt-to-Equity ({screener_info['debt_to_equity']}).",
-    "Bullet 4 in 100% English: Valuation comparison between Stock P/E ({screener_info['pe_ratio']}) and Industry P/E ({screener_info['industry_pe']})."
+    "Bullet 1 in English: Exact PDF Revenue & PAT YoY growth (in ₹ Cr) or Order Book milestone.",
+    "Bullet 2 in English: 52-Week High ({screener_info['high_52w']}) & Low ({screener_info['low_52w']}) vs Current Price ({screener_info['price_str']}).",
+    "Bullet 3 in English: Total Debt ({screener_info['total_debt']}) and Debt-to-Equity ({screener_info['debt_to_equity']}) analysis.",
+    "Bullet 4 in English: Stock P/E ({screener_info['pe_ratio']}) vs Industry P/E ({screener_info['industry_pe']}) and ROE ({screener_info['roe']})."
+  ],
+  "web_story_hook": [
+    "Punchy Web Story slide 1 with {c_clean_name}'s exact PDF revenue & profit jump or order win.",
+    "Punchy Web Story slide 2 about {c_clean_name}'s Share Price Target 2026 ({screener_info['target_2026']}).",
+    "Punchy Web Story slide 3 about Debt-to-Equity ({screener_info['debt_to_equity']}) and ROE ({screener_info['roe']}).",
+    "Punchy Web Story slide 4 about Stock P/E ({screener_info['pe_ratio']}) vs Sector P/E ({screener_info['industry_pe']})."
   ],
   "seo_article_sections": [
     {{
-      "heading": "Operational Performance & YoY Earnings Breakdown (or Order Execution Visibility)",
-      "body": "130-150 words of 100% original, copyright-free financial journalism in English analyzing the exact numbers from the filing, YoY trajectory, and operational efficiency."
+      "heading": "Why {c_clean_name} Share Price is in Focus Today: Q2 Results & PDF Earnings Breakdown",
+      "body": "140-160 words in English analyzing the exact numbers extracted from the BSE PDF, YoY profit growth, and operational margins."
     }},
     {{
-      "heading": "Fundamental Valuation, ROE & Balance Sheet Health",
-      "body": "130-150 words in 100% English analyzing Market Cap, Stock P/E vs Industry P/E, ROE, EPS, Book Value, Debt-to-Equity, and whether the stock looks undervalued or richly priced."
+      "heading": "{c_clean_name} Share Price Target 2026, 2027, 2030 & Fundamental Valuation",
+      "body": "140-160 words in English discussing {c_clean_name} share price target 2026 ({screener_info['target_2026']}) and 2030 ({screener_info['target_2030']}) based on EPS ({screener_info['eps']}), P/E ({screener_info['pe_ratio']}), and Book Value ({screener_info['book_value']})."
     }},
     {{
-      "heading": "Market Outlook & Key Triggers for Investors",
-      "body": "100-120 words in 100% English discussing medium-term growth catalysts, execution risks, and what retail investors should track next."
+      "heading": "Is {c_clean_name} Share a Good Buy for Long Term? Debt-to-Equity & ROE Analysis",
+      "body": "120-140 words in English evaluating Total Debt ({screener_info['total_debt']}), Debt-to-Equity ({screener_info['debt_to_equity']}), ROE ({screener_info['roe']}), and key triggers."
     }}
   ],
   "faqs": [
     {{
-      "q": "What is the latest share price target and quarterly result of [Company Name]?",
-      "a": "Direct 2-sentence answer in 100% English with exact numbers."
+      "q": "What is the {c_clean_name} share price target for 2026, 2027, and 2030?",
+      "a": "Direct 2-sentence answer in English citing valuation bands ({screener_info['target_2026']} for 2026 and {screener_info['target_2030']} for 2030) based on EPS and ROE."
     }},
     {{
-      "q": "Is [Company Name] share a good buy for long term based on its P/E and ROE?",
-      "a": "Direct 2-sentence answer in 100% English citing valuation and ROE."
+      "q": "How were {c_clean_name} Q2 results according to the official BSE PDF?",
+      "a": "Direct 2-sentence answer in English with exact Revenue, EBITDA, and Net Profit YoY numbers from the PDF."
+    }},
+    {{
+      "q": "Is {c_clean_name} a debt-free stock?",
+      "a": "Direct answer in English citing Total Debt of {screener_info['total_debt']} and Debt-to-Equity of {screener_info['debt_to_equity']}."
+    }},
+    {{
+      "q": "Is {c_clean_name} share a good buy for long term investment?",
+      "a": "Direct answer in English comparing Stock P/E ({screener_info['pe_ratio']}) with Industry P/E ({screener_info['industry_pe']}) and ROE ({screener_info['roe']})."
     }}
   ],
-  "gujarati_summary": "2-3 sentences in natural Gujarati summarizing the Consolidated result (YoY) or new order.",
+  "gujarati_summary": "2-3 sentences in natural Gujarati summarizing {c_clean_name}'s exact PDF result (YoY) or new order.",
   "gujarati_intraday_view": "1-2 sentences in natural Gujarati explaining debt, valuation, and expected return."
 }}
 
-Extracted Text from Filing:
+Supplementary Extracted Text from Filing (if any):
 {source_text[:MAX_TEXT_CHARS]}
 """
-    response = None
-    if pdf_bytes and len(pdf_bytes) < 18 * 1024 * 1024:
-        try:
-            pdf_part = {"mime_type": "application/pdf", "data": pdf_bytes}
-            response = call_gemini_with_fallback([prompt, pdf_part])
-        except Exception as exc:
-            log.warning("Multimodal PDF OCR fallback to text prompt: %s", exc)
+    require_vision = (pdf_bytes is not None and pdf_text_len < 400)
+    response = call_ai_api(prompt, pdf_bytes, require_pdf_vision=require_vision)
 
-    if response is None:
-        response = call_gemini_with_fallback(prompt)
+    if response and getattr(response, "text", None):
+        raw = response.text.strip()
+        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+                if isinstance(parsed.get("web_story_hook"), str):
+                    parsed["web_story_hook"] = [parsed["web_story_hook"]]
+                if doc_type == "result":
+                    parsed = verify_and_normalize_pdf_result_numbers(parsed, screener_info)
+                return parsed
+            except Exception as exc:
+                log.warning("JSON parse error for %s: %s", company_title, exc)
 
-    raw = (response.text or "").strip()
-    match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
-    if not match:
-        raise RuntimeError("Gemini did not return valid JSON")
-    parsed = json.loads(match.group(0))
-
-    if doc_type == "result":
-        parsed = ensure_valid_result_numbers(parsed, screener_info)
-    return parsed
+    return None
 
 
-# ---------------- VISUAL CHARTS BUILDER (WITH NUMBERS ON TOP) ----------------
+# ==========================================
+# 8. VISUAL CHARTS & MOBILE-PERFECT HTML BUILDER
+# ==========================================
 def build_quarterly_column_chart_url(comp_name, labels, rev_list, gp_list, np_list):
     datasets = [
-        {
-            "label": "Revenue",
-            "backgroundColor": "#1b5e20",
-            "data": [to_float(x) for x in rev_list],
-        },
-        {
-            "label": "Net Profit",
-            "backgroundColor": "#2563eb",
-            "data": [to_float(x) for x in np_list],
-        },
+        {"label": "Revenue", "backgroundColor": "#1b5e20", "data": [to_float(x) for x in rev_list]},
+        {"label": "Net Profit", "backgroundColor": "#2563eb", "data": [to_float(x) for x in np_list]},
     ]
     if gp_list and any(to_float(x) != 0 for x in gp_list):
-        datasets.insert(
-            1,
-            {
-                "label": "Gross Profit",
-                "backgroundColor": "#90a4ae",
-                "data": [to_float(x) for x in gp_list],
-            },
-        )
+        datasets.insert(1, {"label": "EBITDA", "backgroundColor": "#90a4ae", "data": [to_float(x) for x in gp_list]})
 
     chart_config = {
         "type": "bar",
-        "data": {
-            "labels": labels,
-            "datasets": datasets,
-        },
+        "data": {"labels": labels, "datasets": datasets},
         "options": {
             "layout": {"padding": {"top": 26, "right": 12, "left": 8, "bottom": 8}},
-            "title": {
-                "display": True,
-                "text": f"{comp_name} - Multi-Quarter Trend (Rs.Cr.)",
-                "fontSize": 16,
-                "fontColor": "#334155",
-                "padding": 14,
-            },
-            "legend": {
-                "display": True,
-                "position": "top",
-                "labels": {"fontSize": 12, "fontColor": "#334155"},
-            },
-            "scales": {
-                "yAxes": [{"ticks": {"beginAtZero": True, "padding": 6}}],
-                "xAxes": [{"ticks": {"fontSize": 12, "fontColor": "#334155"}}],
-            },
-            "plugins": {
-                "datalabels": {
-                    "display": True,
-                    "anchor": "end",
-                    "align": "top",
-                    "offset": 2,
-                    "clip": False,
-                    "color": "#000000",
-                    "font": {"weight": "bold", "size": 11},
-                }
-            },
+            "title": {"display": True, "text": f"{comp_name} - Multi-Quarter Trend (Rs.Cr.)", "fontSize": 16, "fontColor": "#334155", "padding": 14},
+            "legend": {"display": True, "position": "top", "labels": {"fontSize": 12, "fontColor": "#334155"}},
+            "scales": {"yAxes": [{"ticks": {"beginAtZero": True, "padding": 6}}], "xAxes": [{"ticks": {"fontSize": 12, "fontColor": "#334155"}}]},
+            "plugins": {"datalabels": {"display": True, "anchor": "end", "align": "top", "offset": 2, "clip": False, "color": "#000000", "font": {"weight": "bold", "size": 11}}},
         },
     }
-    encoded = urllib.parse.quote(json.dumps(chart_config))
-    return f"https://quickchart.io/chart?w=750&h=420&bkg=white&c={encoded}"
+    return f"https://quickchart.io/chart?w=750&h=420&bkg=white&c={urllib.parse.quote(json.dumps(chart_config))}"
 
 
 def build_yoy_comparison_chart_url(comp_name, qtr_lbl, prev_lbl, curr_lbl, rev, gp, np_d, debt_comp):
-    r_curr, r_prev = to_float(rev.get("curr", 0)), to_float(rev.get("prev", 0))
-    gp_curr, gp_prev = to_float(gp.get("curr", 0)), to_float(gp.get("prev", 0))
-    np_curr, np_prev = to_float(np_d.get("curr", 0)), to_float(np_d.get("prev", 0))
-    d_curr, d_prev = to_float(debt_comp.get("curr", 0)), to_float(debt_comp.get("prev", 0))
-
-    labels = ["Revenue", "Gross Profit", "Net Profit", "Total Debt"]
-    curr_data = [r_curr, gp_curr, np_curr, d_curr]
-    prev_data = [r_prev, gp_prev, np_prev, d_prev]
+    labels = ["Revenue", "EBITDA", "Net Profit", "Total Debt"]
+    curr_data = [to_float(rev.get("curr")), to_float(gp.get("curr")), to_float(np_d.get("curr")), to_float(debt_comp.get("curr"))]
+    prev_data = [to_float(rev.get("prev")), to_float(gp.get("prev")), to_float(np_d.get("prev")), to_float(debt_comp.get("prev"))]
 
     chart_config = {
         "type": "bar",
         "data": {
             "labels": labels,
             "datasets": [
-                {
-                    "label": str(curr_lbl),
-                    "backgroundColor": "#1b5e20",
-                    "data": curr_data,
-                },
-                {
-                    "label": str(prev_lbl),
-                    "backgroundColor": "#90a4ae",
-                    "data": prev_data,
-                },
+                {"label": str(curr_lbl), "backgroundColor": "#1b5e20", "data": curr_data},
+                {"label": str(prev_lbl), "backgroundColor": "#90a4ae", "data": prev_data},
             ],
         },
         "options": {
             "layout": {"padding": {"top": 26, "right": 14, "left": 10, "bottom": 8}},
-            "title": {
-                "display": True,
-                "text": f"{comp_name} - {qtr_lbl} YoY (Rs.Cr.)",
-                "fontSize": 17,
-                "fontColor": "#475569",
-                "padding": 14,
-            },
-            "legend": {
-                "display": True,
-                "position": "top",
-                "labels": {"fontSize": 13, "fontColor": "#475569"},
-            },
-            "scales": {
-                "yAxes": [{"ticks": {"beginAtZero": True, "padding": 6}}],
-                "xAxes": [{"ticks": {"fontSize": 13, "fontColor": "#475569"}}],
-            },
-            "plugins": {
-                "datalabels": {
-                    "display": True,
-                    "anchor": "end",
-                    "align": "top",
-                    "offset": 2,
-                    "clip": False,
-                    "color": "#000000",
-                    "font": {"weight": "bold", "size": 12},
-                }
-            },
+            "title": {"display": True, "text": f"{comp_name} - {curr_lbl} vs {prev_lbl} YoY (Rs.Cr.)", "fontSize": 16, "fontColor": "#475569", "padding": 14},
+            "legend": {"display": True, "position": "top", "labels": {"fontSize": 13, "fontColor": "#475569"}},
+            "scales": {"yAxes": [{"ticks": {"beginAtZero": True, "padding": 6}}], "xAxes": [{"ticks": {"fontSize": 13, "fontColor": "#475569"}}]},
+            "plugins": {"datalabels": {"display": True, "anchor": "end", "align": "top", "offset": 2, "clip": False, "color": "#000000", "font": {"weight": "bold", "size": 12}}},
         },
     }
-    encoded = urllib.parse.quote(json.dumps(chart_config))
-    return f"https://quickchart.io/chart?w=750&h=420&bkg=white&c={encoded}"
+    return f"https://quickchart.io/chart?w=750&h=420&bkg=white&c={urllib.parse.quote(json.dumps(chart_config))}"
 
 
-def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scrip_key="", file_key="", scrip_code=""):
+def build_post_html(data, doc_type, screener_info, source_url, trending_kws, comp_key="", scrip_key="", file_key="", scrip_code=""):
     comp_name = html.escape(str(data.get("company_short_name", "Company")))
     res_date = html.escape(str(data.get("result_date", datetime.now().strftime("%B %d, %Y"))))
+    ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    ist_time_str = ist_now.strftime("%B %d, %Y | %I:%M %p IST")
+    iso_time = ist_now.strftime("%Y-%m-%dT%H:%M:%S+05:30")
+
     price_disp = html.escape(str(data.get("price_display", screener_info["price_str"])))
-    qtr_lbl = html.escape(str(data.get("quarter_label", "Q2 FY26-27")))
-    curr_lbl = html.escape(str(data.get("curr_period_label", "Sep 26")))
-    prev_lbl = html.escape(str(data.get("prev_period_label", "Sep 25")))
+    qtr_lbl = html.escape(str(data.get("quarter_label", "Q2 / Quarterly")))
+    curr_lbl = html.escape(shorten_period_label(data.get("curr_period_label", "Sep 2026")))
+    prev_lbl = html.escape(shorten_period_label(data.get("prev_period_label", "Sep 2025")))
     res_type = html.escape(str(data.get("result_type", "Consolidated")))
 
     mkt_cap = html.escape(str(data.get("market_cap") or screener_info["market_cap"]))
@@ -1081,27 +1210,12 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
     total_debt = html.escape(str(data.get("total_debt") or screener_info["total_debt"]))
     de_ratio = html.escape(str(data.get("debt_to_equity") or screener_info["debt_to_equity"]))
     face_val = html.escape(str(data.get("face_value") or screener_info["face_value"]))
+    high_52w = html.escape(str(screener_info.get("high_52w", "N/A")))
+    low_52w = html.escape(str(screener_info.get("low_52w", "N/A")))
     fund_impact = html.escape(str(data.get("fundamental_impact_note", "")))
-    est_return = html.escape(str(data.get("estimated_stock_return", "N/A")))
     intraday_sig = html.escape(str(data.get("intraday_signal", "")))
 
     raw_lead = str(data.get("seo_lead_summary") or "").strip()
-    if not raw_lead:
-        if doc_type == "order":
-            ord_val = (data.get("order_details") or {}).get("order_value", "a new contract")
-            raw_lead = (
-                f"{data.get('company_short_name', 'The company')} (BSE: {scrip_code or 'Listed'}) has announced the receipt "
-                f"of a new order worth {ord_val}. Trading near {screener_info['price_str']} with a Market Cap of "
-                f"{screener_info['market_cap']} and ROE of {screener_info['roe']}, here is the complete order book and fundamental analysis."
-            )
-        else:
-            np_info = data.get("net_profit") or {}
-            rev_info = data.get("revenue") or {}
-            raw_lead = (
-                f"{data.get('company_short_name', 'The company')} (BSE: {scrip_code or 'Listed'}) declared its {data.get('quarter_label', 'quarterly')} "
-                f"Consolidated financial results, reporting a Net Profit (PAT) of Rs. {np_info.get('curr', '0')} Cr ({np_info.get('growth', '0%')} YoY) "
-                f"and Revenue of Rs. {rev_info.get('curr', '0')} Cr ({rev_info.get('growth', '0%')} YoY)."
-            )
     lead_html = html.escape(raw_lead)
 
     seed_int = int(hashlib.md5((comp_name + res_date).encode("utf-8")).hexdigest()[:6], 16)
@@ -1110,23 +1224,33 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
 
     content_blocks = []
 
+    web_story_hooks = data.get("web_story_hook") or []
+    if isinstance(web_story_hooks, str):
+        web_story_hooks = [web_story_hooks]
+    if web_story_hooks and isinstance(web_story_hooks, list):
+        hook_list = "".join(f"<li style='margin-bottom:8px;'>{html.escape(str(h))}</li>" for h in web_story_hooks if h)
+        if hook_list:
+            content_blocks.append(f"""
+            <div style="background: linear-gradient(135deg, #1e3a8a, #2563eb); color: white; border-radius: 14px; padding: 18px 20px; margin-bottom: 24px; box-shadow: 0 4px 12px rgba(37, 99, 235, 0.25);">
+              <h2 style="margin: 0 0 12px 0; font-size: 18px; border-bottom: 1px solid #93c5fd; padding-bottom: 8px; color: white;">⚡ {comp_name} Quick Highlights (Web Story Summary)</h2>
+              <ul style="margin: 0; padding-left: 18px; font-size: 14px; font-weight: 500; line-height: 1.65;">
+                {hook_list}
+              </ul>
+              <p style="margin: 10px 0 0 0; font-size: 12px; text-align: right; color: #dbeafe;"><em>MarketMunafa Equity Research Desk</em></p>
+            </div>
+            """)
+
     if doc_type == "order":
         ord_info = data.get("order_details", {}) or {}
-        client_str = html.escape(str(ord_info.get("client_or_awarder", "Disclosed in Filing")))
-        val_str = html.escape(str(ord_info.get("order_value", "As per BSE Filing")))
-        mcap_pct_str = html.escape(str(ord_info.get("order_to_mcap_ratio", "Significant Revenue Visibility")))
-        scope_str = html.escape(str(ord_info.get("scope_of_work", "Execution of commercial order/contract")))
-        time_str = html.escape(str(ord_info.get("execution_timeline", "As per contract terms")))
-
         order_card = f"""
-        <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 16px; padding: 22px; margin-bottom: 24px;">
-          <h2 style="margin: 0 0 16px 0; font-size: 20px; color: #1e3a8a;">🏆 {comp_name} New Order &amp; Contract Details</h2>
-          <p style="margin: 8px 0; font-size: 16px;"><strong>Company Name:</strong> {comp_name} ({price_disp})</p>
-          <p style="margin: 8px 0; font-size: 16px;"><strong>Client / Awarding Authority:</strong> {client_str}</p>
-          <p style="margin: 8px 0; font-size: 16px;"><strong>Order / Contract Value:</strong> <span style="color:#16a34a; font-weight:700;">{val_str}</span></p>
-          <p style="margin: 8px 0; font-size: 16px;"><strong>Order Size vs Market Cap:</strong> {mcap_pct_str}</p>
-          <p style="margin: 8px 0; font-size: 16px;"><strong>Nature of Work / Scope:</strong> {scope_str}</p>
-          <p style="margin: 8px 0; font-size: 16px;"><strong>Execution Timeline:</strong> {time_str}</p>
+        <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 16px; padding: 20px; margin-bottom: 24px;">
+          <h2 style="margin: 0 0 14px 0; font-size: 19px; color: #1e3a8a;">🏆 {comp_name} Latest Order Win &amp; Contract Details</h2>
+          <p style="margin: 8px 0; font-size: 15px;"><strong>Company Name:</strong> {comp_name} ({price_disp})</p>
+          <p style="margin: 8px 0; font-size: 15px;"><strong>Client / Awarding Authority:</strong> {html.escape(str(ord_info.get("client_or_awarder", "Disclosed in Filing")))}</p>
+          <p style="margin: 8px 0; font-size: 15px;"><strong>Order / Contract Value:</strong> <span style="color:#16a34a; font-weight:700;">{html.escape(str(ord_info.get("order_value", "As per BSE Filing")))}</span></p>
+          <p style="margin: 8px 0; font-size: 15px;"><strong>Order Size vs Market Cap:</strong> {html.escape(str(ord_info.get("order_to_mcap_ratio", "Significant Revenue Visibility")))}</p>
+          <p style="margin: 8px 0; font-size: 15px;"><strong>Nature of Work / Scope:</strong> {html.escape(str(ord_info.get("scope_of_work", "Execution of commercial order/contract")))}</p>
+          <p style="margin: 8px 0; font-size: 15px;"><strong>Execution Timeline:</strong> {html.escape(str(ord_info.get("execution_timeline", "As per contract terms")))}</p>
         </div>
         """
         content_blocks.append(order_card)
@@ -1137,10 +1261,10 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
         np_d = data.get("net_profit", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
         debt_comp = data.get("debt_comparison") or {"curr": screener_info["curr_debt_num"], "prev": screener_info["prev_debt_num"]}
 
-        q_labels = data.get("quarter_chart_labels") or screener_info["q_labels"] or [prev_lbl, curr_lbl]
-        q_rev = data.get("quarter_chart_revenue") or screener_info["q_rev"] or [to_float(rev.get("prev")), to_float(rev.get("curr"))]
-        q_gp = data.get("quarter_chart_gross_profit") or screener_info["q_gp"] or [to_float(gp.get("prev")), to_float(gp.get("curr"))]
-        q_np = data.get("quarter_chart_net_profit") or screener_info["q_np"] or [to_float(np_d.get("prev")), to_float(np_d.get("curr"))]
+        q_labels = data.get("quarter_chart_labels") or [prev_lbl, curr_lbl]
+        q_rev = data.get("quarter_chart_revenue") or [to_float(rev.get("prev")), to_float(rev.get("curr"))]
+        q_gp = data.get("quarter_chart_gross_profit") or [to_float(gp.get("prev")), to_float(gp.get("curr"))]
+        q_np = data.get("quarter_chart_net_profit") or [to_float(np_d.get("prev")), to_float(np_d.get("curr"))]
 
         quarter_chart_url = build_quarterly_column_chart_url(comp_name, q_labels, q_rev, q_gp, q_np)
         yoy_chart_url = build_yoy_comparison_chart_url(comp_name, qtr_lbl, prev_lbl, curr_lbl, rev, gp, np_d, debt_comp)
@@ -1149,129 +1273,138 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
             return "#dc2626" if "-" in str(growth_str) else "#16a34a"
 
         result_card = f"""
-        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 18px; box-shadow: 0 4px 14px rgba(0,0,0,0.05); margin-bottom: 24px; overflow-x: auto;">
-          <div style="display: flex; justify-content: space-between; color: #64748b; font-size: 14px; margin-bottom: 10px;">
-            <span>{res_date}</span>
-            <span>Rs.Cr.</span>
+        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 14px; box-shadow: 0 4px 14px rgba(0,0,0,0.05); margin-bottom: 24px; box-sizing: border-box;">
+          <h2 style="margin: 0 0 8px 0; font-size: 18px; color: #0f172a; line-height: 1.35;">📊 {comp_name} {qtr_lbl} Results Table ({res_type})</h2>
+          <div style="display: flex; justify-content: space-between; align-items: center; color: #64748b; font-size: 12px; margin-bottom: 10px;">
+            <span>{res_date} | Price: <strong style="color:#0f172a;">{price_disp}</strong></span>
+            <span>Figures in ₹ Cr.</span>
           </div>
-          <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 18px;">
-            <strong style="font-size: 21px; color: #0f172a;">{comp_name}</strong>
-            <span style="font-size: 19px; font-weight: 600; color: #0f172a;">{price_disp}</span>
-          </div>
-          <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
-            <thead>
-              <tr style="border-top: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0; color: #64748b; font-weight: 600;">
-                <th style="text-align: left; padding: 10px 4px; white-space: nowrap;">{qtr_lbl}</th>
-                <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">{curr_lbl}</th>
-                <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">{prev_lbl}</th>
-                <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">Diff</th>
-                <th style="text-align: right; padding: 10px 4px; white-space: nowrap;">YoY Growth</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr style="border-bottom: 1px solid #f1f5f9;">
-                <td style="padding: 12px 4px; color: #1e293b; font-weight: 500; white-space: nowrap;">Revenue</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap;">{html.escape(str(rev.get('curr', '0')))}</td>
-                <td style="padding: 12px 4px; text-align: right; color: #475569; white-space: nowrap;">{html.escape(str(rev.get('prev', '0')))}</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: #0f172a; white-space: nowrap;">{html.escape(str(rev.get('difference', '0')))}</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap; color: {growth_color(rev.get('growth', ''))};">{html.escape(str(rev.get('growth', '0%')))}</td>
-              </tr>
-              <tr style="border-bottom: 1px solid #f1f5f9;">
-                <td style="padding: 12px 4px; color: #1e293b; font-weight: 500; white-space: nowrap;">Gross Profit</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap;">{html.escape(str(gp.get('curr', '0')))}</td>
-                <td style="padding: 12px 4px; text-align: right; color: #475569; white-space: nowrap;">{html.escape(str(gp.get('prev', '0')))}</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: #0f172a; white-space: nowrap;">{html.escape(str(gp.get('difference', '0')))}</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap; color: {growth_color(gp.get('growth', ''))};">{html.escape(str(gp.get('growth', '0%')))}</td>
-              </tr>
-              <tr>
-                <td style="padding: 12px 4px; color: #1e293b; font-weight: 500; white-space: nowrap;">Net Profit (PAT)</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap;">{html.escape(str(np_d.get('curr', '0')))}</td>
-                <td style="padding: 12px 4px; text-align: right; color: #475569; white-space: nowrap;">{html.escape(str(np_d.get('prev', '0')))}</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; color: #0f172a; white-space: nowrap;">{html.escape(str(np_d.get('difference', '0')))}</td>
-                <td style="padding: 12px 4px; text-align: right; font-weight: 600; white-space: nowrap; color: {growth_color(np_d.get('growth', ''))};">{html.escape(str(np_d.get('growth', '0%')))}</td>
-              </tr>
-            </tbody>
-          </table>
-          <div style="margin-top: 16px;">
-            <span style="display: inline-block; border: 1px solid #cbd5e1; border-radius: 6px; padding: 4px 12px; font-size: 13px; color: #64748b;">
-              {res_type}
-            </span>
+          <div style="width: 100%; overflow-x: auto;">
+            <table style="width: 100%; border-collapse: collapse; font-size: 12.5px; text-align: right;">
+              <thead>
+                <tr style="border-top: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0; color: #475569; font-weight: 700; background: #f8fafc;">
+                  <th style="text-align: left; padding: 8px 4px; white-space: nowrap;">Metric</th>
+                  <th style="padding: 8px 4px; white-space: nowrap;">{curr_lbl}</th>
+                  <th style="padding: 8px 4px; white-space: nowrap;">{prev_lbl}</th>
+                  <th style="padding: 8px 4px; white-space: nowrap;">Change</th>
+                  <th style="padding: 8px 4px; white-space: nowrap;">YoY %</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr style="border-bottom: 1px solid #f1f5f9;">
+                  <td style="text-align: left; padding: 10px 4px; color: #1e293b; font-weight: 600; white-space: nowrap;">Revenue</td>
+                  <td style="padding: 10px 4px; font-weight: 600; white-space: nowrap;">₹{html.escape(str(rev.get('curr', '0')))}</td>
+                  <td style="padding: 10px 4px; color: #64748b; white-space: nowrap;">₹{html.escape(str(rev.get('prev', '0')))}</td>
+                  <td style="padding: 10px 4px; font-weight: 600; white-space: nowrap;">{html.escape(str(rev.get('difference', '0')))}</td>
+                  <td style="padding: 10px 4px; font-weight: 700; white-space: nowrap; color: {growth_color(rev.get('growth', ''))};">{html.escape(str(rev.get('growth', '0%')))}</td>
+                </tr>
+                <tr style="border-bottom: 1px solid #f1f5f9;">
+                  <td style="text-align: left; padding: 10px 4px; color: #1e293b; font-weight: 600; white-space: nowrap;">EBITDA</td>
+                  <td style="padding: 10px 4px; font-weight: 600; white-space: nowrap;">₹{html.escape(str(gp.get('curr', '0')))}</td>
+                  <td style="padding: 10px 4px; color: #64748b; white-space: nowrap;">₹{html.escape(str(gp.get('prev', '0')))}</td>
+                  <td style="padding: 10px 4px; font-weight: 600; white-space: nowrap;">{html.escape(str(gp.get('difference', '0')))}</td>
+                  <td style="padding: 10px 4px; font-weight: 700; white-space: nowrap; color: {growth_color(gp.get('growth', ''))};">{html.escape(str(gp.get('growth', '0%')))}</td>
+                </tr>
+                <tr>
+                  <td style="text-align: left; padding: 10px 4px; color: #1e293b; font-weight: 600; white-space: nowrap;">Net Profit</td>
+                  <td style="padding: 10px 4px; font-weight: 600; white-space: nowrap;">₹{html.escape(str(np_d.get('curr', '0')))}</td>
+                  <td style="padding: 10px 4px; color: #64748b; white-space: nowrap;">₹{html.escape(str(np_d.get('prev', '0')))}</td>
+                  <td style="padding: 10px 4px; font-weight: 600; white-space: nowrap;">{html.escape(str(np_d.get('difference', '0')))}</td>
+                  <td style="padding: 10px 4px; font-weight: 700; white-space: nowrap; color: {growth_color(np_d.get('growth', ''))};">{html.escape(str(np_d.get('growth', '0%')))}</td>
+                </tr>
+              </tbody>
+            </table>
           </div>
         </div>
         
-        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 18px; margin-bottom: 24px; text-align: center; box-shadow: 0 4px 14px rgba(0,0,0,0.04);">
-          <h2 style="margin: 0 0 12px 0; font-size: 19px; color: #0f172a;">📈 {comp_name} YoY Financial &amp; Debt Comparison Chart</h2>
-          <img src="{yoy_chart_url}" alt="{comp_name} {qtr_lbl} YoY Revenue Profit Chart" width="750" height="420" loading="lazy" style="max-width: 100%; height: auto; border-radius: 8px;" />
+        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 16px; margin-bottom: 24px; text-align: center;">
+          <h3 style="margin: 0 0 12px 0; font-size: 17px; color: #0f172a;">📈 {comp_name} YoY Revenue, PAT &amp; Debt Chart</h3>
+          <img src="{yoy_chart_url}" alt="{comp_name} Q2 Results YoY Chart" width="750" height="420" loading="lazy" style="max-width: 100%; height: auto; border-radius: 8px;" />
         </div>
-        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 18px; margin-bottom: 24px; text-align: center; box-shadow: 0 4px 14px rgba(0,0,0,0.04);">
-          <h2 style="margin: 0 0 12px 0; font-size: 19px; color: #0f172a;">📊 {comp_name} Multi-Quarter Performance Trend</h2>
-          <img src="{quarter_chart_url}" alt="{comp_name} Multi Quarter Revenue Net Profit Trend" width="750" height="420" loading="lazy" style="max-width: 100%; height: auto; border-radius: 8px;" />
+        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 16px; margin-bottom: 24px; text-align: center;">
+          <h3 style="margin: 0 0 12px 0; font-size: 17px; color: #0f172a;">📊 {comp_name} Multi-Quarter Earnings Trend</h3>
+          <img src="{quarter_chart_url}" alt="{comp_name} Quarterly Profit Trend" width="750" height="420" loading="lazy" style="max-width: 100%; height: auto; border-radius: 8px;" />
         </div>
         """
         content_blocks.append(result_card)
 
+    if screener_info.get("target_2026") and screener_info["target_2026"] != "N/A":
+        target_table_card = f"""
+        <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 16px; padding: 16px; margin-bottom: 24px; box-sizing: border-box;">
+          <h2 style="margin: 0 0 10px 0; font-size: 18px; color: #166534;">🎯 {comp_name} Share Price Target 2026, 2027 to 2030</h2>
+          <p style="margin: 0 0 12px 0; font-size: 14px; color: #15803d;">
+            Based on {comp_name}'s EPS of <strong>{eps}</strong>, ROE of <strong>{roe}</strong>, Book Value of <strong>{book_value}</strong>, and P/E of <strong>{pe_ratio}</strong>:
+          </p>
+          <table style="width: 100%; border-collapse: collapse; font-size: 13px; background: #ffffff; border-radius: 8px; overflow: hidden;">
+            <thead>
+              <tr style="background: #dcfce7; color: #14532d; font-weight: 700;">
+                <th style="padding: 8px; text-align: left; border: 1px solid #bbf7d0;">Year</th>
+                <th style="padding: 8px; text-align: right; border: 1px solid #bbf7d0;">Valuation Band</th>
+                <th style="padding: 8px; text-align: left; border: 1px solid #bbf7d0;">Key Driver</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td style="padding: 8px; font-weight: 600; border: 1px solid #e2e8f0;">Target 2026</td>
+                <td style="padding: 8px; text-align: right; font-weight: 700; color: #16a34a; border: 1px solid #e2e8f0;">{html.escape(screener_info['target_2026'])}</td>
+                <td style="padding: 8px; border: 1px solid #e2e8f0;">PAT growth &amp; order execution</td>
+              </tr>
+              <tr>
+                <td style="padding: 8px; font-weight: 600; border: 1px solid #e2e8f0;">Target 2027</td>
+                <td style="padding: 8px; text-align: right; font-weight: 700; color: #16a34a; border: 1px solid #e2e8f0;">{html.escape(screener_info['target_2027'])}</td>
+                <td style="padding: 8px; border: 1px solid #e2e8f0;">Margin expansion &amp; ROE</td>
+              </tr>
+              <tr>
+                <td style="padding: 8px; font-weight: 600; border: 1px solid #e2e8f0;">Target 2030</td>
+                <td style="padding: 8px; text-align: right; font-weight: 700; color: #16a34a; border: 1px solid #e2e8f0;">{html.escape(screener_info['target_2030'])}</td>
+                <td style="padding: 8px; border: 1px solid #e2e8f0;">Long-term compounding</td>
+              </tr>
+            </tbody>
+          </table>
+          <p style="margin: 8px 0 0 0; font-size: 12px; color: #475569;"><em>*Educational valuation estimates based on earnings multiples, not investment advice.</em></p>
+        </div>
+        """
+        content_blocks.append(target_table_card)
+
     highlights = data.get("key_highlights") or []
     if highlights and isinstance(highlights, list):
-        li_items = "".join(
-            f"<li style='margin-bottom: 8px; color: #1e293b; line-height: 1.6;'>{html.escape(str(h))}</li>"
-            for h in highlights if h
-        )
+        li_items = "".join(f"<li style='margin-bottom: 8px; color: #1e293b; line-height: 1.6;'>{html.escape(str(h))}</li>" for h in highlights if h)
         highlights_card = f"""
-        <div style="background: #f8fafc; border-left: 4px solid #2563eb; border-radius: 8px; padding: 16px 20px; margin-bottom: 24px;">
+        <div style="background: #f8fafc; border-left: 4px solid #2563eb; border-radius: 8px; padding: 16px 18px; margin-bottom: 24px;">
           <h2 style="margin: 0 0 10px 0; font-size: 18px; color: #0f172a;">📌 Key Financial Highlights for Investors</h2>
-          <ul style="margin: 0; padding-left: 20px; font-size: 15px;">
-            {li_items}
-          </ul>
+          <ul style="margin: 0; padding-left: 18px; font-size: 14px;">{li_items}</ul>
         </div>
         """
         content_blocks.append(highlights_card)
 
     fundamentals_card = f"""
-    <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 20px; box-shadow: 0 4px 14px rgba(0,0,0,0.05); margin-bottom: 24px;">
-      <h2 style="margin: 0 0 16px 0; font-size: 20px; color: #0f172a;">🔍 {comp_name} Fundamentals &amp; Valuation Ratios</h2>
-      <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+    <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 16px; box-shadow: 0 4px 14px rgba(0,0,0,0.05); margin-bottom: 24px; box-sizing: border-box;">
+      <h2 style="margin: 0 0 14px 0; font-size: 18px; color: #0f172a;">🔍 {comp_name} Fundamental Ratios &amp; 52W High/Low</h2>
+      <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
         <tbody>
           <tr style="border-bottom: 1px solid #f1f5f9;">
-            <td style="padding: 10px 4px; color: #64748b;">Mkt Cap</td>
-            <td style="padding: 10px 8px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{mkt_cap}</td>
-            <td style="padding: 10px 4px 10px 8px; color: #64748b; border-left: 1px solid #f1f5f9;">ROE</td>
-            <td style="padding: 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{roe}</td>
+            <td style="padding: 8px 4px; color: #64748b;">Share Price</td><td style="padding: 8px 4px; text-align: right; font-weight: 700; color: #0f172a;">{price_disp}</td>
+            <td style="padding: 8px 4px; color: #64748b; border-left: 1px solid #f1f5f9;">52W High / Low</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{high_52w} / {low_52w}</td>
           </tr>
           <tr style="border-bottom: 1px solid #f1f5f9;">
-            <td style="padding: 10px 4px; color: #64748b;">P/E Ratio(TTM)</td>
-            <td style="padding: 10px 8px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{pe_ratio}</td>
-            <td style="padding: 10px 4px 10px 8px; color: #64748b; border-left: 1px solid #f1f5f9;">EPS(TTM)</td>
-            <td style="padding: 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{eps}</td>
+            <td style="padding: 8px 4px; color: #64748b;">Market Cap</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{mkt_cap}</td>
+            <td style="padding: 8px 4px; color: #64748b; border-left: 1px solid #f1f5f9;">ROE</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{roe}</td>
           </tr>
           <tr style="border-bottom: 1px solid #f1f5f9;">
-            <td style="padding: 10px 4px; color: #64748b;">P/B Ratio</td>
-            <td style="padding: 10px 8px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{pb_ratio}</td>
-            <td style="padding: 10px 4px 10px 8px; color: #64748b; border-left: 1px solid #f1f5f9;">Div Yield</td>
-            <td style="padding: 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{div_yield}</td>
+            <td style="padding: 8px 4px; color: #64748b;">Stock P/E</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{pe_ratio}</td>
+            <td style="padding: 8px 4px; color: #64748b; border-left: 1px solid #f1f5f9;">Industry P/E</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{ind_pe}</td>
           </tr>
           <tr style="border-bottom: 1px solid #f1f5f9;">
-            <td style="padding: 10px 4px; color: #64748b;">Industry P/E</td>
-            <td style="padding: 10px 8px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{ind_pe}</td>
-            <td style="padding: 10px 4px 10px 8px; color: #64748b; border-left: 1px solid #f1f5f9;">Book Value</td>
-            <td style="padding: 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{book_value}</td>
+            <td style="padding: 8px 4px; color: #64748b;">EPS (TTM)</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{eps}</td>
+            <td style="padding: 8px 4px; color: #64748b; border-left: 1px solid #f1f5f9;">Book Value</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{book_value} ({pb_ratio}x)</td>
           </tr>
           <tr>
-            <td style="padding: 10px 4px; color: #64748b;">Debt to Equity</td>
-            <td style="padding: 10px 8px 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{de_ratio}</td>
-            <td style="padding: 10px 4px 10px 8px; color: #64748b; border-left: 1px solid #f1f5f9;">Face Value</td>
-            <td style="padding: 10px 4px; text-align: right; font-weight: 600; color: #0f172a;">{face_val}</td>
+            <td style="padding: 8px 4px; color: #64748b;">Debt / Equity</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{de_ratio} ({total_debt})</td>
+            <td style="padding: 8px 4px; color: #64748b; border-left: 1px solid #f1f5f9;">Div Yield / FV</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{div_yield} (₹{face_val})</td>
           </tr>
         </tbody>
       </table>
-
-      <p style="margin: 12px 0 6px 0; font-size: 14px; color: #475569;">
-        <strong>Total Company Debt:</strong> {total_debt} | <strong>Fundamental Impact:</strong> {fund_impact}
-      </p>
-
-      <div style="background: #d1fae5; border: 1px solid #10b981; padding: 12px 14px; border-radius: 8px; font-size: 16px; margin-top: 12px;">
-        🎯 <strong>Estimated Stock Return / Outlook:</strong> <span style="color: #065f46; font-weight: 700;">{est_return}</span>
-      </div>
-      <p style="margin: 10px 0 0 0; font-size: 14px; color: #334155;"><strong>Technical &amp; Positional View:</strong> {intraday_sig}</p>
+      <p style="margin: 10px 0 0 0; font-size: 13px; color: #334155;"><strong>Analysis:</strong> {intraday_sig} {fund_impact}</p>
     </div>
     """
     content_blocks.append(fundamentals_card)
@@ -1285,8 +1418,8 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
                 b_txt = html.escape(str(sec.get("body", "")))
                 if b_txt:
                     article_html_parts.append(
-                        f"<h2 style='font-size: 19px; color: #0f172a; margin: 22px 0 10px 0;'>📝 {h_txt}</h2>"
-                        f"<p style='color:#334155; font-size:16px; line-height:1.75; margin-bottom:16px;'>{b_txt}</p>"
+                        f"<h2 style='font-size: 18px; color: #0f172a; margin: 22px 0 10px 0;'>📝 {h_txt}</h2>"
+                        f"<p style='color:#334155; font-size:15px; line-height:1.75; margin-bottom:16px;'>{b_txt}</p>"
                     )
 
     faqs = data.get("faqs") or []
@@ -1297,113 +1430,114 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
             q_clean = str(f_item["q"]).strip()
             a_clean = str(f_item["a"]).strip()
             faq_html_items.append(
-                f"<details style='background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:12px 16px; margin-bottom:10px;'>"
-                f"<summary style='font-weight:600; color:#0f172a; cursor:pointer; font-size:15px;'>{html.escape(q_clean)}</summary>"
-                f"<p style='margin:10px 0 0 0; color:#334155; font-size:15px; line-height:1.6;'>{html.escape(a_clean)}</p>"
+                f"<details style='background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:12px 14px; margin-bottom:10px;'>"
+                f"<summary style='font-weight:600; color:#0f172a; cursor:pointer; font-size:14px;'>{html.escape(q_clean)}</summary>"
+                f"<p style='margin:10px 0 0 0; color:#334155; font-size:14px; line-height:1.6;'>{html.escape(a_clean)}</p>"
                 f"</details>"
             )
-            faq_schema_entities.append({
-                "@type": "Question",
-                "name": q_clean,
-                "acceptedAnswer": {
-                    "@type": "Answer",
-                    "text": a_clean,
-                },
-            })
+            faq_schema_entities.append({"@type": "Question", "name": q_clean, "acceptedAnswer": {"@type": "Answer", "text": a_clean}})
 
-    faq_block_html = ""
-    if faq_html_items:
-        faq_block_html = (
-            f"<div style='margin: 26px 0;'>"
-            f"<h2 style='font-size: 19px; color: #0f172a; margin-bottom: 14px;'>❓ Frequently Asked Questions (FAQs)</h2>"
-            f"{''.join(faq_html_items)}"
-            f"</div>"
-        )
+    faq_block_html = f"<div style='margin: 26px 0;'><h2 style='font-size: 18px; color: #0f172a; margin-bottom: 14px;'>❓ Frequently Asked Questions ({comp_name} Share FAQs)</h2>{''.join(faq_html_items)}</div>" if faq_html_items else ""
 
-    faq_schema_json = json.dumps({
-        "@context": "https://schema.org",
-        "@type": "FAQPage",
-        "mainEntity": faq_schema_entities,
-    })
+    kw_badges = "".join(
+        f"<span style='display:inline-block; background:#f1f5f9; color:#334155; border:1px solid #cbd5e1; border-radius:20px; padding:4px 10px; font-size:12px; margin:3px;'>{html.escape(k)}</span>"
+        for k in (trending_kws or [])
+    )
+    trending_kw_html = f"""
+    <div style="margin: 22px 0; padding: 14px; background: #f8fafc; border-radius: 10px; border: 1px solid #e2e8f0;">
+      <strong style="font-size: 13px; color: #0f172a; display: block; margin-bottom: 8px;">🔥 Trending Investor Searches on Google:</strong>
+      {kw_badges}
+    </div>
+    """ if kw_badges else ""
 
     internal_links_html = f"""
-    <div style="background: #eff6ff; border: 1px dashed #60a5fa; border-radius: 10px; padding: 14px 18px; margin: 22px 0; font-size: 14px; color: #1e3a8a;">
-      <strong>🔗 Explore More on MarketMunafa:</strong>
+    <div style="background: #eff6ff; border: 1px dashed #60a5fa; border-radius: 10px; padding: 14px 16px; margin: 22px 0; font-size: 14px; color: #1e3a8a;">
+      <strong>🔗 Explore More High-Growth Stocks on MarketMunafa:</strong>
       <ul style="margin: 8px 0 0 0; padding-left: 18px; line-height: 1.8;">
         <li><a href="{BLOG_BASE_URL}/search/label/STOCK%20RESULT" style="color:#1d4ed8; font-weight:600; text-decoration:none;">📊 Latest Q2 &amp; Quarterly Stock Results Analysis</a></li>
-        <li><a href="{BLOG_BASE_URL}/search/label/SHARE%20ORDER" style="color:#1d4ed8; font-weight:600; text-decoration:none;">🏆 New Corporate Order Wins &amp; Contract Updates</a></li>
-        <li><a href="{BLOG_BASE_URL}/search/label/MARKET%20NEWS" style="color:#1d4ed8; font-weight:600; text-decoration:none;">📰 Daily Indian Stock Market Fundamental Picks</a></li>
+        <li><a href="{BLOG_BASE_URL}/search/label/SHARE%20ORDER" style="color:#1d4ed8; font-weight:600; text-decoration:none;">🏆 New Corporate Order Wins &amp; Share Price Targets</a></li>
+        <li><a href="{BLOG_BASE_URL}/search/label/MARKET%20NEWS" style="color:#1d4ed8; font-weight:600; text-decoration:none;">📰 Daily Multibagger &amp; Debt-Free Stock Picks</a></li>
       </ul>
     </div>
     """
 
-    source_link_html = (
-        f'<p style="margin-top:16px;"><a href="{html.escape(source_url, quote=True)}" '
-        f'target="_blank" rel="nofollow noopener" style="color:#2563eb; font-weight:600; text-decoration:none;">'
-        f'📄 Verify Official BSE Exchange Filing PDF</a></p>'
-        if source_url else ""
-    )
+    source_link_html = f'<p style="margin-top:16px;"><a href="{html.escape(source_url, quote=True)}" target="_blank" rel="nofollow noopener" style="color:#2563eb; font-weight:600; text-decoration:none;">📄 Verify Official BSE Exchange Filing PDF</a></p>' if source_url else ""
+
+    faq_schema_json = json.dumps({"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": faq_schema_entities})
+    news_schema_json = json.dumps({
+        "@context": "https://schema.org",
+        "@type": "NewsArticle",
+        "headline": str(data.get("seo_title") or f"{comp_name} Share Price Target 2026 & Q2 Results")[:110],
+        "datePublished": iso_time,
+        "dateModified": iso_time,
+        "image": [thumb_url],
+        "author": [{"@type": "Organization", "name": "MarketMunafa Equity Research Desk", "url": BLOG_BASE_URL}],
+        "publisher": {"@type": "Organization", "name": "MarketMunafa", "url": BLOG_BASE_URL},
+    })
 
     meta_comment = f"<!-- MM_META:type={doc_type}|comp_key={comp_key}|scrip={scrip_key}|file={file_key}|comp_name={comp_name} -->"
 
     html_body = f"""
     {meta_comment}
-    <article style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 720px; margin: 0 auto; color: #1e293b;">
-      <p style="font-size: 16px; line-height: 1.75; color: #0f172a; background: #f8fafc; padding: 14px 16px; border-radius: 10px; border: 1px solid #e2e8f0; margin-bottom: 18px;">
+    <article itemscope itemtype="https://schema.org/NewsArticle" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 740px; margin: 0 auto; color: #1e293b; box-sizing: border-box;">
+      <div style="font-size: 12px; color: #64748b; margin-bottom: 12px; font-weight: 500;">
+        📅 Published on: <time itemprop="datePublished" datetime="{iso_time}">{ist_time_str}</time> | By <span itemprop="author">MarketMunafa Equity Research Desk</span>
+      </div>
+      <p style="font-size: 15px; line-height: 1.7; color: #0f172a; background: #f8fafc; padding: 14px; border-radius: 10px; border: 1px solid #e2e8f0; margin-bottom: 18px;">
         <strong>Executive Summary:</strong> {lead_html}
       </p>
-
       <figure style="margin: 0 0 22px 0; text-align: center;">
-        <img src="{thumb_url}" alt="{comp_name} Share Price Target and {qtr_lbl} Financial Analysis" width="1200" height="675" fetchpriority="high" style="width: 100%; height: auto; aspect-ratio: 16/9; object-fit: cover; border-radius: 12px;" />
-        <figcaption style="font-size: 13px; color: #64748b; margin-top: 6px;">{comp_name} (BSE: {html.escape(str(scrip_code or 'Listed'))}) Equity Research | MarketMunafa</figcaption>
+        <img itemprop="image" src="{thumb_url}" alt="{comp_name} Share Price Target 2026 and {qtr_lbl} Results" width="1200" height="675" fetchpriority="high" style="width: 100%; height: auto; aspect-ratio: 16/9; object-fit: cover; border-radius: 12px;" />
+        <figcaption style="font-size: 12px; color: #64748b; margin-top: 6px;">{comp_name} (BSE: {html.escape(str(scrip_code or 'Listed'))}) Share Price Target &amp; Equity Research | MarketMunafa</figcaption>
       </figure>
       <!--more-->
-
       {"".join(content_blocks)}
-
       {"".join(article_html_parts)}
-
       {faq_block_html}
-
+      {trending_kw_html}
       {internal_links_html}
-
       {source_link_html}
-
+      <script type="application/ld+json">{news_schema_json}</script>
       <script type="application/ld+json">{faq_schema_json}</script>
-
       <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 22px 0;" />
       <p style="font-size: 12px; color: #64748b; line-height: 1.5;">
-        <strong>Disclaimer:</strong> This independent equity research article on MarketMunafa is originally authored using publicly disclosed BSE corporate filings and fundamental ratios for educational purposes only. We are not SEBI-registered investment advisors. Please consult a certified financial planner before making any investment decisions.
+        <strong>Disclaimer:</strong> This independent equity research article on MarketMunafa is originally authored using publicly disclosed BSE corporate filings and fundamental ratios for educational and informational purposes only. Valuation projections are algorithmic estimates and not investment advice. We are not SEBI-registered advisors. Please consult a certified financial planner before making any investment decisions.
       </p>
     </article>
     """
     return html_body, yoy_chart_url
 
 
-# ---------------- TELEGRAM GUJARATI ALERT ----------------
+# ==========================================
+# 9. TELEGRAM, BLOGGER & SITEMAP PING
+# ==========================================
+def ping_search_engines():
+    sitemap_url = f"{BLOG_BASE_URL}/sitemap.xml"
+    for ping_url in [
+        f"https://www.google.com/ping?sitemap={urllib.parse.quote(sitemap_url)}",
+        f"https://www.bing.com/ping?sitemap={urllib.parse.quote(sitemap_url)}",
+    ]:
+        try:
+            requests.get(ping_url, timeout=8)
+        except Exception:
+            pass
+
+
 def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, chart_url):
     if not SEND_TO_TELEGRAM or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
-
     comp_name = html.escape(str(data.get("company_short_name", "Company")))
     res_date = html.escape(str(data.get("result_date", "")))
     price_disp = html.escape(str(data.get("price_display", screener_info["price_str"])))
-    qtr_lbl = html.escape(str(data.get("quarter_label", "Q2 FY26-27")))
-    curr_lbl = html.escape(str(data.get("curr_period_label", "Current")))
-    prev_lbl = html.escape(str(data.get("prev_period_label", "Previous")))
-
+    qtr_lbl = html.escape(str(data.get("quarter_label", "Quarterly")))
+    curr_lbl = html.escape(shorten_period_label(data.get("curr_period_label", "Sep 2026")))
+    prev_lbl = html.escape(shorten_period_label(data.get("prev_period_label", "Sep 2025")))
     mkt_cap = html.escape(str(data.get("market_cap") or screener_info["market_cap"]))
     pe_ratio = html.escape(str(data.get("pe_ratio") or screener_info["pe_ratio"]))
-    pb_ratio = html.escape(str(data.get("pb_ratio") or screener_info["pb_ratio"]))
-    ind_pe = html.escape(str(data.get("industry_pe") or screener_info["industry_pe"]))
     roe = html.escape(str(data.get("roe") or screener_info["roe"]))
-    eps = html.escape(str(data.get("eps") or screener_info["eps"]))
-    div_yield = html.escape(str(data.get("div_yield") or screener_info["div_yield"]))
-    book_value = html.escape(str(data.get("book_value") or screener_info["book_value"]))
-    total_debt = html.escape(str(data.get("total_debt") or screener_info["total_debt"]))
     de_ratio = html.escape(str(data.get("debt_to_equity") or screener_info["debt_to_equity"]))
-    face_val = html.escape(str(data.get("face_value") or screener_info["face_value"]))
-    est_return = html.escape(str(data.get("estimated_stock_return", "N/A")))
+    total_debt = html.escape(str(data.get("total_debt") or screener_info["total_debt"]))
+    est_return = html.escape(str(data.get("estimated_stock_return", screener_info.get("target_2026", "N/A"))))
     guj_summary = html.escape(str(data.get("gujarati_summary", "")))
     guj_intraday = html.escape(str(data.get("gujarati_intraday_view", "")))
 
@@ -1411,21 +1545,19 @@ def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, 
         header_title = f"🏆 <b>{comp_name} - નવો ઓર્ડર / કોન્ટ્રેક્ટ અપડેટ</b>"
         ord_info = data.get("order_details", {}) or {}
         dynamic_block_gu = (
-            f"📦 <b>ઓર્ડરની મુખ્ય વિગતો:</b>\n"
-            f"• <b>ક્લાયન્ટ / કંપની:</b> {html.escape(str(ord_info.get('client_or_awarder', '-')))}\n"
-            f"• <b>ઓર્ડરનું મૂલ્ય:</b> <b>{html.escape(str(ord_info.get('order_value', '-')))}</b>\n"
-            f"• <b>કામની વિગત:</b> {html.escape(str(ord_info.get('scope_of_work', '-')))}\n\n"
+            f"📦 <b>ઓર્ડરની વિગત:</b> {html.escape(str(ord_info.get('order_value', '-')))} "
+            f"({html.escape(str(ord_info.get('client_or_awarder', '-')))})\n\n"
         )
     else:
-        header_title = f"📊 <b>{comp_name} - {qtr_lbl} Consolidated રિઝલ્ટ અપડેટ</b>"
+        header_title = f"📊 <b>{comp_name} - {qtr_lbl} સાચા PDF રિઝલ્ટ અપડેટ</b>"
         rev = data.get("revenue", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
         gp = data.get("gross_profit", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
         np_d = data.get("net_profit", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
         dynamic_block_gu = (
-            f"📈 <b>નાણાકીય કામગીરી - YoY ({curr_lbl} vs {prev_lbl}):</b>\n"
-            f"• <b>આવક (Revenue):</b> ₹{html.escape(str(rev.get('curr', '0')))} Cr (તફાવત: {html.escape(str(rev.get('difference', '0')))}) | YoY ગ્રોથ: <b>{html.escape(str(rev.get('growth', '0%')))}</b>\n"
-            f"• <b>કુલ નફો (Gross Profit):</b> ₹{html.escape(str(gp.get('curr', '0')))} Cr (તફાવત: {html.escape(str(gp.get('difference', '0')))}) | YoY ગ્રોથ: <b>{html.escape(str(gp.get('growth', '0%')))}</b>\n"
-            f"• <b>ચોખ્ખો નફો (Consolidated PAT):</b> ₹{html.escape(str(np_d.get('curr', '0')))} Cr (તફાવત: {html.escape(str(np_d.get('difference', '0')))}) | YoY ગ્રોથ: <b>{html.escape(str(np_d.get('growth', '0%')))}</b>\n\n"
+            f"📈 <b>નાણાકીય કામગીરી ({curr_lbl} vs {prev_lbl}):</b>\n"
+            f"• <b>આવક (Revenue):</b> ₹{html.escape(str(rev.get('curr', '0')))} Cr ({html.escape(str(rev.get('growth', '0%')))} YoY)\n"
+            f"• <b>EBITDA:</b> ₹{html.escape(str(gp.get('curr', '0')))} Cr ({html.escape(str(gp.get('growth', '0%')))} YoY)\n"
+            f"• <b>ચોખ્ખો નફો (PAT):</b> ₹{html.escape(str(np_d.get('curr', '0')))} Cr (<b>{html.escape(str(np_d.get('growth', '0%')))} YoY</b>)\n\n"
         )
 
     msg_html = (
@@ -1433,19 +1565,15 @@ def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, 
         f"━━━━━━━━━━━━━━━━━━━━\n"
         f"📅 <b>તારીખ:</b> {res_date} | 💰 <b>ભાવ:</b> {price_disp}\n\n"
         f"{dynamic_block_gu}"
-        f"🔍 <b>તમામ ૧૦ ફંડામેન્ટલ ઇન્ડિકેટર્સ:</b>\n"
-        f"• <b>Mkt Cap:</b> {mkt_cap} | <b>ROE:</b> {roe}\n"
-        f"• <b>P/E Ratio:</b> {pe_ratio} | <b>EPS (TTM):</b> {eps}\n"
-        f"• <b>P/B Ratio:</b> {pb_ratio} | <b>Div Yield:</b> {div_yield}\n"
-        f"• <b>Industry P/E:</b> {ind_pe} | <b>Book Value:</b> {book_value}\n"
-        f"• <b>Debt to Equity:</b> {de_ratio} (Debt: {total_debt}) | <b>Face Value:</b> {face_val}\n\n"
-        f"🎯 <b>અંદાજિત શેર રીટર્ન / બૂસ્ટ:</b> <b>{est_return}</b>\n\n"
-        f"🏦 <b>ઇન્ટ્રાડે વ્યુ:</b> {guj_intraday}\n"
+        f"🔍 <b>Mkt Cap:</b> {mkt_cap} | <b>P/E:</b> {pe_ratio} | <b>ROE:</b> {roe}\n"
+        f"🏦 <b>Debt-to-Equity:</b> {de_ratio} ({total_debt})\n"
+        f"🎯 <b>અંદાજિત વેલ્યુએશન ટાર્ગેટ (2026):</b> <b>{est_return}</b>\n\n"
         f"📝 <b>સારાંશ:</b> {guj_summary}\n"
+        f"💡 <b>વ્યુ:</b> {guj_intraday}\n"
     )
 
     if blog_url:
-        msg_html += f"\n🌐 <a href=\"{html.escape(blog_url, quote=True)}\"><b>સંપૂર્ણ પોસ્ટ અને ચાર્ટ બ્લોગ પર જુઓ</b></a>"
+        msg_html += f"\n🌐 <a href=\"{html.escape(blog_url, quote=True)}\"><b>સંપૂર્ણ રિપોર્ટ અને 2026-2030 ટાર્ગેટ બ્લોગ પર વાંચો</b></a>"
     if source_url:
         msg_html += f" | <a href=\"{html.escape(source_url, quote=True)}\"><b>BSE PDF</b></a>"
     msg_html += "\n\n✅ <b>MarketMunafa</b>"
@@ -1454,30 +1582,18 @@ def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, 
         if chart_url and doc_type != "order":
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                data={
-                    "chat_id": TELEGRAM_CHAT_ID,
-                    "photo": chart_url,
-                    "caption": f"📊 {comp_name} - Consolidated YoY પરિણામ અને ગ્રોથ ચાર્ટ",
-                },
+                data={"chat_id": TELEGRAM_CHAT_ID, "photo": chart_url, "caption": f"📊 {comp_name} - YoY Growth Chart"},
                 timeout=15,
             )
-
         requests.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": msg_html,
-                "parse_mode": "HTML",
-                "disable_web_page_preview": False,
-            },
+            data={"chat_id": TELEGRAM_CHAT_ID, "text": msg_html, "parse_mode": "HTML", "disable_web_page_preview": False},
             timeout=20,
         )
-        log.info("Telegram Gujarati alert sent successfully")
     except Exception as exc:
         log.warning("Telegram send warning: %s", exc)
 
 
-# ---------------- BLOGGER SCANNER & DEDUPLICATION ----------------
 def blogger_access_token():
     required = (GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN)
     if not all(required):
@@ -1499,17 +1615,11 @@ def blogger_access_token():
 def _parse_single_blog_post_for_dedup(title_str, content_html, labels_list, state):
     t_low = title_str.lower()
     lbl_low = " ".join(str(x).lower() for x in (labels_list or []))
-
-    if "share order" in lbl_low or any(w in t_low for w in ("order", "contract", "award", "loa", "work order")):
-        p_type = "order"
-    else:
-        p_type = "result"
+    p_type = "order" if ("share order" in lbl_low or any(w in t_low for w in ("order", "contract", "award", "loa"))) else "result"
 
     meta_match = re.search(r"<!--\s*MM_META:([^>]+?)\s*-->", content_html)
     if meta_match:
-        meta_parts = dict(
-            kv.split("=", 1) for kv in meta_match.group(1).split("|") if "=" in kv
-        )
+        meta_parts = dict(kv.split("=", 1) for kv in meta_match.group(1).split("|") if "=" in kv)
         m_type = meta_parts.get("type") or p_type
         if meta_parts.get("comp_key"):
             state["comp_keys"].add(meta_parts["comp_key"].strip())
@@ -1522,49 +1632,16 @@ def _parse_single_blog_post_for_dedup(title_str, content_html, labels_list, stat
             if ck:
                 state["comp_keys"].add(ck)
 
-    fig_match = re.search(r"<figcaption[^>]*>\s*([^<|(]+?)\s+(?:Corporate Filing|\(BSE)", content_html, flags=re.I)
-    if fig_match:
-        comp_from_fig = html.unescape(fig_match.group(1)).strip()
-        ck = normalize_company_key(comp_from_fig, p_type)
-        if ck:
-            state["comp_keys"].add(ck)
-
-    strong_match = re.search(r"<strong[^>]*font-size:\s*21px[^>]*>\s*([^<]+?)\s*</strong>", content_html, flags=re.I)
-    if strong_match:
-        comp_from_strong = html.unescape(strong_match.group(1)).strip()
-        ck = normalize_company_key(comp_from_strong, p_type)
-        if ck:
-            state["comp_keys"].add(ck)
-
-    ord_comp_match = re.search(r"<strong>\s*Company Name:\s*</strong>\s*([^<(]+)", content_html, flags=re.I)
-    if ord_comp_match:
-        comp_from_ord = html.unescape(ord_comp_match.group(1)).strip()
-        ck = normalize_company_key(comp_from_ord, p_type)
-        if ck:
-            state["comp_keys"].add(ck)
-
     title_ck = normalize_company_key(title_str, p_type)
     if title_ck:
         state["comp_keys"].add(title_ck)
 
-    for match in re.findall(r"[a-zA-Z0-9_-]{8,}\.(?:pdf|xml|xbrl|html)", content_html, flags=re.I):
-        state["file_keys"].add(match.lower())
-
-    for sc in re.findall(r"\b(5\d{5})\b", title_str + " " + content_html):
-        state["scrip_keys"].add(f"{p_type}_{sc}")
-
 
 def get_existing_blogger_posts():
-    state = {
-        "comp_keys": set(),
-        "scrip_keys": set(),
-        "file_keys": set(),
-    }
+    state = {"comp_keys": set(), "scrip_keys": set(), "file_keys": set()}
     if not BLOG_ID:
         return state
-
     total_scanned = 0
-
     try:
         token = blogger_access_token()
         page_token = None
@@ -1579,7 +1656,6 @@ def get_existing_blogger_posts():
                 timeout=25,
             )
             if res.status_code != 200:
-                log.warning("Blogger API scan status %s: %s", res.status_code, res.text[:200])
                 break
             data = res.json()
             items = data.get("items", [])
@@ -1597,30 +1673,7 @@ def get_existing_blogger_posts():
             if not page_token:
                 break
     except Exception as exc:
-        log.warning("Blogger API full scan warning: %s", exc)
-
-    try:
-        feed_url = f"https://www.blogger.com/feeds/{BLOG_ID}/posts/default?alt=json&max-results=500"
-        res = c_requests.get(feed_url, impersonate="chrome120", timeout=25)
-        if res.status_code == 200:
-            entries = res.json().get("feed", {}).get("entry", [])
-            for entry in entries:
-                title_str = entry.get("title", {}).get("$t", "")
-                content_html = entry.get("content", {}).get("$t", "")
-                labels_list = [cat.get("term", "") for cat in entry.get("category", [])]
-                _parse_single_blog_post_for_dedup(title_str, content_html, labels_list, state)
-            if len(entries) > total_scanned:
-                total_scanned = len(entries)
-    except Exception as exc:
-        log.warning("Public Blogger feed scan warning: %s", exc)
-
-    log.info(
-        "Full Blog Scan Complete: %d posts scanned | %d company keys | %d file keys | %d scrip keys",
-        total_scanned,
-        len(state["comp_keys"]),
-        len(state["file_keys"]),
-        len(state["scrip_keys"]),
-    )
+        log.warning("Blogger scan warning: %s", exc)
     return state
 
 
@@ -1640,41 +1693,37 @@ def blogger_publish(title, content_html, doc_type):
     if not BLOG_ID:
         raise RuntimeError("BLOG_ID is missing")
     token = blogger_access_token()
-
-    clean_title = re.sub(r"<[^>]+>", "", str(title))
-    clean_title = re.sub(r"[\r\n\t]+", " ", clean_title).strip()[:140]
-    if not clean_title:
-        clean_title = "Corporate Financial Update | MarketMunafa"
-
+    clean_title = re.sub(r"[\r\n\t]+", " ", re.sub(r"<[^>]+>", "", str(title))).strip()[:140] or "Share Price Target & Q2 Results | MarketMunafa"
     labels = ["MARKET NEWS", "SHARE ORDER"] if doc_type == "order" else ["MARKET NEWS", "STOCK RESULT"]
 
-    payload = {
-        "title": clean_title,
-        "content": content_html,
-        "labels": labels,
-    }
+    for attempt in range(2):
+        response = requests.post(
+            f"https://www.googleapis.com/blogger/v3/blogs/{BLOG_ID}/posts/",
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={"title": clean_title, "content": content_html, "labels": labels},
+            timeout=25,
+        )
+        if response.status_code == 429:
+            if attempt == 0:
+                time.sleep(25)
+                continue
+            log.warning("⚠️ Blogger Daily Post Limit (429) reached! Sending to Telegram only.")
+            return None
+        response.raise_for_status()
+        return response.json().get("url", "")
+    return None
 
-    response = requests.post(
-        f"https://www.googleapis.com/blogger/v3/blogs/{BLOG_ID}/posts/",
-        headers={
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        },
-        json=payload,
-        timeout=25,
-    )
-    response.raise_for_status()
-    return response.json().get("url", "")
 
-
-def publish_item(item, doc_type, ai_data, screener_info, item_id, comp_key, scrip_key, file_key, scrip_code=""):
+def publish_item(item, doc_type, ai_data, screener_info, trending_kws, item_id, comp_key, scrip_key, file_key, scrip_code=""):
     source_url = item["link"]
-    raw_title = ai_data.get("seo_title") or f"{item['title']} Consolidated Results & Valuation | MarketMunafa"
+    c_short = ai_data.get("company_short_name") or screener_info.get("screener_company_name") or item["title"]
+    raw_title = ai_data.get("seo_title") or f"{c_short} Share Price Target 2026, Q2 Results & Latest News"
     blog_html, yoy_chart_url = build_post_html(
         ai_data,
         doc_type,
         screener_info,
         source_url,
+        trending_kws,
         comp_key=comp_key,
         scrip_key=scrip_key,
         file_key=file_key,
@@ -1682,39 +1731,49 @@ def publish_item(item, doc_type, ai_data, screener_info, item_id, comp_key, scri
     )
 
     blog_url = ""
+    blogger_quota_hit = False
     if POST_TO_BLOGGER:
-        blog_url = blogger_publish(raw_title, blog_html, doc_type)
-        mark_posted(item_id, comp_key, scrip_key, file_key, item["title"], source_url)
-        log.info("Blogger post successful (%s): %s", doc_type, blog_url)
+        res_url = blogger_publish(raw_title, blog_html, doc_type)
+        if res_url is None:
+            blogger_quota_hit = True
+        else:
+            blog_url = res_url
+            mark_posted(item_id, comp_key, scrip_key, file_key, item["title"], source_url)
+            log.info("✅ Published 100%% PDF-Verified Post (%s): %s", doc_type, blog_url)
+            ping_search_engines()
 
     send_telegram_gujarati(ai_data, doc_type, screener_info, blog_url, source_url, yoy_chart_url)
+    return not blogger_quota_hit
 
 
-# ---------------- MAIN RUNNER ----------------
+# ==========================================
+# 10. MAIN RUNNER (ACCURACY-FIRST PIPELINE)
+# ==========================================
 def run():
     init_db()
-
-    log.info("Scanning existing posts on MarketMunafa blog before processing feeds...")
+    log.info("Scanning existing posts on MarketMunafa blog...")
     blog_state = get_existing_blogger_posts()
 
-    all_items = []
-
-    json_items = fetch_bse_json_announcements()
-    all_items.extend(json_items)
-
+    all_items = fetch_bse_json_announcements()
     for kind, feed_url in FEEDS.items():
         try:
             items = parse_feed(feed_url, kind)
-            log.info("%s XML feed (filtered): %d items", kind, len(items))
             all_items.extend(items)
         except Exception:
-            log.exception("Feed failed: %s", feed_url)
+            pass
 
     if not all_items:
         log.warning("No feed items retrieved.")
         return
 
+    published_count = 0
+    seen_in_run = set()
+
     for item in all_items:
+        if published_count >= MAX_POSTS_PER_RUN:
+            log.info("Reached MAX_POSTS_PER_RUN (%d). Stopping cleanly.", MAX_POSTS_PER_RUN)
+            break
+
         doc_type = classify_item(item)
         if not doc_type:
             continue
@@ -1726,69 +1785,66 @@ def run():
         file_key = extract_file_key(item["link"])
         item_id = make_item_id(comp_key, file_key, item)
 
-        # STAGE 1 DEDUPLICATION CHECK
+        # એક જ રનમાં એકની એક કંપની બે વાર ચેક ન થાય તે માટે
+        run_dedup_token = scrip_key or comp_key or item_id
+        if run_dedup_token in seen_in_run:
+            continue
+        seen_in_run.add(run_dedup_token)
+
         is_dup, dup_reason = is_already_on_blog_or_db(item_id, comp_key, scrip_key, file_key, blog_state)
         if is_dup:
-            log.info("Skipping duplicate [Stage 1 - %s] (%s): %s", dup_reason, doc_type, item["title"])
             continue
 
-        log.info("Processing %s: %s", doc_type, item["title"])
         try:
-            # SCREENER FUNDAMENTALS & MID/LARGE CAP CHECK (પેની અને સ્મોલ કેપ ફિલ્ટર)
-            screener_info = get_screener_fundamentals(item["title"])
-            
-            # જો માર્કેટ કેપ ₹5,000 Cr થી ઓછી હોય (સ્મોલ/પેની કેપ), તો સીધા જ સ્કીપ કરો
-            if not screener_info["is_mid_large_cap"] and screener_info["market_cap_num"] > 0:
-                log.info("Skipping Small/Penny Cap Company (Market Cap: %s): %s", screener_info["market_cap"], item["title"])
+            screener_info = get_screener_fundamentals(item["title"], scrip_code=scrip_code)
+
+            if not screener_info["is_eligible_stock"]:
+                log.info("Skipping Penny/Unlisted/Mismatched Stock (Mkt Cap: %s): %s", screener_info["market_cap"], item["title"])
                 continue
 
-            # Check Screener company name against blog before calling Gemini
             if screener_info.get("screener_company_name"):
                 scr_comp_key = normalize_company_key(screener_info["screener_company_name"], doc_type)
                 if scr_comp_key and scr_comp_key in blog_state["comp_keys"]:
-                    log.info(
-                        "Skipping duplicate [Screener Name Match: %s] (%s): %s",
-                        scr_comp_key,
-                        doc_type,
-                        item["title"],
-                    )
                     continue
 
-            source_text, pdf_bytes = get_document_payload(item)
+            source_text, pdf_bytes, pdf_text_len = get_document_payload(item, scrip_code=scrip_code)
             file_key = extract_file_key(item["link"]) or file_key
 
-            if doc_type == "result" and not pdf_bytes and not screener_info["q_all_rev"] and len(source_text) < 120:
-                log.warning("Skipped: no PDF and no Screener quarterly data for %s", item["title"])
+            if not pdf_bytes:
+                log.warning("Skipping %s because official BSE PDF could not be downloaded.", item["title"])
                 continue
 
+            c_search_name = screener_info.get("screener_company_name") or comp_basis
+            trending_kws = fetch_live_google_keywords(c_search_name)
+
             ai_data = analyze_with_gemini_json(
-                item["title"], scrip_code, doc_type, source_text, pdf_bytes, screener_info
+                item["title"], scrip_code, doc_type, source_text, pdf_bytes, screener_info, trending_kws, pdf_text_len
             )
 
-            ai_comp_name = str(ai_data.get("company_short_name") or "").strip()
-            ai_comp_key = normalize_company_key(ai_comp_name, doc_type) if ai_comp_name else ""
-            if ai_comp_key and ai_comp_key in blog_state["comp_keys"]:
-                log.info(
-                    "Skipping duplicate [Stage 2 AI Name Match: %s] (%s): %s",
-                    ai_comp_key,
-                    doc_type,
-                    item["title"],
-                )
+            if not ai_data or ai_data.get("pdf_table_verified") is False or ai_data.get("skip_stock") is True:
+                log.info("Skipping stock (weak result or unverified PDF table): %s", item["title"])
                 continue
 
             if doc_type == "result":
                 r_curr = to_float(ai_data.get("revenue", {}).get("curr"))
                 np_curr = to_float(ai_data.get("net_profit", {}).get("curr"))
-                if r_curr == 0 and np_curr == 0:
-                    log.warning("Skipping result post with 0/empty financial figures: %s", item["title"])
+                curr_p = str(ai_data.get("curr_period_label", "")).lower()
+                if (r_curr == 0 and np_curr == 0) or any(old_q in curr_p for old_q in ("jun 2026", "mar 2026", "dec 2025")):
+                    log.warning("Skipping result post due to old period (%s) or zero figures: %s", curr_p, item["title"])
                     continue
 
+            ai_comp_name = str(ai_data.get("company_short_name") or "").strip()
+            ai_comp_key = normalize_company_key(ai_comp_name, doc_type) if ai_comp_name else ""
+            if ai_comp_key and ai_comp_key in blog_state["comp_keys"]:
+                continue
+
             final_comp_key = ai_comp_key or comp_key
-            publish_item(
+            blogger_ok = publish_item(
                 item,
                 doc_type,
                 ai_data,
                 screener_info,
+                trending_kws,
                 item_id,
                 final_comp_key,
                 scrip_key,
@@ -1805,7 +1861,11 @@ def run():
             if file_key:
                 blog_state["file_keys"].add(file_key)
 
-            time.sleep(5)
+            published_count += 1
+            if not blogger_ok:
+                break
+
+            time.sleep(15)
         except Exception:
             log.exception("Item processing failed: %s", item["title"])
 
