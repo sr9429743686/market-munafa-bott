@@ -48,7 +48,7 @@ for _ek in re.split(r"[,\s]+", os.getenv("GEMINI_API_KEY", "").strip()):
         GEMINI_API_KEYS.append(_ek)
 
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
-GEMINI_MAX_RPM = 12        # સેફ મોડ: 12 RPM જેથી ક્યારેય 429 ન આવે અને PDF શાંતિથી વંચાય
+GEMINI_MAX_RPM = 12
 GEMINI_MAX_TPM = 240000
 GEMINI_MAX_RPD = 500
 
@@ -63,8 +63,8 @@ OPENROUTER_MAX_RPD = 20
 RATE_WINDOW_SECONDS = 60.0
 
 # ---------------- QUALITY & ACCURACY FILTERS ----------------
-MIN_MARKET_CAP_CR = float(os.getenv("MIN_MARKET_CAP_CR", "100.0"))
-MIN_STOCK_PRICE = float(os.getenv("MIN_STOCK_PRICE", "10.0"))
+# ₹75 Cr થી ઉપરના તમામ Small Cap, Mid Cap અને Large Cap શેર્સ લેવાશે (Share Price ની શરત કાઢી નાખી છે જેથી Easy Trip જેવા શેર સ્કીપ ન થાય)
+MIN_MARKET_CAP_CR = float(os.getenv("MIN_MARKET_CAP_CR", "75.0"))
 MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "10"))
 
 FEEDS = {
@@ -110,7 +110,6 @@ class MultiKeyRotator:
         if num_keys == 0:
             return None, None
 
-        # Patiently wait up to 4 cycles if keys are in per-minute cooldown
         for _ in range(4):
             if len(self.exhausted_today) >= num_keys:
                 log.warning("All %s keys have reached their daily quota (%d/day).", self.name, self.max_per_day)
@@ -409,10 +408,6 @@ def fmt_num(val):
 
 
 def shorten_period_label(lbl):
-    """
-    લાંબી તારીખો (જેમ કે 'September 30, 2026' અથવા '30.09.2026') ને 'Sep 2026' માં ફેરવે છે
-    જેથી મોબાઈલ ટેબલમાં એક પણ શબ્દ તૂટે નહીં.
-    """
     s = str(lbl or "").strip()
     if not s:
         return "Current"
@@ -436,7 +431,7 @@ def shorten_period_label(lbl):
 
 
 # ==========================================
-# 5. SCREENER FUNDAMENTALS (STRICT SCRIP VERIFICATION)
+# 5. SCREENER FUNDAMENTALS (CONSOLIDATED PRIORITY)
 # ==========================================
 def _extract_quarters_from_soup(soup):
     q_data = {
@@ -559,7 +554,6 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
                     continue
 
                 page_html = c_res.text
-                # STRICT BSE SCRIP CODE CHECK: જો BSE Scrip Code પેજ પર ન હોય તો ખોટી કંપની ગણીને સ્કીપ કરો
                 if scrip_code and not re.search(rf"\b{re.escape(str(scrip_code))}\b", page_html):
                     log.info("Screener page %s does not match BSE Scrip Code %s. Skipping mismatch.", hit_name, scrip_code)
                     continue
@@ -616,7 +610,8 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
                         elif ("P/B" in t or "Price to book" in t) and num_txt:
                             info["pb_ratio"] = num_txt
 
-                if info["market_cap_num"] >= MIN_MARKET_CAP_CR and (info["price_num"] == 0 or info["price_num"] >= MIN_STOCK_PRICE):
+                # ₹75 Cr થી ઉપરના તમામ શેર્સ માન્ય ગણાશે (ભાવ ₹10 થી ઓછો હોય તો પણ જો માર્કેટ કેપ ₹75 Cr+ હોય તો સ્કીપ નહીં થાય)
+                if info["market_cap_num"] >= MIN_MARKET_CAP_CR:
                     info["is_eligible_stock"] = True
 
                 if info["price_num"] > 0:
@@ -655,54 +650,88 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
 
 
 # ==========================================
-# 6. BSE API & FEEDS
+# 6. BSE API, SCRIP PDF RESOLVER & FEEDS
 # ==========================================
-def fetch_bse_json_announcements():
+def fetch_bse_pdf_url_by_scrip(scrip_code):
+    """
+    જ્યારે XML ફીડમાં સીધી PDF લિંક ન હોય (જેમ કે Panchsheel Organics 531726 કે Ameenji Rubber 544555),
+    ત્યારે BSE JSON API માંથી તેનો Scrip Code સર્ચ કરીને સાચી PDF લિંક શોધી કાઢે છે.
+    """
+    if not scrip_code:
+        return "", ""
     ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
     today_str = ist_now.strftime("%Y%m%d")
-    prev_str = (ist_now - timedelta(days=1)).strftime("%Y%m%d")
-    output = []
+    prev_str = (ist_now - timedelta(days=5)).strftime("%Y%m%d")
 
-    for kind, cat in [("result", "Result"), ("announcement", "Company+Update")]:
+    for cat in ("Result", "-1"):
         api_url = (
             f"https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
-            f"?pageno=1&strCat={cat}&strPrevDate={prev_str}&strScrip=&strSearch=P&strToDate={today_str}&strType=C&subcategory=-1"
+            f"?pageno=1&strCat={cat}&strPrevDate={prev_str}&strScrip={scrip_code}&strSearch=P&strToDate={today_str}&strType=C&subcategory=-1"
         )
         try:
             res = get_url(api_url)
             rows = res.json().get("Table", []) if isinstance(res.json(), dict) else []
-            count = 0
             for r in rows:
-                comp = str(r.get("SLONGNAME") or "").strip()
-                scrip = str(r.get("SCRIP_CD") or "").strip()
-                sub = str(r.get("NEWSSUB") or "").strip()
-                head = str(r.get("HEADLINE") or "").strip()
-                more = str(r.get("MORE") or "").strip()
-                subcat = str(r.get("SUBCATNAME") or "").strip()
                 attach = str(r.get("ATTACHMENTNAME") or "").strip()
-                news_id = str(r.get("NEWSID") or "").strip()
-                title = f"{comp} ({scrip}) - {sub}" if comp else sub
-                desc = " | ".join(filter(None, [subcat, head, more]))
-                if not title or is_mutual_fund_nav_spam(title, desc, scrip):
-                    continue
-                pdf_link = f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{attach}" if attach else ""
-                item_kind = "result" if (kind == "result" or "result" in subcat.lower()) else "announcement"
-                output.append({
-                    "kind": item_kind,
-                    "title": html.unescape(re.sub(r"<[^>]+>", " ", title)).strip(),
-                    "company_raw": comp,
-                    "scrip_code": scrip,
-                    "description": html.unescape(re.sub(r"<[^>]+>", " ", desc)).strip(),
-                    "link": pdf_link,
-                    "attachment_name": attach,
-                    "guid": news_id or pdf_link or title,
-                })
-                count += 1
+                if attach and attach.lower().endswith(".pdf"):
+                    return f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{attach}", attach
+        except Exception:
+            pass
+    return "", ""
+
+
+def fetch_bse_json_announcements():
+    ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    today_str = ist_now.strftime("%Y%m%d")
+    prev_str = (ist_now - timedelta(days=2)).strftime("%Y%m%d")
+    output = []
+
+    for kind, cat in [("result", "Result"), ("announcement", "Company+Update")]:
+        count = 0
+        for page_no in (1, 2, 3):
+            api_url = (
+                f"https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
+                f"?pageno={page_no}&strCat={cat}&strPrevDate={prev_str}&strScrip=&strSearch=P&strToDate={today_str}&strType=C&subcategory=-1"
+            )
+            try:
+                res = get_url(api_url)
+                rows = res.json().get("Table", []) if isinstance(res.json(), dict) else []
+                if not rows:
+                    break
+                for r in rows:
+                    comp = str(r.get("SLONGNAME") or "").strip()
+                    scrip = str(r.get("SCRIP_CD") or "").strip()
+                    sub = str(r.get("NEWSSUB") or "").strip()
+                    head = str(r.get("HEADLINE") or "").strip()
+                    more = str(r.get("MORE") or "").strip()
+                    subcat = str(r.get("SUBCATNAME") or "").strip()
+                    attach = str(r.get("ATTACHMENTNAME") or "").strip()
+                    news_id = str(r.get("NEWSID") or "").strip()
+                    title = f"{comp} ({scrip}) - {sub}" if comp else sub
+                    desc = " | ".join(filter(None, [subcat, head, more]))
+                    if not title or is_mutual_fund_nav_spam(title, desc, scrip):
+                        continue
+                    pdf_link = f"https://www.bseindia.com/xml-data/corpfiling/AttachLive/{attach}" if attach else ""
+                    item_kind = "result" if (kind == "result" or "result" in subcat.lower()) else "announcement"
+                    output.append({
+                        "kind": item_kind,
+                        "title": html.unescape(re.sub(r"<[^>]+>", " ", title)).strip(),
+                        "company_raw": comp,
+                        "scrip_code": scrip,
+                        "description": html.unescape(re.sub(r"<[^>]+>", " ", desc)).strip(),
+                        "link": pdf_link,
+                        "attachment_name": attach,
+                        "guid": news_id or pdf_link or title,
+                    })
+                    count += 1
+                    if count >= MAX_ITEMS_PER_FEED:
+                        break
                 if count >= MAX_ITEMS_PER_FEED:
                     break
-            log.info("BSE JSON API (%s): %d items fetched", cat, count)
-        except Exception as exc:
-            log.warning("BSE JSON API warning (%s): %s", cat, exc)
+            except Exception as exc:
+                log.warning("BSE JSON API warning (%s p%d): %s", cat, page_no, exc)
+                break
+        log.info("BSE JSON API (%s): %d items fetched", cat, count)
     return output
 
 
@@ -728,7 +757,7 @@ def parse_feed(feed_url, feed_kind):
         output.append({
             "kind": feed_kind,
             "title": clean_t,
-            "company_raw": clean_t.split("-")[0].split(":")[0].strip(),
+            "company_raw": clean_t.split("(")[0].split("-")[0].split(":")[0].strip(),
             "scrip_code": str(scrip).strip(),
             "description": html.unescape(re.sub(r"<[^>]+>", " ", description)).strip(),
             "link": urljoin(feed_url, link) if link else "",
@@ -739,13 +768,26 @@ def parse_feed(feed_url, feed_kind):
     return output
 
 
-def get_document_payload(item):
+def get_document_payload(item, scrip_code=""):
     parts = [f"COMPANY TITLE: {item['title']}"]
     pdf_bytes = None
     extracted_pdf_text = ""
     if item["description"]:
         parts.append("FEED DESCRIPTION:\n" + item["description"])
-    url, attach_name = item["link"], item.get("attachment_name", "")
+
+    url = item.get("link") or ""
+    attach_name = item.get("attachment_name") or ""
+
+    # જો XML ફીડમાં સીધી PDF લિંક ન હોય, તો BSE API માં Scrip Code થી PDF શોધો
+    if not url or not urlparse(url).path.lower().endswith(".pdf"):
+        resolved_url, resolved_attach = fetch_bse_pdf_url_by_scrip(scrip_code)
+        if resolved_url:
+            url = resolved_url
+            attach_name = resolved_attach
+            item["link"] = resolved_url
+            item["attachment_name"] = resolved_attach
+            log.info("Resolved official BSE PDF for %s (%s): %s", item["title"], scrip_code, attach_name)
+
     if url and urlparse(url).path.lower().endswith(".pdf"):
         try:
             try:
@@ -769,7 +811,7 @@ def get_document_payload(item):
             if extracted_pdf_text:
                 parts.append("EXTRACTED PDF TEXT:\n" + extracted_pdf_text)
         except Exception as exc:
-            log.warning("Attachment download warning: %s", exc)
+            log.warning("Attachment download warning for %s: %s", url, exc)
     return clean_text("\n\n".join(parts))[:MAX_TEXT_CHARS], pdf_bytes, len(extracted_pdf_text)
 
 
@@ -814,10 +856,6 @@ def compute_metric_dict(curr_val, prev_val):
 
 
 def verify_and_normalize_pdf_result_numbers(ai_data, screener_info):
-    """
-    PDF માંથી Gemini એ કાઢેલા આંકડાનું ગણિત (Change અને YoY %) Python દ્વારા 100% ચોકસાઈથી ફરી ગણે છે
-    અને Multi-Quarter Chart માં લેટેસ્ટ PDF ક્વાર્ટરનો ઉમેરો કરે છે.
-    """
     rev = ai_data.get("revenue") or {}
     gp = ai_data.get("gross_profit") or {}
     np_d = ai_data.get("net_profit") or {}
@@ -831,7 +869,6 @@ def verify_and_normalize_pdf_result_numbers(ai_data, screener_info):
     ai_data["gross_profit"] = compute_metric_dict(gp.get("curr"), gp.get("prev"))
     ai_data["net_profit"] = compute_metric_dict(np_d.get("curr"), np_d.get("prev"))
 
-    # Multi-Quarter Chart માં Screener ના જૂના ક્વાર્ટર્સની પાછળ આ નવા PDF ક્વાર્ટરના સાચા આંકડા જોડો
     q_labels = list(screener_info.get("q_labels", []))
     q_rev = list(screener_info.get("q_rev", []))
     q_gp = list(screener_info.get("q_gp", []))
@@ -871,7 +908,6 @@ class DummyResponse:
 def call_ai_api(prompt_text, pdf_bytes=None, require_pdf_vision=False):
     est_tokens = max(3000, int(len(prompt_text) / 3.5) + (4000 if pdf_bytes else 0))
 
-    # 2 full rounds across Gemini keys with patient sleep if rate-limited, because PDF accuracy is top priority
     if GEMINI_API_KEYS:
         gemini_models = [GEMINI_MODEL, "gemini-3.5-flash-lite", "gemini-2.0-flash"]
         seen_m = []
@@ -912,7 +948,6 @@ def call_ai_api(prompt_text, pdf_bytes=None, require_pdf_vision=False):
                 log.info("Pausing 25s to retry Gemini PDF Vision for 100% accurate extraction...")
                 time.sleep(25)
 
-    # OpenRouter Backup ONLY if PDF text was already extracted by PyPDF2 (not a scanned image PDF)
     if not require_pdf_vision and OpenAI is not None and OPENROUTER_KEYS:
         or_models = ["google/gemini-3.5-flash-lite", "google/gemini-2.0-flash-lite-preview-02-05:free", "google/gemma-3-27b-it:free"]
         for _ in range(len(OPENROUTER_ROTATOR.keys)):
@@ -1189,7 +1224,6 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
 
     content_blocks = []
 
-    # 1. VISUAL WEB STORY SUMMARY BOX
     web_story_hooks = data.get("web_story_hook") or []
     if isinstance(web_story_hooks, str):
         web_story_hooks = [web_story_hooks]
@@ -1206,7 +1240,6 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
             </div>
             """)
 
-    # 2. RESULT / ORDER TABLE (NO WRAPPING OR CLIPPING ON MOBILE)
     if doc_type == "order":
         ord_info = data.get("order_details", {}) or {}
         order_card = f"""
@@ -1295,7 +1328,6 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
         """
         content_blocks.append(result_card)
 
-    # 3. SHARE PRICE TARGET TABLE (2026 - 2030)
     if screener_info.get("target_2026") and screener_info["target_2026"] != "N/A":
         target_table_card = f"""
         <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 16px; padding: 16px; margin-bottom: 24px; box-sizing: border-box;">
@@ -1334,7 +1366,6 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
         """
         content_blocks.append(target_table_card)
 
-    # 4. KEY HIGHLIGHTS
     highlights = data.get("key_highlights") or []
     if highlights and isinstance(highlights, list):
         li_items = "".join(f"<li style='margin-bottom: 8px; color: #1e293b; line-height: 1.6;'>{html.escape(str(h))}</li>" for h in highlights if h)
@@ -1346,7 +1377,6 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
         """
         content_blocks.append(highlights_card)
 
-    # 5. FUNDAMENTAL RATIOS TABLE
     fundamentals_card = f"""
     <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 16px; box-shadow: 0 4px 14px rgba(0,0,0,0.05); margin-bottom: 24px; box-sizing: border-box;">
       <h2 style="margin: 0 0 14px 0; font-size: 18px; color: #0f172a;">🔍 {comp_name} Fundamental Ratios &amp; 52W High/Low</h2>
@@ -1737,6 +1767,7 @@ def run():
         return
 
     published_count = 0
+    seen_in_run = set()
 
     for item in all_items:
         if published_count >= MAX_POSTS_PER_RUN:
@@ -1754,6 +1785,12 @@ def run():
         file_key = extract_file_key(item["link"])
         item_id = make_item_id(comp_key, file_key, item)
 
+        # એક જ રનમાં એકની એક કંપની બે વાર ચેક ન થાય તે માટે
+        run_dedup_token = scrip_key or comp_key or item_id
+        if run_dedup_token in seen_in_run:
+            continue
+        seen_in_run.add(run_dedup_token)
+
         is_dup, dup_reason = is_already_on_blog_or_db(item_id, comp_key, scrip_key, file_key, blog_state)
         if is_dup:
             continue
@@ -1770,10 +1807,9 @@ def run():
                 if scr_comp_key and scr_comp_key in blog_state["comp_keys"]:
                     continue
 
-            source_text, pdf_bytes, pdf_text_len = get_document_payload(item)
+            source_text, pdf_bytes, pdf_text_len = get_document_payload(item, scrip_code=scrip_code)
             file_key = extract_file_key(item["link"]) or file_key
 
-            # 🛑 MANDATORY PDF REQUIREMENT: જો BSE ની PDF ડાઉનલોડ ન થઈ હોય, તો અંદાજિત આંકડાથી પોસ્ટ ન કરો
             if not pdf_bytes:
                 log.warning("Skipping %s because official BSE PDF could not be downloaded.", item["title"])
                 continue
@@ -1785,7 +1821,6 @@ def run():
                 item["title"], scrip_code, doc_type, source_text, pdf_bytes, screener_info, trending_kws, pdf_text_len
             )
 
-            # જો AI એ PDF ન વાંચી હોય અથવા પરિણામ નબળું હોય તો સ્કીપ કરો
             if not ai_data or ai_data.get("pdf_table_verified") is False or ai_data.get("skip_stock") is True:
                 log.info("Skipping stock (weak result or unverified PDF table): %s", item["title"])
                 continue
@@ -1794,7 +1829,6 @@ def run():
                 r_curr = to_float(ai_data.get("revenue", {}).get("curr"))
                 np_curr = to_float(ai_data.get("net_profit", {}).get("curr"))
                 curr_p = str(ai_data.get("curr_period_label", "")).lower()
-                # જૂના ક્વાર્ટર (Jun 2026 / Mar 2026) જો ભૂલથી આવી ગયા હોય તો પોસ્ટ ન થવા દો
                 if (r_curr == 0 and np_curr == 0) or any(old_q in curr_p for old_q in ("jun 2026", "mar 2026", "dec 2025")):
                     log.warning("Skipping result post due to old period (%s) or zero figures: %s", curr_p, item["title"])
                     continue
@@ -1831,7 +1865,6 @@ def run():
             if not blogger_ok:
                 break
 
-            # બે પોસ્ટ વચ્ચે 15 સેકન્ડનો વિરામ જેથી Gemini અને Blogger બંને શાંતિથી અને ચોકસાઈથી કામ કરે
             time.sleep(15)
         except Exception:
             log.exception("Item processing failed: %s", item["title"])
