@@ -27,44 +27,48 @@ except ImportError:
     OpenAI = None
 
 # ==========================================
-# 1. CONFIGURATION & CREDENTIALS
+# 1. CONFIGURATION & CREDENTIALS (FROM ENV / GITHUB SECRETS)
 # ==========================================
-BLOG_ID = os.getenv("BLOG_ID", "6996150531679127159").strip()
-BLOG_BASE_URL = os.getenv("BLOG_BASE_URL", "https://marketmunafa.blogspot.com").rstrip("/")
-GOOGLE_CLIENT_ID = (os.getenv("GOOGLE_CLIENT_ID") or os.getenv("CLIENT_ID") or "").strip()
-GOOGLE_CLIENT_SECRET = (os.getenv("GOOGLE_CLIENT_SECRET") or os.getenv("CLIENT_SECRET") or "").strip()
-GOOGLE_REFRESH_TOKEN = (os.getenv("GOOGLE_REFRESH_TOKEN") or os.getenv("REFRESH_TOKEN") or "").strip()
+BLOG_ID = os.getenv("BLOG_ID", "6996150531679127159").strip('"\' ')
+BLOG_BASE_URL = os.getenv("BLOG_BASE_URL", "https://marketmunafa.blogspot.com").strip('"\' ').rstrip("/")
+GOOGLE_CLIENT_ID = (os.getenv("GOOGLE_CLIENT_ID") or os.getenv("CLIENT_ID") or "").strip('"\' ')
+GOOGLE_CLIENT_SECRET = (os.getenv("GOOGLE_CLIENT_SECRET") or os.getenv("CLIENT_SECRET") or "").strip('"\' ')
+GOOGLE_REFRESH_TOKEN = (os.getenv("GOOGLE_REFRESH_TOKEN") or os.getenv("REFRESH_TOKEN") or "").strip('"\' ')
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "9086072964:AAEUyn-GAyJLdsYR4YS5l6Xy6HJsOOoA8HM").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "430834857").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip('"\' ')
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip('"\' ')
 
-# ---------------- GEMINI 3.5 FLASH-LITE QUOTA (15 RPM, 250k TPM, 500 RPD) ----------------
 GEMINI_API_KEYS = [
-    "AQ.Ab8RN6" + "JWzU70V3RM1zMEx0VEYmUj4q" + "EvvqqKbH27t1oHIO3Xjg",
-    "AQ.Ab8RN6" + "Iw_vLVx2SPdac2gbUhK5fiSy" + "ihpDMHASZdZzdd4SnFGQ",
+    k.strip('"\' ') for k in re.split(r"[,\s]+", os.getenv("GEMINI_API_KEY", "")) if k.strip('"\' ')
 ]
-for _ek in re.split(r"[,\s]+", os.getenv("GEMINI_API_KEY", "").strip()):
-    if _ek and _ek not in GEMINI_API_KEYS:
-        GEMINI_API_KEYS.append(_ek)
-
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip('"\' ')
 GEMINI_MAX_RPM = 12
 GEMINI_MAX_TPM = 240000
 GEMINI_MAX_RPD = 500
 
-# ---------------- OPENROUTER BACKUP KEYS (2 KEYS: 5 RPM, 20 RPD) ----------------
 OPENROUTER_KEYS = [
-    "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",
-    "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",
+    k.strip('"\' ') for k in re.split(r"[,\s]+", os.getenv("OPENROUTER_API_KEY", "")) if k.strip('"\' ')
 ]
 OPENROUTER_MAX_RPM = 5
 OPENROUTER_MAX_RPD = 20
 
 RATE_WINDOW_SECONDS = 60.0
 
-# ---------------- QUALITY, ADSENSE & GOOGLE NEWS FILTERS ----------------
-MIN_MARKET_CAP_CR = float(os.getenv("MIN_MARKET_CAP_CR", "75.0"))
-MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "6"))
+# Strict 8 Approved Blog Categories
+APPROVED_LABELS = [
+    "STOCKS RESULT",
+    "MARKET NEWS",
+    "IPO",
+    "INTRADAY",
+    "TOP 10 STOCKS",
+    "DEBT FREE 10 STOCKS",
+    "GOLD",
+    "SILVER",
+]
+
+# Quality & Indexing Protection Filters
+MIN_MARKET_CAP_CR = float(os.getenv("MIN_MARKET_CAP_CR", "100.0"))
+MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "3"))
 
 FEEDS = {
     "result": "https://www.bseindia.com/Data/XML/FinancialResultsFeed.aspx",
@@ -88,7 +92,7 @@ log = logging.getLogger("marketmunafa")
 
 
 # ==========================================
-# 2. MULTI-KEY ROTATOR (PATIENT WAIT MODE)
+# 2. MULTI-KEY ROTATOR
 # ==========================================
 class MultiKeyRotator:
     def __init__(self, name, keys, max_per_min, max_per_day, max_tpm=240000, window_sec=60.0):
@@ -111,7 +115,7 @@ class MultiKeyRotator:
 
         for _ in range(4):
             if len(self.exhausted_today) >= num_keys:
-                log.warning("All %s keys have reached their daily quota (%d/day).", self.name, self.max_per_day)
+                log.warning("All %s keys have reached daily quota (%d/day).", self.name, self.max_per_day)
                 return None, None
 
             now = time.time()
@@ -141,16 +145,9 @@ class MultiKeyRotator:
                     self.daily_count[idx] += 1
                     self.next_idx = (idx + 1) % num_keys
                     log.info(
-                        "Using %s Key #%d/%d | RPM: %d/%d | TPM: %d/%d | RPD: %d/%d",
-                        self.name,
-                        idx + 1,
-                        num_keys,
-                        curr_rpm + 1,
-                        self.max_per_min,
-                        curr_tpm + estimated_tokens,
-                        self.max_tpm,
-                        self.daily_count[idx],
-                        self.max_per_day,
+                        "Using %s Key #%d/%d | RPM: %d/%d | RPD: %d/%d",
+                        self.name, idx + 1, num_keys, curr_rpm + 1, self.max_per_min,
+                        self.daily_count[idx], self.max_per_day,
                     )
                     return idx, self.keys[idx]
                 else:
@@ -176,32 +173,17 @@ class MultiKeyRotator:
             self.cooldown_until[idx] = time.time() + cooldown_sec
 
 
-GEMINI_ROTATOR = MultiKeyRotator(
-    "Gemini (gemini-3.5-flash-lite)",
-    GEMINI_API_KEYS,
-    max_per_min=GEMINI_MAX_RPM,
-    max_per_day=GEMINI_MAX_RPD,
-    max_tpm=GEMINI_MAX_TPM,
-    window_sec=RATE_WINDOW_SECONDS,
-)
-
-OPENROUTER_ROTATOR = MultiKeyRotator(
-    "OpenRouter Backup",
-    OPENROUTER_KEYS,
-    max_per_min=OPENROUTER_MAX_RPM,
-    max_per_day=OPENROUTER_MAX_RPD,
-    max_tpm=240000,
-    window_sec=RATE_WINDOW_SECONDS,
-)
+GEMINI_ROTATOR = MultiKeyRotator("Gemini", GEMINI_API_KEYS, GEMINI_MAX_RPM, GEMINI_MAX_RPD, GEMINI_MAX_TPM, RATE_WINDOW_SECONDS)
+OPENROUTER_ROTATOR = MultiKeyRotator("OpenRouter Backup", OPENROUTER_KEYS, OPENROUTER_MAX_RPM, OPENROUTER_MAX_RPD, 240000, RATE_WINDOW_SECONDS)
 
 
 # ==========================================
-# 3. INDIAN MULTI-LANGUAGE TRANSLATOR ENGINE
+# 3. CLEAN 3-LANGUAGE TRANSLATOR (GU, EN, HI)
 # ==========================================
 def translate_text_indic(text, target_lang):
     if not text or not str(text).strip():
         return ""
-    clean_txt = str(text).strip()
+    clean_txt = html.unescape(str(text)).strip()
     try:
         url = (
             f"https://translate.googleapis.com/translate_a/single"
@@ -212,14 +194,14 @@ def translate_text_indic(text, target_lang):
             data = res.json()
             translated = "".join([part[0] for part in data[0] if part and part[0]])
             if translated:
-                return translated
+                return html.unescape(translated).strip()
     except Exception:
         pass
     return clean_txt
 
 
 def build_multilang_pack(data):
-    lead_en = str(data.get("seo_lead_summary") or "")
+    lead_en = html.unescape(str(data.get("seo_lead_summary") or "")).strip()
     hooks_en = data.get("web_story_hook") or []
     if isinstance(hooks_en, str):
         hooks_en = [hooks_en]
@@ -227,111 +209,48 @@ def build_multilang_pack(data):
     sections_en = data.get("seo_article_sections") or []
     faqs_en = data.get("faqs") or []
 
-    batch_items = [lead_en]
-    batch_items.extend([str(h) for h in hooks_en[:4]])
-    batch_items.extend([str(k) for k in highlights_en[:4]])
-    for sec in sections_en[:3]:
-        batch_items.append(str(sec.get("heading", "")))
-        batch_items.append(str(sec.get("body", "")))
-    for fq in faqs_en[:4]:
-        batch_items.append(str(fq.get("q", "")))
-        batch_items.append(str(fq.get("a", "")))
+    lang_packs = {
+        "en": {
+            "lead": lead_en,
+            "hooks": [html.unescape(str(h)).strip() for h in hooks_en[:4]],
+            "highlights": [html.unescape(str(k)).strip() for k in highlights_en[:4]],
+            "sections": [
+                {"heading": html.unescape(str(s.get("heading", ""))).strip(), "body": html.unescape(str(s.get("body", ""))).strip()}
+                for s in sections_en[:3]
+            ],
+            "faqs": [
+                {"q": html.unescape(str(f.get("q", ""))).strip(), "a": html.unescape(str(f.get("a", ""))).strip()}
+                for f in faqs_en[:4]
+            ],
+        }
+    }
 
-    joined_en = "\n|||\n".join(batch_items)
-    lang_packs = {}
-
-    for lang_code in ("gu", "hi", "te", "ta"):
-        translated_blob = translate_text_indic(joined_en, lang_code)
-        parts = [p.strip() for p in translated_blob.split("|||")]
-        if len(parts) < len(batch_items):
-            parts = [translate_text_indic(item, lang_code) for item in batch_items]
-
-        idx = 0
-        l_lead = parts[idx] if idx < len(parts) else lead_en
-        idx += 1
-
-        l_hooks = []
-        for _ in hooks_en[:4]:
-            l_hooks.append(parts[idx] if idx < len(parts) else "")
-            idx += 1
-
-        l_high = []
-        for _ in highlights_en[:4]:
-            l_high.append(parts[idx] if idx < len(parts) else "")
-            idx += 1
-
-        l_secs = []
-        for _ in sections_en[:3]:
-            h_t = parts[idx] if idx < len(parts) else ""
-            b_t = parts[idx + 1] if (idx + 1) < len(parts) else ""
-            l_secs.append({"heading": h_t, "body": b_t})
-            idx += 2
-
-        l_faqs = []
-        for _ in faqs_en[:4]:
-            q_t = parts[idx] if idx < len(parts) else ""
-            a_t = parts[idx + 1] if (idx + 1) < len(parts) else ""
-            l_faqs.append({"q": q_t, "a": a_t})
-            idx += 2
-
+    for lang_code in ("gu", "hi"):
         lang_packs[lang_code] = {
-            "lead": l_lead,
-            "hooks": l_hooks,
-            "highlights": l_high,
-            "sections": l_secs,
-            "faqs": l_faqs,
+            "lead": translate_text_indic(lead_en, lang_code),
+            "hooks": [translate_text_indic(h, lang_code) for h in hooks_en[:4]],
+            "highlights": [translate_text_indic(k, lang_code) for k in highlights_en[:4]],
+            "sections": [
+                {
+                    "heading": translate_text_indic(s.get("heading", ""), lang_code),
+                    "body": translate_text_indic(s.get("body", ""), lang_code),
+                }
+                for s in sections_en[:3]
+            ],
+            "faqs": [
+                {
+                    "q": translate_text_indic(f.get("q", ""), lang_code),
+                    "a": translate_text_indic(f.get("a", ""), lang_code),
+                }
+                for f in faqs_en[:4]
+            ],
         }
 
     return lang_packs
 
 
 # ==========================================
-# 4. LIVE GOOGLE AUTOCOMPLETE KEYWORD ENGINE
-# ==========================================
-def fetch_live_google_keywords(company_name):
-    short_name = re.sub(r"\b(ltd|limited|india|industries|corp|corporation|pvt)\b", "", company_name, flags=re.I).strip()
-    seed_queries = [
-        f"{short_name} share ",
-        f"{short_name} share price target ",
-        f"why {short_name} share ",
-        f"{short_name} q2 results ",
-    ]
-    found_keywords = []
-    seen = set()
-
-    for q in seed_queries:
-        try:
-            url = f"https://suggestqueries.google.com/complete/search?client=firefox&gl=in&hl=en&q={urllib.parse.quote(q)}"
-            res = c_requests.get(url, impersonate="chrome120", timeout=6)
-            if res.status_code == 200:
-                data = res.json()
-                if isinstance(data, list) and len(data) > 1 and isinstance(data[1], list):
-                    for kw in data[1]:
-                        kw_clean = str(kw).strip()
-                        if kw_clean and kw_clean.lower() not in seen and len(kw_clean) > 8:
-                            seen.add(kw_clean.lower())
-                            found_keywords.append(kw_clean)
-        except Exception:
-            pass
-
-    high_vol_defaults = [
-        f"{short_name} share price target 2026",
-        f"{short_name} share price target 2027 to 2030",
-        f"{short_name} Q2 results 2026 analysis",
-        f"Why {short_name} share price is rising today",
-        f"Is {short_name} share a good buy for long term",
-        f"{short_name} share latest news in Gujarati and Hindi",
-    ]
-    for d_kw in high_vol_defaults:
-        if d_kw.lower() not in seen:
-            seen.add(d_kw.lower())
-            found_keywords.append(d_kw)
-
-    return found_keywords[:10]
-
-
-# ==========================================
-# 5. DUPLICATE PROTECTION & HELPERS
+# 4. DUPLICATE PROTECTION & HELPERS
 # ==========================================
 STOP_WORDS_REGEX = re.compile(
     r"\b(q1|q2|q3|q4|fy\d+|fy\d{2}-\d{2}|h1|h2|9m|results|result|order|orders|contract|contracts|"
@@ -518,7 +437,7 @@ def shorten_period_label(lbl):
 
 
 # ==========================================
-# 6. SCREENER FUNDAMENTALS (CONSOLIDATED PRIORITY)
+# 5. SCREENER FUNDAMENTALS (CONSOLIDATED PRIORITY)
 # ==========================================
 def _extract_quarters_from_soup(soup):
     q_data = {
@@ -583,7 +502,11 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
         "price_str": "Live on BSE",
         "price_num": 0.0,
         "high_52w": "N/A",
+        "high_52w_num": 0.0,
         "low_52w": "N/A",
+        "low_52w_num": 0.0,
+        "dist_from_high": "N/A",
+        "dist_from_low": "N/A",
         "market_cap": "N/A",
         "market_cap_num": 0.0,
         "is_eligible_stock": False,
@@ -599,6 +522,7 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
         "curr_debt_num": 0,
         "prev_debt_num": 0,
         "debt_to_equity": "0.00",
+        "debt_to_equity_num": 0.0,
         "face_value": "N/A",
         "quarters_text": "",
         "q_all_labels": [],
@@ -609,9 +533,6 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
         "q_rev": [],
         "q_gp": [],
         "q_np": [],
-        "target_2026": "N/A",
-        "target_2027": "N/A",
-        "target_2030": "N/A",
     }
 
     seen_q = set()
@@ -672,7 +593,9 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
                             info["price_num"] = to_float(num_txt)
                         elif "High / Low" in t and len(nums) >= 2:
                             info["high_52w"] = f"₹{nums[0]}"
+                            info["high_52w_num"] = to_float(nums[0])
                             info["low_52w"] = f"₹{nums[1]}"
+                            info["low_52w_num"] = to_float(nums[1])
                         elif "Market Cap" in t and num_txt:
                             info["market_cap"] = f"₹{num_txt} Cr"
                             info["market_cap_num"] = to_float(num_txt)
@@ -690,6 +613,7 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
                             info["face_value"] = num_txt
                         elif ("Debt to equity" in t or t.startswith("Debt to")) and num_txt:
                             info["debt_to_equity"] = num_txt
+                            info["debt_to_equity_num"] = float(to_float(num_txt))
                         elif "Industry P/E" in t and num_txt:
                             info["industry_pe"] = num_txt
                         elif "EPS" in t and num_txt:
@@ -700,11 +624,14 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
                 if info["market_cap_num"] >= MIN_MARKET_CAP_CR:
                     info["is_eligible_stock"] = True
 
+                # Calculate factual 52-week positioning (NO fabricated future price targets)
                 if info["price_num"] > 0:
-                    p = info["price_num"]
-                    info["target_2026"] = f"₹{round(p * 1.15, 1):,} to ₹{round(p * 1.24, 1):,}"
-                    info["target_2027"] = f"₹{round(p * 1.35, 1):,} to ₹{round(p * 1.50, 1):,}"
-                    info["target_2030"] = f"₹{round(p * 1.90, 1):,} to ₹{round(p * 2.40, 1):,}"
+                    if info["high_52w_num"] > 0:
+                        diff_h = ((info["price_num"] - info["high_52w_num"]) / info["high_52w_num"]) * 100
+                        info["dist_from_high"] = f"{diff_h:+.1f}% vs 52W High"
+                    if info["low_52w_num"] > 0:
+                        diff_l = ((info["price_num"] - info["low_52w_num"]) / info["low_52w_num"]) * 100
+                        info["dist_from_low"] = f"{diff_l:+.1f}% vs 52W Low"
 
                 borrowings, equity = None, None
                 bs_sec = soup.find("section", id="balance-sheet")
@@ -728,7 +655,9 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
                                     pass
 
                 if info["debt_to_equity"] in ("N/A", "0.00") and borrowings is not None and equity and equity > 0:
-                    info["debt_to_equity"] = f"{(borrowings / equity):.2f}"
+                    de_calc = borrowings / equity
+                    info["debt_to_equity"] = f"{de_calc:.2f}"
+                    info["debt_to_equity_num"] = round(de_calc, 2)
                 break
         except Exception as exc:
             log.warning("Screener lookup warning for %s: %s", q, exc)
@@ -736,7 +665,7 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
 
 
 # ==========================================
-# 7. BSE API, SCRIP PDF RESOLVER & FEEDS
+# 6. BSE API, SCRIP PDF RESOLVER & FEEDS
 # ==========================================
 def fetch_bse_pdf_url_by_scrip(scrip_code):
     if not scrip_code:
@@ -932,7 +861,11 @@ def compute_metric_dict(curr_val, prev_val):
     c, p = to_float(curr_val), to_float(prev_val)
     diff = round(c - p, 2)
     diff_str = f"{'+' if diff > 0 else ''}{fmt_num(diff)} Cr"
-    g_str = f"{'+' if ((c - p) / abs(p)) * 100 > 0 else ''}{((c - p) / abs(p)) * 100:.1f}%" if p != 0 else "0.0%"
+    if p != 0:
+        pct = ((c - p) / abs(p)) * 100
+        g_str = f"{'+' if pct > 0 else ''}{pct:.1f}%"
+    else:
+        g_str = "N/A"
     return {"curr": fmt_num(c), "prev": fmt_num(p), "difference": diff_str, "growth": g_str}
 
 
@@ -979,7 +912,7 @@ def verify_and_normalize_pdf_result_numbers(ai_data, screener_info):
 
 
 # ==========================================
-# 8. AI API CALL (PATIENT MULTIMODAL PDF READER)
+# 7. AI API CALL (MULTIMODAL PDF READER)
 # ==========================================
 class DummyResponse:
     def __init__(self, text):
@@ -990,7 +923,7 @@ def call_ai_api(prompt_text, pdf_bytes=None, require_pdf_vision=False):
     est_tokens = max(3000, int(len(prompt_text) / 3.5) + (4000 if pdf_bytes else 0))
 
     if GEMINI_API_KEYS:
-        gemini_models = [GEMINI_MODEL, "gemini-3.5-flash-lite", "gemini-2.0-flash"]
+        gemini_models = [GEMINI_MODEL, "gemini-2.5-flash", "gemini-2.0-flash"]
         seen_m = []
         for m in gemini_models:
             if m and m not in seen_m:
@@ -1015,7 +948,7 @@ def call_ai_api(prompt_text, pdf_bytes=None, require_pdf_vision=False):
                         else:
                             resp = model.generate_content(prompt_text)
                         if resp and getattr(resp, "text", None):
-                            log.info("Gemini PDF Vision analysis success using model: %s", m_name)
+                            log.info("Gemini PDF Vision success using model: %s", m_name)
                             return resp
                     except Exception as exc:
                         err_str = str(exc).lower()
@@ -1026,11 +959,10 @@ def call_ai_api(prompt_text, pdf_bytes=None, require_pdf_vision=False):
                 if not key_error:
                     break
             if attempt_round == 0:
-                log.info("Pausing 25s to retry Gemini PDF Vision for 100% accurate extraction...")
-                time.sleep(25)
+                time.sleep(20)
 
     if not require_pdf_vision and OpenAI is not None and OPENROUTER_KEYS:
-        or_models = ["google/gemini-3.5-flash-lite", "google/gemini-2.0-flash-lite-preview-02-05:free", "google/gemma-3-27b-it:free"]
+        or_models = ["google/gemini-2.5-flash", "google/gemini-2.0-flash-lite-preview-02-05:free", "google/gemma-3-27b-it:free"]
         for _ in range(len(OPENROUTER_ROTATOR.keys)):
             or_idx, or_key = OPENROUTER_ROTATOR.acquire_key(estimated_tokens=est_tokens)
             if or_key is None:
@@ -1042,7 +974,7 @@ def call_ai_api(prompt_text, pdf_bytes=None, require_pdf_vision=False):
                         model=or_model,
                         messages=[{"role": "user", "content": prompt_text}],
                         temperature=0.2,
-                        max_tokens=4000,
+                        max_tokens=3600,
                     )
                     txt = completion.choices[0].message.content
                     if txt and "{" in txt:
@@ -1057,63 +989,46 @@ def call_ai_api(prompt_text, pdf_bytes=None, require_pdf_vision=False):
     return None
 
 
-def analyze_with_gemini_json(company_title, scrip_code, doc_type, source_text, pdf_bytes, screener_info, trending_kws, pdf_text_len=0):
+def analyze_with_gemini_json(company_title, scrip_code, doc_type, source_text, pdf_bytes, screener_info, pdf_text_len=0):
     c_clean_name = screener_info.get("screener_company_name") or re.sub(r"\(\d+\)", "", company_title).split("-")[0].strip()
-    kws_str = ", ".join(trending_kws)
     ist_today_str = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%B %d, %Y")
 
     prompt = f"""
-You are India's #1 Chartered Accountant (CA), SEBI-compliant Equity Research Analyst, and Google News Editor for 'MarketMunafa' (https://marketmunafa.blogspot.com).
-Carefully inspect EVERY PAGE of the attached BSE Corporate Filing PDF ({doc_type.upper()}) for {c_clean_name} (BSE: {scrip_code}).
+You are a SEBI-compliant Indian Chartered Accountant (CA) and factual financial journalist for 'Market Munafa' ({BLOG_BASE_URL}).
+Inspect EVERY PAGE of the attached BSE Corporate Filing PDF ({doc_type.upper()}) for {c_clean_name} (BSE: {scrip_code}).
 
-CRITICAL RULES FOR GOOGLE #1 RANKING, ADSENSE APPROVAL, GOOGLE NEWS & 100% COPYRIGHT-FREE CONTENT:
-1. 100% ORIGINAL & COPYRIGHT-FREE JOURNALISM:
-   - NEVER copy sentences verbatim from the BSE filing PDF. Write bespoke, human-grade financial commentary with deep analytical value (margin drivers, capital efficiency, working capital, and sector valuation).
-2. THE ATTACHED PDF IS THE SINGLE SOURCE OF TRUTH FOR FINANCIAL RESULT NUMBERS:
-   - Read the financial results table directly from the attached PDF document (including scanned image tables).
-   - NEVER use old quarters like 'Jun 2026' or 'Mar 2026' if the PDF is for 'Sep 2026' (Quarter ended 30.09.2026)!
-3. CONSOLIDATED vs STANDALONE:
-   - If the PDF contains BOTH Consolidated and Standalone financial results, strictly extract **Consolidated** figures and set `"result_type": "Consolidated"`.
-   - If the PDF contains ONLY Standalone financial results, extract **Standalone** figures and set `"result_type": "Standalone"`.
-4. EXACT COLUMN SELECTION (YEAR-ON-YEAR / YoY COMPARISON):
-   - Look at the **"Quarter Ended" (3 Months)** columns in the PDF table:
-     * `curr_period_label`: The latest quarter ended in the PDF (format strictly as `"Sep 2026"` for 30.09.2026).
-     * `prev_period_label`: The **SAME QUARTER LAST YEAR (YoY)** in the PDF (format strictly as `"Sep 2025"` for 30.09.2025).
-   - Do NOT pick 6-Month (Half-Yearly) or 12-Month (Yearly) columns when 3-Month (Quarterly) columns are present!
-5. EXACT UNIT CONVERSION TO Rs. CRORES (₹ Cr):
-   - First check the unit written at the top of the PDF table (`Rs. in Lakhs`, `Rs. in Crores`, `Rs. in Millions`, `Rs. in Thousands`).
-   - Convert every figure accurately into **Rs. Crores (₹ Cr)**:
-     * If `Rs. in Lakhs`: Divide by `100` (e.g. `10,363.00 Lakhs` = `103.63` Cr; `467.00 Lakhs` = `4.67` Cr).
-     * If `Rs. in Millions`: Divide by `10`.
-     * If `Rs. in Thousands`: Divide by `10,000`.
-     * If `Rs. in Crores`: Keep exact value.
-6. EXACT ROWS TO EXTRACT FROM THE PDF TABLE:
-   - `revenue`: **Revenue from Operations** (or Total Income if Revenue from Operations is not separate).
-   - `gross_profit`: **EBITDA / Operating Profit** = Calculate `Profit Before Exceptional Items & Tax (PBT) + Finance Costs + Depreciation & Amortization` from the PDF table!
-   - `net_profit`: **Net Profit (PAT)** = `Profit / (Loss) for the period (after tax)`.
-7. STRONG RESULT FILTER:
-   - Set `"skip_stock": false` ONLY IF the PDF shows strong performance (positive YoY Net Profit growth >= 5%, turnaround from loss to profit, strong revenue growth >= 15%, or a new order win). If the result is weak, loss-making, or unreadable, set `"skip_stock": true`.
-8. HIGH-SEARCH-VOLUME SEO TITLE:
-   - `seo_title` MUST start with `{c_clean_name} Share Price Target 2026` or `{c_clean_name} Q2 Results` or `{c_clean_name} Share Latest News`.
-   - Naturally weave these live Google trending keywords into headings, body, and FAQs: {kws_str}
+STRICT ACCURACY & YMYL COMPLIANCE RULES:
+1. NO FAKE PRICE TARGETS OR BUY/SELL RECOMMENDATIONS:
+   - NEVER invent future share price targets (like 2026/2027/2030 targets) or expected return percentages.
+   - Stick strictly to verified financial numbers, official BSE disclosures, 52-week range, and valuation ratios.
+2. EXACT ARITHMETIC CONSISTENCY:
+   - Double-check your YoY percentage math: ((curr - prev) / abs(prev)) * 100.
+   - NEVER confuse the Revenue amount in ₹ Cr with the YoY growth percentage!
+3. PDF IS THE SINGLE SOURCE OF TRUTH:
+   - Extract exact figures directly from the attached BSE PDF table (prefer Consolidated if both Consolidated and Standalone exist).
+   - Pick the 3-Month ("Quarter Ended") columns: latest quarter (`curr_period_label`, e.g., "Sep 2026") vs same quarter last year (`prev_period_label`, e.g., "Sep 2025").
+   - Convert accurately into ₹ Crores: Lakhs ÷ 100, Millions ÷ 10, Thousands ÷ 10,000.
+   - Extract: `revenue` (Revenue from Operations), `gross_profit` (EBITDA = PBT before exceptional + Finance Cost + Depreciation), and `net_profit` (PAT).
+4. QUALITY FILTER:
+   - Set `"skip_stock": false` ONLY IF the PDF shows strong performance (positive YoY PAT growth >= 5%, turnaround to profit, revenue growth >= 15%, or a material new order win). Otherwise set `"skip_stock": true`.
 
-Company Name: {c_clean_name} (BSE: {scrip_code})
-Screener Verified Valuation Ratios:
-- Current Share Price: {screener_info['price_str']} (52W High: {screener_info['high_52w']} | 52W Low: {screener_info['low_52w']})
+Company: {c_clean_name} (BSE: {scrip_code})
+Screener Verified Data:
+- Current Price: {screener_info['price_str']} | 52W High: {screener_info['high_52w']} ({screener_info['dist_from_high']}) | 52W Low: {screener_info['low_52w']} ({screener_info['dist_from_low']})
 - Market Cap: {screener_info['market_cap']}
 - Stock P/E: {screener_info['pe_ratio']} | Industry P/E: {screener_info['industry_pe']} | P/B: {screener_info['pb_ratio']}
 - ROE: {screener_info['roe']} | ROCE: {screener_info['roce']} | EPS (TTM): {screener_info['eps']}
 - Total Debt: {screener_info['total_debt']} | Debt-to-Equity: {screener_info['debt_to_equity']}
-- Book Value: {screener_info['book_value']} | Div Yield: {screener_info['div_yield']}
-- Algorithmic Valuation Bands: 2026: {screener_info['target_2026']} | 2027: {screener_info['target_2027']} | 2030: {screener_info['target_2030']}
+- Book Value: {screener_info['book_value']} | Div Yield: {screener_info['div_yield']} | Face Value: {screener_info['face_value']}
 
-Return ONLY a valid JSON object with this exact structure:
+Return ONLY a valid JSON object:
 {{
   "pdf_table_verified": true,
   "pdf_original_unit": "Lakhs or Crores or Millions",
   "skip_stock": false,
-  "seo_title": "{c_clean_name} Share Price Target 2026, Q2 Results (PAT YoY Growth) & Latest News",
-  "seo_lead_summary": "55-70 word original, high-CTR opening news paragraph in English starting with '{c_clean_name} Share Price Target 2026 & Q2 Results:' summarizing exact PDF PAT/Revenue YoY growth or Order value, current share price ({screener_info['price_str']}), ROE ({screener_info['roe']}), and fundamental outlook.",
+  "seo_title": "Clear 60-85 char factual news headline starting with '{c_clean_name}' (e.g., '{c_clean_name} Q2 Results: PAT Jumps XX% YoY, Revenue Rises to ₹XX Cr' or '{c_clean_name} Bags ₹XX Cr Order')",
+  "meta_description": "140-150 character crisp factual summary naming {c_clean_name}, exact PDF PAT/Revenue or Order value, and Debt-to-Equity.",
+  "seo_lead_summary": "55-70 word original, objective news lead summarizing exact PDF numbers (matching YoY % math), current share price ({screener_info['price_str']}), ROE ({screener_info['roe']}), and debt ratio.",
   "company_short_name": "{c_clean_name}",
   "result_date": "{ist_today_str}",
   "price_display": "{screener_info['price_str']}",
@@ -1127,71 +1042,55 @@ Return ONLY a valid JSON object with this exact structure:
   "debt_comparison": {{"curr": "{screener_info['curr_debt_num']}", "prev": "{screener_info['prev_debt_num']}"}},
   "order_details": {{
     "client_or_awarder": "Client Name from PDF",
-    "order_value": "Order Value in Rs. Cr. from PDF",
+    "order_value": "Order Value in ₹ Cr from PDF",
     "order_to_mcap_ratio": "Order Value as % of Market Cap",
     "scope_of_work": "Project scope from PDF",
     "execution_timeline": "Execution timeline from PDF"
   }},
-  "market_cap": "{screener_info['market_cap']}",
-  "pe_ratio": "{screener_info['pe_ratio']}",
-  "pb_ratio": "{screener_info['pb_ratio']}",
-  "industry_pe": "{screener_info['industry_pe']}",
-  "roe": "{screener_info['roe']}",
-  "eps": "{screener_info['eps']}",
-  "div_yield": "{screener_info['div_yield']}",
-  "book_value": "{screener_info['book_value']}",
-  "total_debt": "{screener_info['total_debt']}",
-  "debt_to_equity": "{screener_info['debt_to_equity']}",
-  "face_value": "{screener_info['face_value']}",
-  "fundamental_impact_note": "1-2 sentences in English explaining what changed in {c_clean_name}'s fundamentals.",
-  "estimated_stock_return": "{screener_info['target_2026']} (Medium-Term Valuation Band)",
-  "intraday_signal": "1-2 sentences in English covering 52-week high/low ({screener_info['high_52w']} / {screener_info['low_52w']}) and momentum.",
+  "fundamental_impact_note": "1-2 factual sentences explaining the balance-sheet and earnings impact.",
+  "market_position_note": "1-2 factual sentences noting where the stock trades relative to its 52-week high ({screener_info['high_52w']}) and low ({screener_info['low_52w']}).",
   "key_highlights": [
-    "Highlight 1 in English: Exact PDF Revenue & PAT YoY growth (in ₹ Cr) or Order Book milestone.",
-    "Highlight 2 in English: 52-Week High ({screener_info['high_52w']}) & Low ({screener_info['low_52w']}) vs Current Price ({screener_info['price_str']}).",
-    "Highlight 3 in English: Total Debt ({screener_info['total_debt']}) and Debt-to-Equity ({screener_info['debt_to_equity']}) balance sheet check.",
-    "Highlight 4 in English: Stock P/E ({screener_info['pe_ratio']}) vs Industry P/E ({screener_info['industry_pe']}) and ROE ({screener_info['roe']})."
+    "Highlight 1: Exact PDF Revenue & PAT YoY figures (in ₹ Cr) or Order Value.",
+    "Highlight 2: 52-Week High ({screener_info['high_52w']}) & Low ({screener_info['low_52w']}) vs Current Price ({screener_info['price_str']}).",
+    "Highlight 3: Balance Sheet Check - Total Debt ({screener_info['total_debt']}) and Debt-to-Equity ({screener_info['debt_to_equity']}).",
+    "Highlight 4: Valuation Snapshot - Stock P/E ({screener_info['pe_ratio']}) vs Industry P/E ({screener_info['industry_pe']}) and ROE ({screener_info['roe']})."
   ],
   "web_story_hook": [
-    "Punchy Web Story slide 1 with {c_clean_name}'s exact PDF revenue & profit jump or order win.",
-    "Punchy Web Story slide 2 about {c_clean_name}'s Share Price Target 2026 ({screener_info['target_2026']}).",
-    "Punchy Web Story slide 3 about Debt-to-Equity ({screener_info['debt_to_equity']}) and ROE ({screener_info['roe']}).",
-    "Punchy Web Story slide 4 about Stock P/E ({screener_info['pe_ratio']}) vs Sector P/E ({screener_info['industry_pe']})."
+    "Takeaway 1 with {c_clean_name}'s exact PDF revenue/profit change or order win.",
+    "Takeaway 2 noting EBITDA/operating margin performance.",
+    "Takeaway 3 covering Debt-to-Equity ({screener_info['debt_to_equity']}) and ROE ({screener_info['roe']}).",
+    "Takeaway 4 comparing Stock P/E ({screener_info['pe_ratio']}) with Sector P/E ({screener_info['industry_pe']})."
   ],
   "seo_article_sections": [
     {{
-      "heading": "Why {c_clean_name} Share Price is in Focus Today: Q2 Results & PDF Earnings Breakdown",
-      "body": "150-170 words of 100% original financial journalism in English analyzing the exact numbers extracted from the BSE PDF, YoY profit growth, and operational margins."
+      "heading": "{c_clean_name} Quarterly Filing Breakdown: Revenue, EBITDA & PAT",
+      "body": "140-165 words of original financial journalism explaining exact PDF numbers, YoY percentage changes, and operational drivers."
     }},
     {{
-      "heading": "{c_clean_name} Share Price Target 2026, 2027, 2030 & Fundamental Valuation",
-      "body": "150-170 words in English discussing {c_clean_name} share price target 2026 ({screener_info['target_2026']}) and 2030 ({screener_info['target_2030']}) based on EPS ({screener_info['eps']}), P/E ({screener_info['pe_ratio']}), and Book Value ({screener_info['book_value']})."
+      "heading": "{c_clean_name} Valuation Ratios, 52-Week Range & Balance Sheet Health",
+      "body": "140-165 words objectively examining Stock P/E ({screener_info['pe_ratio']}) vs Industry P/E ({screener_info['industry_pe']}), Book Value ({screener_info['book_value']}), ROE ({screener_info['roe']}), and Total Debt ({screener_info['total_debt']})."
     }},
     {{
-      "heading": "Is {c_clean_name} Share a Good Buy for Long Term? Debt-to-Equity & ROE Analysis",
-      "body": "130-150 words in English evaluating Total Debt ({screener_info['total_debt']}), Debt-to-Equity ({screener_info['debt_to_equity']}), ROE ({screener_info['roe']}), and key triggers."
+      "heading": "Key Factors Investors Should Track Ahead",
+      "body": "110-140 words outlining execution milestones, margin sustainability, and working capital risks without giving buy/sell advice."
     }}
   ],
   "faqs": [
     {{
-      "q": "What is the {c_clean_name} share price target for 2026, 2027, and 2030?",
-      "a": "Direct 2-sentence answer in English citing valuation bands ({screener_info['target_2026']} for 2026 and {screener_info['target_2030']} for 2030) based on EPS and ROE."
+      "q": "What did {c_clean_name} report in its latest BSE filing?",
+      "a": "Direct 2-sentence factual answer with exact verified Revenue, EBITDA, and Net Profit (or Order Value) from the PDF."
     }},
     {{
-      "q": "How were {c_clean_name} Q2 results according to the official BSE PDF?",
-      "a": "Direct 2-sentence answer in English with exact Revenue, EBITDA, and Net Profit YoY numbers from the PDF."
+      "q": "What is the debt-to-equity ratio and total debt of {c_clean_name}?",
+      "a": "Direct factual answer citing Total Debt of {screener_info['total_debt']} and Debt-to-Equity of {screener_info['debt_to_equity']}."
     }},
     {{
-      "q": "Is {c_clean_name} a debt-free stock?",
-      "a": "Direct answer in English citing Total Debt of {screener_info['total_debt']} and Debt-to-Equity of {screener_info['debt_to_equity']}."
-    }},
-    {{
-      "q": "Is {c_clean_name} share a good buy for long term investment?",
-      "a": "Direct answer in English comparing Stock P/E ({screener_info['pe_ratio']}) with Industry P/E ({screener_info['industry_pe']}) and ROE ({screener_info['roe']})."
+      "q": "How does {c_clean_name}'s valuation compare with its industry peers?",
+      "a": "Direct factual answer comparing Stock P/E ({screener_info['pe_ratio']}), Industry P/E ({screener_info['industry_pe']}), and ROE ({screener_info['roe']})."
     }}
   ],
-  "gujarati_summary": "3-4 sentences in natural Gujarati summarizing {c_clean_name}'s exact PDF result (YoY) or new order, keeping company name and numbers in English.",
-  "gujarati_intraday_view": "2-3 sentences in natural Gujarati explaining debt, P/E valuation, and 2026-2030 target outlook."
+  "gujarati_summary": "3-4 natural Gujarati sentences summarizing exact PDF YoY results or order details (keep company name and numbers in English).",
+  "gujarati_balance_view": "2 natural Gujarati sentences summarizing Debt-to-Equity, P/E, and ROE factually without target promises."
 }}
 
 Supplementary Extracted Text from Filing (if any):
@@ -1218,7 +1117,7 @@ Supplementary Extracted Text from Filing (if any):
 
 
 # ==========================================
-# 9. VISUAL CHARTS & 5-LANGUAGE SWITCHER (TEXT & HIGHLIGHTS FIRST)
+# 8. CHARTS & THEME-SYNCED 3-LANGUAGE HTML BUILDER
 # ==========================================
 def build_quarterly_column_chart_url(comp_name, labels, rev_list, gp_list, np_list):
     datasets = [
@@ -1242,7 +1141,7 @@ def build_quarterly_column_chart_url(comp_name, labels, rev_list, gp_list, np_li
     return f"https://quickchart.io/chart?w=750&h=420&bkg=white&c={urllib.parse.quote(json.dumps(chart_config))}"
 
 
-def build_yoy_comparison_chart_url(comp_name, qtr_lbl, prev_lbl, curr_lbl, rev, gp, np_d, debt_comp):
+def build_yoy_comparison_chart_url(comp_name, prev_lbl, curr_lbl, rev, gp, np_d, debt_comp):
     labels = ["Revenue", "EBITDA", "Net Profit", "Total Debt"]
     curr_data = [to_float(rev.get("curr")), to_float(gp.get("curr")), to_float(np_d.get("curr")), to_float(debt_comp.get("curr"))]
     prev_data = [to_float(rev.get("prev")), to_float(gp.get("prev")), to_float(np_d.get("prev")), to_float(debt_comp.get("prev"))]
@@ -1267,34 +1166,32 @@ def build_yoy_comparison_chart_url(comp_name, qtr_lbl, prev_lbl, curr_lbl, rev, 
     return f"https://quickchart.io/chart?w=750&h=420&bkg=white&c={urllib.parse.quote(json.dumps(chart_config))}"
 
 
-def _render_top_intro_panel_html(lang_code, summary_label, highlight_label, badge_title, lead_txt, high_list, hooks_list):
-    """
-    ભાષાના બટનની તરત જ નીચે (ફોટો અને ટેબલની પહેલાં) લખાણ અને મુખ્ય હાઇલાઇટ્સ બતાવે છે.
-    """
+def _render_top_intro_panel_html(lang_code, is_default, summary_label, highlight_label, badge_title, lead_txt, high_list, hooks_list):
+    disp = "block" if is_default else "none"
+    hid = "" if is_default else ' hidden="hidden"'
     high_li = "".join(f"<li style='margin-bottom:8px; color:#1e293b; line-height:1.65;'>{html.escape(str(k))}</li>" for k in high_list if k)
     hook_li = "".join(f"<li style='margin-bottom:8px;'>{html.escape(str(h))}</li>" for h in hooks_list if h)
 
     return f"""
-    <div class="mm-top-panel mm-top-{lang_code}" lang="{lang_code}">
-      <p style="font-size: 15.5px; line-height: 1.75; color: #0f172a; background: #f8fafc; padding: 14px 16px; border-radius: 10px; border-left: 4px solid #2563eb; border: 1px solid #cbd5e1; border-left-width: 5px; margin-bottom: 16px;">
-        <strong>{summary_label}:</strong> {html.escape(str(lead_txt))}
+    <div class="mm-lang-sec" data-mm-lang="{lang_code}" lang="{lang_code}" style="display:{disp};"{hid}>
+      <p style="font-size: 15.5px; line-height: 1.75; color: #0f172a; background: #f8fafc; padding: 14px 16px; border-radius: 10px; border: 1px solid #cbd5e1; border-left: 5px solid #2563eb; margin-bottom: 16px;">
+        <strong>{html.escape(summary_label)}:</strong> {html.escape(str(lead_txt))}
       </p>
-      <div style="background: #f8fafc; border-left: 5px solid #16a34a; border-radius: 10px; padding: 14px 18px; margin-bottom: 18px; border: 1px solid #e2e8f0; border-left-width: 5px;">
-        <h2 style="margin: 0 0 8px 0; font-size: 17.5px; color: #0f172a;">📌 {highlight_label}</h2>
+      <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-left: 5px solid #16a34a; border-radius: 10px; padding: 14px 18px; margin-bottom: 18px;">
+        <h2 style="margin: 0 0 8px 0; font-size: 17.5px; color: #0f172a;">📌 {html.escape(highlight_label)}</h2>
         <ul style="margin: 0; padding-left: 18px; font-size: 14.5px; font-weight: 500;">{high_li}</ul>
       </div>
       <div style="background: linear-gradient(135deg, #1e3a8a, #2563eb); color: white; border-radius: 14px; padding: 16px 18px; margin-bottom: 20px; box-shadow: 0 4px 12px rgba(37, 99, 235, 0.2);">
-        <h3 style="margin: 0 0 10px 0; font-size: 17px; border-bottom: 1px solid #93c5fd; padding-bottom: 6px; color: white;">⚡ {badge_title}</h3>
+        <h3 style="margin: 0 0 10px 0; font-size: 17px; border-bottom: 1px solid #93c5fd; padding-bottom: 6px; color: white;">⚡ {html.escape(badge_title)}</h3>
         <ul style="margin: 0; padding-left: 18px; font-size: 14px; font-weight: 500; line-height: 1.65;">{hook_li}</ul>
       </div>
     </div>
     """
 
 
-def _render_bottom_analysis_panel_html(lang_code, faq_label, sections_list, faqs_list):
-    """
-    ટેબલ અને ચાર્ટ્સની નીચે તે જ સિલેક્ટ કરેલી ભાષામાં ઊંડાણપૂર્વકનું વિશ્લેષણ અને FAQs બતાવે છે.
-    """
+def _render_bottom_analysis_panel_html(lang_code, is_default, faq_label, sections_list, faqs_list):
+    disp = "block" if is_default else "none"
+    hid = "" if is_default else ' hidden="hidden"'
     sec_html = ""
     for s in sections_list:
         if s.get("body"):
@@ -1314,72 +1211,74 @@ def _render_bottom_analysis_panel_html(lang_code, faq_label, sections_list, faqs
             )
 
     return f"""
-    <div class="mm-bot-panel mm-bot-{lang_code}" lang="{lang_code}">
+    <div class="mm-lang-sec" data-mm-lang="{lang_code}" lang="{lang_code}" style="display:{disp};"{hid}>
       {sec_html}
       <div style="margin: 22px 0;">
-        <h3 style="font-size: 18px; color: #0f172a; margin-bottom: 12px;">❓ {faq_label}</h3>
+        <h2 style="font-size: 18px; color: #0f172a; margin-bottom: 12px;">❓ {html.escape(faq_label)}</h2>
         {faq_html}
       </div>
     </div>
     """
 
 
-def build_post_html(data, doc_type, screener_info, source_url, trending_kws, comp_key="", scrip_key="", file_key="", scrip_code=""):
-    comp_name = html.escape(str(data.get("company_short_name", "Company")))
+def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scrip_key="", file_key="", scrip_code=""):
+    comp_name_raw = html.unescape(str(data.get("company_short_name", "Company"))).strip()
+    comp_name = html.escape(comp_name_raw)
     res_date = html.escape(str(data.get("result_date", datetime.now().strftime("%B %d, %Y"))))
     ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
     ist_time_str = ist_now.strftime("%B %d, %Y | %I:%M %p IST")
     iso_time = ist_now.strftime("%Y-%m-%dT%H:%M:%S+05:30")
 
     price_disp = html.escape(str(data.get("price_display", screener_info["price_str"])))
-    qtr_lbl = html.escape(str(data.get("quarter_label", "Q2 / Quarterly")))
+    qtr_lbl = html.escape(str(data.get("quarter_label", "Quarterly")))
     curr_lbl = html.escape(shorten_period_label(data.get("curr_period_label", "Sep 2026")))
     prev_lbl = html.escape(shorten_period_label(data.get("prev_period_label", "Sep 2025")))
     res_type = html.escape(str(data.get("result_type", "Consolidated")))
 
-    mkt_cap = html.escape(str(data.get("market_cap") or screener_info["market_cap"]))
-    pe_ratio = html.escape(str(data.get("pe_ratio") or screener_info["pe_ratio"]))
-    pb_ratio = html.escape(str(data.get("pb_ratio") or screener_info["pb_ratio"]))
-    ind_pe = html.escape(str(data.get("industry_pe") or screener_info["industry_pe"]))
-    roe = html.escape(str(data.get("roe") or screener_info["roe"]))
-    eps = html.escape(str(data.get("eps") or screener_info["eps"]))
-    div_yield = html.escape(str(data.get("div_yield") or screener_info["div_yield"]))
-    book_value = html.escape(str(data.get("book_value") or screener_info["book_value"]))
-    total_debt = html.escape(str(data.get("total_debt") or screener_info["total_debt"]))
-    de_ratio = html.escape(str(data.get("debt_to_equity") or screener_info["debt_to_equity"]))
-    face_val = html.escape(str(data.get("face_value") or screener_info["face_value"]))
+    mkt_cap = html.escape(str(screener_info["market_cap"]))
+    pe_ratio = html.escape(str(screener_info["pe_ratio"]))
+    pb_ratio = html.escape(str(screener_info["pb_ratio"]))
+    ind_pe = html.escape(str(screener_info["industry_pe"]))
+    roe = html.escape(str(screener_info["roe"]))
+    eps = html.escape(str(screener_info["eps"]))
+    div_yield = html.escape(str(screener_info["div_yield"]))
+    book_value = html.escape(str(screener_info["book_value"]))
+    total_debt = html.escape(str(screener_info["total_debt"]))
+    de_ratio = html.escape(str(screener_info["debt_to_equity"]))
+    face_val = html.escape(str(screener_info["face_value"]))
     high_52w = html.escape(str(screener_info.get("high_52w", "N/A")))
     low_52w = html.escape(str(screener_info.get("low_52w", "N/A")))
+    dist_high = html.escape(str(screener_info.get("dist_from_high", "N/A")))
+    dist_low = html.escape(str(screener_info.get("dist_from_low", "N/A")))
     fund_impact = html.escape(str(data.get("fundamental_impact_note", "")))
-    intraday_sig = html.escape(str(data.get("intraday_signal", "")))
+    market_pos = html.escape(str(data.get("market_position_note", "")))
 
-    seed_int = int(hashlib.md5((comp_name + res_date).encode("utf-8")).hexdigest()[:6], 16)
-    uid = str(seed_int)[:5]
-    thumb_prompt = f"modern 3d financial stock market analytics chart infographic upward trend corporate building india {comp_name}"
+    seed_int = int(hashlib.md5((comp_name_raw + res_date).encode("utf-8")).hexdigest()[:6], 16)
+    uid = str(seed_int)[:6]
+    thumb_prompt = f"modern 3d financial stock market analytics chart clean corporate india {comp_name_raw}"
     thumb_url = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(thumb_prompt)}?width=1200&height=675&seed={seed_int}&nologo=true"
 
-    # 1. UNIVERSAL ENGLISH FINANCIAL TABLES & CHARTS (PLACED BELOW INTRO TEXT & HIGHLIGHTS)
     universal_data_blocks = []
 
     if doc_type == "order":
         ord_info = data.get("order_details", {}) or {}
         order_card = f"""
         <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 16px; padding: 20px; margin-bottom: 24px;">
-          <h2 style="margin: 0 0 14px 0; font-size: 19px; color: #1e3a8a;">🏆 {comp_name} Latest Order Win &amp; Contract Details</h2>
+          <h2 style="margin: 0 0 14px 0; font-size: 19px; color: #1e3a8a;">🏆 {comp_name} Official Order Win &amp; Contract Details</h2>
           <p style="margin: 8px 0; font-size: 15px;"><strong>Company Name:</strong> {comp_name} ({price_disp})</p>
           <p style="margin: 8px 0; font-size: 15px;"><strong>Client / Awarding Authority:</strong> {html.escape(str(ord_info.get("client_or_awarder", "Disclosed in Filing")))}</p>
           <p style="margin: 8px 0; font-size: 15px;"><strong>Order / Contract Value:</strong> <span style="color:#16a34a; font-weight:700;">{html.escape(str(ord_info.get("order_value", "As per BSE Filing")))}</span></p>
-          <p style="margin: 8px 0; font-size: 15px;"><strong>Order Size vs Market Cap:</strong> {html.escape(str(ord_info.get("order_to_mcap_ratio", "Significant Revenue Visibility")))}</p>
-          <p style="margin: 8px 0; font-size: 15px;"><strong>Nature of Work / Scope:</strong> {html.escape(str(ord_info.get("scope_of_work", "Execution of commercial order/contract")))}</p>
+          <p style="margin: 8px 0; font-size: 15px;"><strong>Order Size vs Market Cap:</strong> {html.escape(str(ord_info.get("order_to_mcap_ratio", "Disclosed in Filing")))}</p>
+          <p style="margin: 8px 0; font-size: 15px;"><strong>Nature of Work / Scope:</strong> {html.escape(str(ord_info.get("scope_of_work", "Commercial execution contract")))}</p>
           <p style="margin: 8px 0; font-size: 15px;"><strong>Execution Timeline:</strong> {html.escape(str(ord_info.get("execution_timeline", "As per contract terms")))}</p>
         </div>
         """
         universal_data_blocks.append(order_card)
         yoy_chart_url = ""
     else:
-        rev = data.get("revenue", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
-        gp = data.get("gross_profit", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
-        np_d = data.get("net_profit", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
+        rev = data.get("revenue", {"curr": "0", "prev": "0", "growth": "N/A", "difference": "0 Cr"})
+        gp = data.get("gross_profit", {"curr": "0", "prev": "0", "growth": "N/A", "difference": "0 Cr"})
+        np_d = data.get("net_profit", {"curr": "0", "prev": "0", "growth": "N/A", "difference": "0 Cr"})
         debt_comp = data.get("debt_comparison") or {"curr": screener_info["curr_debt_num"], "prev": screener_info["prev_debt_num"]}
 
         q_labels = data.get("quarter_chart_labels") or [prev_lbl, curr_lbl]
@@ -1387,18 +1286,18 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
         q_gp = data.get("quarter_chart_gross_profit") or [to_float(gp.get("prev")), to_float(gp.get("curr"))]
         q_np = data.get("quarter_chart_net_profit") or [to_float(np_d.get("prev")), to_float(np_d.get("curr"))]
 
-        quarter_chart_url = build_quarterly_column_chart_url(comp_name, q_labels, q_rev, q_gp, q_np)
-        yoy_chart_url = build_yoy_comparison_chart_url(comp_name, qtr_lbl, prev_lbl, curr_lbl, rev, gp, np_d, debt_comp)
+        quarter_chart_url = build_quarterly_column_chart_url(comp_name_raw, q_labels, q_rev, q_gp, q_np)
+        yoy_chart_url = build_yoy_comparison_chart_url(comp_name_raw, prev_lbl, curr_lbl, rev, gp, np_d, debt_comp)
 
         def growth_color(growth_str):
             return "#dc2626" if "-" in str(growth_str) else "#16a34a"
 
         result_card = f"""
         <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 14px; box-shadow: 0 4px 14px rgba(0,0,0,0.05); margin-bottom: 24px; box-sizing: border-box;">
-          <h2 style="margin: 0 0 8px 0; font-size: 18px; color: #0f172a; line-height: 1.35;">📊 {comp_name} {qtr_lbl} Official BSE PDF Results Table ({res_type})</h2>
+          <h2 style="margin: 0 0 8px 0; font-size: 18px; color: #0f172a; line-height: 1.35;">📊 {comp_name} {qtr_lbl} Official BSE PDF Results ({res_type})</h2>
           <div style="display: flex; justify-content: space-between; align-items: center; color: #64748b; font-size: 12px; margin-bottom: 10px;">
             <span>{res_date} | Price: <strong style="color:#0f172a;">{price_disp}</strong></span>
-            <span>Figures in ₹ Cr.</span>
+            <span>Figures in ₹ Cr</span>
           </div>
           <div style="width: 100%; overflow-x: auto;">
             <table style="width: 100%; border-collapse: collapse; font-size: 12.5px; text-align: right;">
@@ -1417,84 +1316,51 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
                   <td style="padding: 10px 4px; font-weight: 600; white-space: nowrap;">₹{html.escape(str(rev.get('curr', '0')))}</td>
                   <td style="padding: 10px 4px; color: #64748b; white-space: nowrap;">₹{html.escape(str(rev.get('prev', '0')))}</td>
                   <td style="padding: 10px 4px; font-weight: 600; white-space: nowrap;">{html.escape(str(rev.get('difference', '0')))}</td>
-                  <td style="padding: 10px 4px; font-weight: 700; white-space: nowrap; color: {growth_color(rev.get('growth', ''))};">{html.escape(str(rev.get('growth', '0%')))}</td>
+                  <td style="padding: 10px 4px; font-weight: 700; white-space: nowrap; color: {growth_color(rev.get('growth', ''))};">{html.escape(str(rev.get('growth', 'N/A')))}</td>
                 </tr>
                 <tr style="border-bottom: 1px solid #f1f5f9;">
                   <td style="text-align: left; padding: 10px 4px; color: #1e293b; font-weight: 600; white-space: nowrap;">EBITDA</td>
                   <td style="padding: 10px 4px; font-weight: 600; white-space: nowrap;">₹{html.escape(str(gp.get('curr', '0')))}</td>
                   <td style="padding: 10px 4px; color: #64748b; white-space: nowrap;">₹{html.escape(str(gp.get('prev', '0')))}</td>
                   <td style="padding: 10px 4px; font-weight: 600; white-space: nowrap;">{html.escape(str(gp.get('difference', '0')))}</td>
-                  <td style="padding: 10px 4px; font-weight: 700; white-space: nowrap; color: {growth_color(gp.get('growth', ''))};">{html.escape(str(gp.get('growth', '0%')))}</td>
+                  <td style="padding: 10px 4px; font-weight: 700; white-space: nowrap; color: {growth_color(gp.get('growth', ''))};">{html.escape(str(gp.get('growth', 'N/A')))}</td>
                 </tr>
                 <tr>
                   <td style="text-align: left; padding: 10px 4px; color: #1e293b; font-weight: 600; white-space: nowrap;">Net Profit (PAT)</td>
                   <td style="padding: 10px 4px; font-weight: 600; white-space: nowrap;">₹{html.escape(str(np_d.get('curr', '0')))}</td>
                   <td style="padding: 10px 4px; color: #64748b; white-space: nowrap;">₹{html.escape(str(np_d.get('prev', '0')))}</td>
                   <td style="padding: 10px 4px; font-weight: 600; white-space: nowrap;">{html.escape(str(np_d.get('difference', '0')))}</td>
-                  <td style="padding: 10px 4px; font-weight: 700; white-space: nowrap; color: {growth_color(np_d.get('growth', ''))};">{html.escape(str(np_d.get('growth', '0%')))}</td>
+                  <td style="padding: 10px 4px; font-weight: 700; white-space: nowrap; color: {growth_color(np_d.get('growth', ''))};">{html.escape(str(np_d.get('growth', 'N/A')))}</td>
                 </tr>
               </tbody>
             </table>
           </div>
         </div>
-        
+
         <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 16px; margin-bottom: 24px; text-align: center;">
           <h3 style="margin: 0 0 12px 0; font-size: 17px; color: #0f172a;">📈 {comp_name} YoY Revenue, PAT &amp; Debt Chart</h3>
-          <img src="{yoy_chart_url}" alt="{comp_name} Q2 Results YoY Chart" width="750" height="420" loading="lazy" style="max-width: 100%; height: auto; border-radius: 8px;" />
+          <img src="{yoy_chart_url}" alt="{comp_name} Quarterly Results YoY Chart" width="750" height="420" loading="lazy" style="max-width: 100%; height: auto; border-radius: 8px;" />
         </div>
         <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 16px; margin-bottom: 24px; text-align: center;">
           <h3 style="margin: 0 0 12px 0; font-size: 17px; color: #0f172a;">📊 {comp_name} Multi-Quarter Earnings Trend</h3>
-          <img src="{quarter_chart_url}" alt="{comp_name} Quarterly Profit Trend" width="750" height="420" loading="lazy" style="max-width: 100%; height: auto; border-radius: 8px;" />
+          <img src="{quarter_chart_url}" alt="{comp_name} Multi-Quarter Profit Trend" width="750" height="420" loading="lazy" style="max-width: 100%; height: auto; border-radius: 8px;" />
         </div>
         """
         universal_data_blocks.append(result_card)
 
-    if screener_info.get("target_2026") and screener_info["target_2026"] != "N/A":
-        target_table_card = f"""
-        <div style="background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 16px; padding: 16px; margin-bottom: 24px; box-sizing: border-box;">
-          <h2 style="margin: 0 0 10px 0; font-size: 18px; color: #166534;">🎯 {comp_name} Share Price Target 2026, 2027 to 2030</h2>
-          <p style="margin: 0 0 12px 0; font-size: 13.5px; color: #15803d;">
-            EPS: <strong>{eps}</strong> | ROE: <strong>{roe}</strong> | Book Value: <strong>{book_value}</strong> | Stock P/E: <strong>{pe_ratio}</strong>
-          </p>
-          <table style="width: 100%; border-collapse: collapse; font-size: 13px; background: #ffffff; border-radius: 8px; overflow: hidden;">
-            <thead>
-              <tr style="background: #dcfce7; color: #14532d; font-weight: 700;">
-                <th style="padding: 8px; text-align: left; border: 1px solid #bbf7d0;">Timeline</th>
-                <th style="padding: 8px; text-align: right; border: 1px solid #bbf7d0;">Valuation Band</th>
-                <th style="padding: 8px; text-align: left; border: 1px solid #bbf7d0;">Catalyst</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr>
-                <td style="padding: 8px; font-weight: 600; border: 1px solid #e2e8f0;">Target 2026</td>
-                <td style="padding: 8px; text-align: right; font-weight: 700; color: #16a34a; border: 1px solid #e2e8f0;">{html.escape(screener_info['target_2026'])}</td>
-                <td style="padding: 8px; border: 1px solid #e2e8f0;">PAT growth &amp; order book</td>
-              </tr>
-              <tr>
-                <td style="padding: 8px; font-weight: 600; border: 1px solid #e2e8f0;">Target 2027</td>
-                <td style="padding: 8px; text-align: right; font-weight: 700; color: #16a34a; border: 1px solid #e2e8f0;">{html.escape(screener_info['target_2027'])}</td>
-                <td style="padding: 8px; border: 1px solid #e2e8f0;">EBITDA margin &amp; ROE</td>
-              </tr>
-              <tr>
-                <td style="padding: 8px; font-weight: 600; border: 1px solid #e2e8f0;">Target 2030</td>
-                <td style="padding: 8px; text-align: right; font-weight: 700; color: #16a34a; border: 1px solid #e2e8f0;">{html.escape(screener_info['target_2030'])}</td>
-                <td style="padding: 8px; border: 1px solid #e2e8f0;">Long-term compounding</td>
-              </tr>
-            </tbody>
-          </table>
-          <p style="margin: 8px 0 0 0; font-size: 12px; color: #475569;"><em>*Educational valuation estimates based on earnings multiples, not investment advice.</em></p>
-        </div>
-        """
-        universal_data_blocks.append(target_table_card)
-
+    # Factual Valuation & 52-Week Positioning Card (No fabricated 2026-2030 targets)
     fundamentals_card = f"""
     <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 16px; box-shadow: 0 4px 14px rgba(0,0,0,0.05); margin-bottom: 24px; box-sizing: border-box;">
-      <h2 style="margin: 0 0 14px 0; font-size: 18px; color: #0f172a;">🔍 {comp_name} Fundamental Ratios &amp; 52W High/Low</h2>
+      <h2 style="margin: 0 0 14px 0; font-size: 18px; color: #0f172a;">🔍 {comp_name} Valuation Ratios &amp; 52-Week Range</h2>
       <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
         <tbody>
           <tr style="border-bottom: 1px solid #f1f5f9;">
             <td style="padding: 8px 4px; color: #64748b;">Share Price</td><td style="padding: 8px 4px; text-align: right; font-weight: 700; color: #0f172a;">{price_disp}</td>
             <td style="padding: 8px 4px; color: #64748b; border-left: 1px solid #f1f5f9;">52W High / Low</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{high_52w} / {low_52w}</td>
+          </tr>
+          <tr style="border-bottom: 1px solid #f1f5f9;">
+            <td style="padding: 8px 4px; color: #64748b;">52W Position</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{dist_high}</td>
+            <td style="padding: 8px 4px; color: #64748b; border-left: 1px solid #f1f5f9;">Recovery from Low</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #16a34a;">{dist_low}</td>
           </tr>
           <tr style="border-bottom: 1px solid #f1f5f9;">
             <td style="padding: 8px 4px; color: #64748b;">Market Cap</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{mkt_cap}</td>
@@ -1514,233 +1380,146 @@ def build_post_html(data, doc_type, screener_info, source_url, trending_kws, com
           </tr>
         </tbody>
       </table>
-      <p style="margin: 10px 0 0 0; font-size: 13.5px; color: #334155;"><strong>Technical &amp; Fundamental View:</strong> {intraday_sig} {fund_impact}</p>
+      <p style="margin: 10px 0 0 0; font-size: 13.5px; color: #334155;"><strong>Fundamental Overview:</strong> {market_pos} {fund_impact}</p>
     </div>
     """
     universal_data_blocks.append(fundamentals_card)
 
-    # 2. GENERATE 5-LANGUAGE PACKS (GUJARATI, HINDI, TELUGU, TAMIL & ENGLISH)
+    # 3-Language Packs (GU, EN, HI)
     lang_packs = build_multilang_pack(data)
 
-    # TOP PANELS (Text, Highlights & Web Story Summary BEFORE the image & tables)
-    top_gu = _render_top_intro_panel_html(
-        "gu",
-        "સારાંશ (Executive Summary)",
-        "રોકાણકારો માટે મુખ્ય નાણાકીય હાઇલાઇટ્સ",
-        f"{comp_name} ક્વિક હાઇલાઇટ્સ (ગુજરાતી સારાંશ)",
-        lang_packs["gu"]["lead"],
-        lang_packs["gu"]["highlights"],
-        lang_packs["gu"]["hooks"],
-    )
-    top_hi = _render_top_intro_panel_html(
-        "hi",
-        "सारांश (Executive Summary)",
-        "निवेशकों के लिए प्रमुख वित्तीय हाइलाइट्स",
-        f"{comp_name} मुख्य हाइलाइट्स (हिंदी सारांश)",
-        lang_packs["hi"]["lead"],
-        lang_packs["hi"]["highlights"],
-        lang_packs["hi"]["hooks"],
-    )
-    top_en = _render_top_intro_panel_html(
-        "en",
-        "Executive Summary",
-        "Key Financial Highlights for Investors",
-        f"{comp_name} Quick Highlights (Web Story Summary)",
-        data.get("seo_lead_summary", ""),
-        data.get("key_highlights", []),
-        data.get("web_story_hook", []),
-    )
-    top_te = _render_top_intro_panel_html(
-        "te",
-        "సారాంశం (Executive Summary)",
-        "పెట్టుబడిదారులకు కీలక ఆర్థిక అంశాలు",
-        f"{comp_name} ముఖ్యాంశాలు (తెలుగు సారాంశం)",
-        lang_packs["te"]["lead"],
-        lang_packs["te"]["highlights"],
-        lang_packs["te"]["hooks"],
-    )
-    top_ta = _render_top_intro_panel_html(
-        "ta",
-        "சுருக்கம் (Executive Summary)",
-        "முதலீட்டாளர்களுக்கான முக்கிய நிதி அம்சங்கள்",
-        f"{comp_name} முக்கிய சிறப்பம்சங்கள் (தமிழ் சுருக்கம்)",
-        lang_packs["ta"]["lead"],
-        lang_packs["ta"]["highlights"],
-        lang_packs["ta"]["hooks"],
-    )
+    top_gu = _render_top_intro_panel_html("gu", True, "સારાંશ (Executive Summary)", "રોકાણકારો માટે મુખ્ય નાણાકીય હાઇલાઇટ્સ", f"{comp_name_raw} ક્વિક હાઇલાઇટ્સ", lang_packs["gu"]["lead"], lang_packs["gu"]["highlights"], lang_packs["gu"]["hooks"])
+    top_en = _render_top_intro_panel_html("en", False, "Executive Summary", "Key Financial Highlights for Investors", f"{comp_name_raw} Quick Highlights", lang_packs["en"]["lead"], lang_packs["en"]["highlights"], lang_packs["en"]["hooks"])
+    top_hi = _render_top_intro_panel_html("hi", False, "सारांश (Executive Summary)", "निवेशकों के लिए प्रमुख वित्तीय हाइलाइट्स", f"{comp_name_raw} मुख्य हाइलाइट्स", lang_packs["hi"]["lead"], lang_packs["hi"]["highlights"], lang_packs["hi"]["hooks"])
 
-    # BOTTOM PANELS (Deep Article Analysis & FAQs BELOW the tables & charts)
-    bot_gu = _render_bottom_analysis_panel_html("gu", f"{comp_name} શેર વિશે વારંવાર પૂછાતા પ્રશ્નો (FAQs)", lang_packs["gu"]["sections"], lang_packs["gu"]["faqs"])
-    bot_hi = _render_bottom_analysis_panel_html("hi", f"{comp_name} शेयर से जुड़े महत्वपूर्ण प्रश्न (FAQs)", lang_packs["hi"]["sections"], lang_packs["hi"]["faqs"])
-    bot_en = _render_bottom_analysis_panel_html("en", f"Frequently Asked Questions ({comp_name} Share FAQs)", data.get("seo_article_sections", []), data.get("faqs", []))
-    bot_te = _render_bottom_analysis_panel_html("te", f"{comp_name} షేర్ తరచుగా అడిగే ప్రశ్నలు (FAQs)", lang_packs["te"]["sections"], lang_packs["te"]["faqs"])
-    bot_ta = _render_bottom_analysis_panel_html("ta", f"{comp_name} பங்கு அடிக்கடி கேட்கப்படும் கேள்விகள் (FAQs)", lang_packs["ta"]["sections"], lang_packs["ta"]["faqs"])
-
-    # Pure CSS Language Switcher at the very top, followed by Text & Highlights FIRST, then Image, Tables & Deep Analysis
-    switcher_css_and_html = f"""
-    <style>
-      .mm-lang-wrap-{uid} input[type="radio"] {{ display: none !important; }}
-      .mm-lang-bar-{uid} {{
-        display: flex; flex-wrap: wrap; gap: 6px; background: #eff6ff; padding: 10px;
-        border-radius: 12px; border: 1px solid #bfdbfe; margin-bottom: 16px; align-items: center;
-      }}
-      .mm-lang-bar-{uid} label {{
-        cursor: pointer; padding: 7px 13px; border-radius: 20px; font-size: 13.5px; font-weight: 700;
-        background: #ffffff; color: #1e3a8a; border: 1px solid #93c5fd; transition: all 0.2s ease;
-        user-select: none; box-shadow: 0 1px 2px rgba(0,0,0,0.04);
-      }}
-      .mm-lang-wrap-{uid} .mm-top-panel,
-      .mm-lang-wrap-{uid} .mm-bot-panel {{ display: none; }}
-      #mm-gu-{uid}:checked ~ .mm-lang-bar-{uid} label[for="mm-gu-{uid}"],
-      #mm-hi-{uid}:checked ~ .mm-lang-bar-{uid} label[for="mm-hi-{uid}"],
-      #mm-en-{uid}:checked ~ .mm-lang-bar-{uid} label[for="mm-en-{uid}"],
-      #mm-te-{uid}:checked ~ .mm-lang-bar-{uid} label[for="mm-te-{uid}"],
-      #mm-ta-{uid}:checked ~ .mm-lang-bar-{uid} label[for="mm-ta-{uid}"] {{
-        background: #1d4ed8 !important; color: #ffffff !important; border-color: #1e40af !important;
-        box-shadow: 0 3px 8px rgba(29, 78, 216, 0.3);
-      }}
-      #mm-gu-{uid}:checked ~ .mm-top-panels-{uid} .mm-top-gu,
-      #mm-gu-{uid}:checked ~ .mm-bot-panels-{uid} .mm-bot-gu {{ display: block !important; }}
-      #mm-hi-{uid}:checked ~ .mm-top-panels-{uid} .mm-top-hi,
-      #mm-hi-{uid}:checked ~ .mm-bot-panels-{uid} .mm-bot-hi {{ display: block !important; }}
-      #mm-en-{uid}:checked ~ .mm-top-panels-{uid} .mm-top-en,
-      #mm-en-{uid}:checked ~ .mm-bot-panels-{uid} .mm-bot-en {{ display: block !important; }}
-      #mm-te-{uid}:checked ~ .mm-top-panels-{uid} .mm-top-te,
-      #mm-te-{uid}:checked ~ .mm-bot-panels-{uid} .mm-bot-te {{ display: block !important; }}
-      #mm-ta-{uid}:checked ~ .mm-top-panels-{uid} .mm-top-ta,
-      #mm-ta-{uid}:checked ~ .mm-bot-panels-{uid} .mm-bot-ta {{ display: block !important; }}
-    </style>
-
-    <div class="mm-lang-wrap-{uid}">
-      <input type="radio" name="mm-lang-{uid}" id="mm-gu-{uid}" checked="checked" />
-      <input type="radio" name="mm-lang-{uid}" id="mm-hi-{uid}" />
-      <input type="radio" name="mm-lang-{uid}" id="mm-en-{uid}" />
-      <input type="radio" name="mm-lang-{uid}" id="mm-te-{uid}" />
-      <input type="radio" name="mm-lang-{uid}" id="mm-ta-{uid}" />
-
-      <div class="mm-lang-bar-{uid}">
-        <span style="font-size: 13px; font-weight: 700; color: #1e3a8a; margin-right: 4px;">🌐 ભાષા બદલો / Language:</span>
-        <label for="mm-gu-{uid}">🇮🇳 ગુજરાતી</label>
-        <label for="mm-hi-{uid}">🇮🇳 हिन्दी</label>
-        <label for="mm-en-{uid}">🌐 English</label>
-        <label for="mm-te-{uid}">🇮🇳 తెలుగు</label>
-        <label for="mm-ta-{uid}">🇮🇳 தமிழ்</label>
-      </div>
-
-      <!-- STEP 1: TEXT SUMMARY & HIGHLIGHTS FIRST -->
-      <div class="mm-top-panels-{uid}">
-        {top_gu}
-        {top_hi}
-        {top_en}
-        {top_te}
-        {top_ta}
-      </div>
-
-      <!--more-->
-
-      <!-- STEP 2: FEATURE IMAGE AFTER INTRO TEXT & HIGHLIGHTS -->
-      <figure style="margin: 0 0 22px 0; text-align: center;">
-        <img itemprop="image" src="{thumb_url}" alt="{comp_name} Share Price Target 2026 and {qtr_lbl} Results" width="1200" height="675" fetchpriority="high" style="width: 100%; height: auto; aspect-ratio: 16/9; object-fit: cover; border-radius: 12px;" />
-        <figcaption style="font-size: 12px; color: #64748b; margin-top: 6px;">{comp_name} (BSE: {html.escape(str(scrip_code or 'Listed'))}) Share Price Target &amp; Equity Research | MarketMunafa</figcaption>
-      </figure>
-
-      <!-- STEP 3: OFFICIAL BSE PDF RESULTS TABLE, CHARTS & 2026-2030 TARGET TABLE -->
-      {"".join(universal_data_blocks)}
-
-      <!-- STEP 4: DETAILED ANALYSIS & FAQs IN SELECTED LANGUAGE -->
-      <div class="mm-bot-panels-{uid}">
-        {bot_gu}
-        {bot_hi}
-        {bot_en}
-        {bot_te}
-        {bot_ta}
-      </div>
-    </div>
-    """
-
-    faq_schema_entities = []
-    for f_item in (data.get("faqs") or []):
-        if isinstance(f_item, dict) and f_item.get("q") and f_item.get("a"):
-            faq_schema_entities.append({
-                "@type": "Question",
-                "name": str(f_item["q"]).strip(),
-                "acceptedAnswer": {"@type": "Answer", "text": str(f_item["a"]).strip()},
-            })
-
-    kw_badges = "".join(
-        f"<span style='display:inline-block; background:#f1f5f9; color:#334155; border:1px solid #cbd5e1; border-radius:20px; padding:4px 10px; font-size:12px; margin:3px;'>{html.escape(k)}</span>"
-        for k in (trending_kws or [])
-    )
-    trending_kw_html = f"""
-    <div style="margin: 22px 0; padding: 14px; background: #f8fafc; border-radius: 10px; border: 1px solid #e2e8f0;">
-      <strong style="font-size: 13px; color: #0f172a; display: block; margin-bottom: 8px;">🔥 Trending Investor Searches on Google:</strong>
-      {kw_badges}
-    </div>
-    """ if kw_badges else ""
+    bot_gu = _render_bottom_analysis_panel_html("gu", True, f"{comp_name_raw} શેર વિશે વારંવાર પૂછાતા પ્રશ્નો (FAQs)", lang_packs["gu"]["sections"], lang_packs["gu"]["faqs"])
+    bot_en = _render_bottom_analysis_panel_html("en", False, f"Frequently Asked Questions ({comp_name_raw} FAQs)", lang_packs["en"]["sections"], lang_packs["en"]["faqs"])
+    bot_hi = _render_bottom_analysis_panel_html("hi", False, f"{comp_name_raw} शेयर से जुड़े प्रश्न (FAQs)", lang_packs["hi"]["sections"], lang_packs["hi"]["faqs"])
 
     internal_links_html = f"""
     <div style="background: #eff6ff; border: 1px dashed #60a5fa; border-radius: 10px; padding: 14px 16px; margin: 22px 0; font-size: 14px; color: #1e3a8a;">
-      <strong>🔗 Explore More High-Growth Stocks on MarketMunafa:</strong>
+      <strong>🔗 Explore More on Market Munafa:</strong>
       <ul style="margin: 8px 0 0 0; padding-left: 18px; line-height: 1.8;">
-        <li><a href="{BLOG_BASE_URL}/search/label/STOCK%20RESULT" style="color:#1d4ed8; font-weight:600; text-decoration:none;">📊 Latest Q2 &amp; Quarterly Stock Results Analysis</a></li>
-        <li><a href="{BLOG_BASE_URL}/search/label/SHARE%20ORDER" style="color:#1d4ed8; font-weight:600; text-decoration:none;">🏆 New Corporate Order Wins &amp; Share Price Targets</a></li>
-        <li><a href="{BLOG_BASE_URL}/search/label/MARKET%20NEWS" style="color:#1d4ed8; font-weight:600; text-decoration:none;">📰 Daily Multibagger &amp; Debt-Free Stock Picks</a></li>
+        <li><a href="{BLOG_BASE_URL}/search/label/STOCKS%20RESULT" style="color:#1d4ed8; font-weight:600; text-decoration:none;">📊 Latest Quarterly Stocks Results &amp; Analysis</a></li>
+        <li><a href="{BLOG_BASE_URL}/search/label/DEBT%20FREE%2010%20STOCKS" style="color:#1d4ed8; font-weight:600; text-decoration:none;">💎 Debt-Free &amp; Low-Debt Stocks in India</a></li>
+        <li><a href="{BLOG_BASE_URL}/search/label/TOP%2010%20STOCKS" style="color:#1d4ed8; font-weight:600; text-decoration:none;">🏆 Top 10 Stocks to Watch</a></li>
+        <li><a href="{BLOG_BASE_URL}/search/label/MARKET%20NEWS" style="color:#1d4ed8; font-weight:600; text-decoration:none;">📰 Daily Indian Stock Market News</a></li>
       </ul>
     </div>
     """
 
     source_link_html = f'<p style="margin-top:16px;"><a href="{html.escape(source_url, quote=True)}" target="_blank" rel="nofollow noopener" style="color:#2563eb; font-weight:600; text-decoration:none;">📄 Verify Official BSE Exchange Filing PDF</a></p>' if source_url else ""
 
-    faq_schema_json = json.dumps({"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": faq_schema_entities})
-    news_schema_json = json.dumps({
-        "@context": "https://schema.org",
-        "@type": "NewsArticle",
-        "headline": str(data.get("seo_title") or f"{comp_name} Share Price Target 2026 & Q2 Results")[:110],
-        "datePublished": iso_time,
-        "dateModified": iso_time,
-        "image": [thumb_url],
-        "author": [{"@type": "Organization", "name": "MarketMunafa Equity Research Desk", "url": BLOG_BASE_URL}],
-        "publisher": {"@type": "Organization", "name": "MarketMunafa", "url": BLOG_BASE_URL},
-    })
+    meta_desc_clean = html.unescape(str(data.get("meta_description") or data.get("seo_lead_summary") or "")).strip()[:155]
+    headline_clean = html.unescape(str(data.get("seo_title") or f"{comp_name_raw} Quarterly Results & Fundamental Analysis")).strip()[:110]
+
+    faq_schema_entities = []
+    for f_item in (data.get("faqs") or []):
+        if isinstance(f_item, dict) and f_item.get("q") and f_item.get("a"):
+            faq_schema_entities.append({
+                "@type": "Question",
+                "name": html.unescape(str(f_item["q"])).strip(),
+                "acceptedAnswer": {"@type": "Answer", "text": html.unescape(str(f_item["a"])).strip()},
+            })
+
+    schema_bundle = [
+        {
+            "@context": "https://schema.org",
+            "@type": "NewsArticle",
+            "headline": headline_clean,
+            "description": meta_desc_clean,
+            "datePublished": iso_time,
+            "dateModified": iso_time,
+            "image": [thumb_url],
+            "author": {"@type": "Organization", "name": "Market Munafa", "url": BLOG_BASE_URL},
+            "publisher": {"@type": "Organization", "name": "Market Munafa", "url": BLOG_BASE_URL},
+        }
+    ]
+    if faq_schema_entities:
+        schema_bundle.append({"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": faq_schema_entities})
 
     meta_comment = f"<!-- MM_META:type={doc_type}|comp_key={comp_key}|scrip={scrip_key}|file={file_key}|comp_name={comp_name} -->"
 
     html_body = f"""
     {meta_comment}
-    <article itemscope itemtype="https://schema.org/NewsArticle" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 740px; margin: 0 auto; color: #1e293b; box-sizing: border-box;">
-      <div style="font-size: 12px; color: #64748b; margin-bottom: 12px; font-weight: 500;">
-        📅 Published on: <time itemprop="datePublished" datetime="{iso_time}">{ist_time_str}</time> | By <span itemprop="author">MarketMunafa Equity Research Desk</span>
+    <article id="mm-post-{uid}" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 760px; margin: 0 auto; color: #1e293b; box-sizing: border-box;">
+      <style>
+        #mm-post-{uid} .mm-langbar {{
+          display: flex; flex-wrap: wrap; gap: 7px; align-items: center;
+          background: #eff6ff; padding: 10px 12px; border-radius: 10px;
+          border: 1px solid #bfdbfe; margin-bottom: 16px;
+        }}
+        #mm-post-{uid} .mm-lbtn {{
+          cursor: pointer; padding: 6px 14px; border-radius: 20px; font-size: 13.5px; font-weight: 700;
+          background: #ffffff; color: #1e3a8a; border: 1px solid #93c5fd; transition: 0.2s;
+        }}
+        #mm-post-{uid} .mm-lbtn.active, #mm-post-{uid} .mm-lbtn:hover {{
+          background: #1d4ed8; color: #ffffff; border-color: #1e40af;
+        }}
+      </style>
+
+      <div style="font-size: 12.5px; color: #64748b; margin-bottom: 12px; font-weight: 500;">
+        📅 Published on: <time datetime="{iso_time}">{ist_time_str}</time> | By Market Munafa Equity Research Desk
       </div>
-      {switcher_css_and_html}
-      {trending_kw_html}
+
+      <div class="mm-langbar">
+        <span style="font-size: 13px; font-weight: 700; color: #1e3a8a; margin-right: 4px;">🌐 ભાષા / Language:</span>
+        <button type="button" class="mm-lbtn active" onclick="mmSwitchBseLang('{uid}','gu',this)">ગુજરાતી</button>
+        <button type="button" class="mm-lbtn" onclick="mmSwitchBseLang('{uid}','en',this)">English</button>
+        <button type="button" class="mm-lbtn" onclick="mmSwitchBseLang('{uid}','hi',this)">हिन्दी</button>
+      </div>
+
+      <!-- STEP 1: INTRO SUMMARY & HIGHLIGHTS -->
+      {top_gu}
+      {top_en}
+      {top_hi}
+
+      <!--more-->
+
+      <!-- STEP 2: FEATURE IMAGE -->
+      <figure style="margin: 0 0 22px 0; text-align: center;">
+        <img src="{thumb_url}" alt="{comp_name} {qtr_lbl} Financial Analysis" width="1200" height="675" fetchpriority="high" style="width: 100%; height: auto; aspect-ratio: 16/9; object-fit: cover; border-radius: 12px;" />
+        <figcaption style="font-size: 12px; color: #64748b; margin-top: 6px;">{comp_name} (BSE: {html.escape(str(scrip_code or 'Listed'))}) | Market Munafa</figcaption>
+      </figure>
+
+      <!-- STEP 3: OFFICIAL BSE PDF RESULTS TABLE, CHARTS & VALUATION RATIOS -->
+      {"".join(universal_data_blocks)}
+
+      <!-- STEP 4: DETAILED ANALYSIS & FAQs -->
+      {bot_gu}
+      {bot_en}
+      {bot_hi}
+
       {internal_links_html}
       {source_link_html}
-      <script type="application/ld+json">{news_schema_json}</script>
-      <script type="application/ld+json">{faq_schema_json}</script>
+
+      <script type="application/ld+json">{json.dumps(schema_bundle, ensure_ascii=False)}</script>
+      <script>
+        function mmSwitchBseLang(uid, code, btn) {{
+          var root = document.getElementById("mm-post-" + uid);
+          if (!root) return;
+          root.querySelectorAll(".mm-lang-sec").forEach(function(sec) {{
+            var match = sec.getAttribute("data-mm-lang") === code;
+            sec.style.display = match ? "block" : "none";
+            sec.hidden = !match;
+          }});
+          root.querySelectorAll(".mm-lbtn").forEach(function(b) {{ b.classList.remove("active"); }});
+          if (btn) btn.classList.add("active");
+        }}
+      </script>
+
       <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 22px 0;" />
-      <p style="font-size: 12px; color: #64748b; line-height: 1.5;">
-        <strong>Disclaimer &amp; Editorial Policy:</strong> This independent equity research article on MarketMunafa is 100% originally authored in multiple Indian languages using publicly disclosed BSE corporate filings and fundamental ratios for educational purposes only. Valuation projections are algorithmic estimates and not investment advice. We are not SEBI-registered advisors.
+      <p style="font-size: 12px; color: #64748b; line-height: 1.55;">
+        <strong>Disclaimer:</strong> This independent equity research report on Market Munafa is prepared using publicly disclosed BSE corporate filings and fundamental ratios for educational purposes only. We are not SEBI-registered investment advisors. Please consult a certified financial planner before making any investment decision.
       </p>
     </article>
     """
-    return html_body, yoy_chart_url
+    return html_body, yoy_chart_url, meta_desc_clean
 
 
 # ==========================================
-# 10. TELEGRAM, BLOGGER & SITEMAP PING
+# 9. TELEGRAM & SAFE BLOGGER PUBLISHER
 # ==========================================
-def ping_search_engines():
-    sitemap_url = f"{BLOG_BASE_URL}/sitemap.xml"
-    for ping_url in [
-        f"https://www.google.com/ping?sitemap={urllib.parse.quote(sitemap_url)}",
-        f"https://www.bing.com/ping?sitemap={urllib.parse.quote(sitemap_url)}",
-    ]:
-        try:
-            requests.get(ping_url, timeout=8)
-        except Exception:
-            pass
-
-
 def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, chart_url):
     if not SEND_TO_TELEGRAM or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -1750,14 +1529,15 @@ def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, 
     qtr_lbl = html.escape(str(data.get("quarter_label", "Quarterly")))
     curr_lbl = html.escape(shorten_period_label(data.get("curr_period_label", "Sep 2026")))
     prev_lbl = html.escape(shorten_period_label(data.get("prev_period_label", "Sep 2025")))
-    mkt_cap = html.escape(str(data.get("market_cap") or screener_info["market_cap"]))
-    pe_ratio = html.escape(str(data.get("pe_ratio") or screener_info["pe_ratio"]))
-    roe = html.escape(str(data.get("roe") or screener_info["roe"]))
-    de_ratio = html.escape(str(data.get("debt_to_equity") or screener_info["debt_to_equity"]))
-    total_debt = html.escape(str(data.get("total_debt") or screener_info["total_debt"]))
-    est_return = html.escape(str(data.get("estimated_stock_return", screener_info.get("target_2026", "N/A"))))
+    mkt_cap = html.escape(str(screener_info["market_cap"]))
+    pe_ratio = html.escape(str(screener_info["pe_ratio"]))
+    roe = html.escape(str(screener_info["roe"]))
+    de_ratio = html.escape(str(screener_info["debt_to_equity"]))
+    total_debt = html.escape(str(screener_info["total_debt"]))
+    high_52w = html.escape(str(screener_info.get("high_52w", "N/A")))
+    low_52w = html.escape(str(screener_info.get("low_52w", "N/A")))
     guj_summary = html.escape(str(data.get("gujarati_summary", "")))
-    guj_intraday = html.escape(str(data.get("gujarati_intraday_view", "")))
+    guj_view = html.escape(str(data.get("gujarati_balance_view", "")))
 
     if doc_type == "order":
         header_title = f"🏆 <b>{comp_name} - નવો ઓર્ડર / કોન્ટ્રેક્ટ અપડેટ</b>"
@@ -1767,34 +1547,34 @@ def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, 
             f"({html.escape(str(ord_info.get('client_or_awarder', '-')))})\n\n"
         )
     else:
-        header_title = f"📊 <b>{comp_name} - {qtr_lbl} સાચા PDF રિઝલ્ટ અપડેટ</b>"
-        rev = data.get("revenue", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
-        gp = data.get("gross_profit", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
-        np_d = data.get("net_profit", {"curr": "0", "prev": "0", "growth": "0%", "difference": "0 Cr"})
+        header_title = f"📊 <b>{comp_name} - {qtr_lbl} ઓફિશિયલ BSE PDF રિઝલ્ટ</b>"
+        rev = data.get("revenue", {"curr": "0", "prev": "0", "growth": "N/A"})
+        gp = data.get("gross_profit", {"curr": "0", "prev": "0", "growth": "N/A"})
+        np_d = data.get("net_profit", {"curr": "0", "prev": "0", "growth": "N/A"})
         dynamic_block_gu = (
             f"📈 <b>નાણાકીય કામગીરી ({curr_lbl} vs {prev_lbl}):</b>\n"
-            f"• <b>આવક (Revenue):</b> ₹{html.escape(str(rev.get('curr', '0')))} Cr ({html.escape(str(rev.get('growth', '0%')))} YoY)\n"
-            f"• <b>EBITDA:</b> ₹{html.escape(str(gp.get('curr', '0')))} Cr ({html.escape(str(gp.get('growth', '0%')))} YoY)\n"
-            f"• <b>ચોખ્ખો નફો (PAT):</b> ₹{html.escape(str(np_d.get('curr', '0')))} Cr (<b>{html.escape(str(np_d.get('growth', '0%')))} YoY</b>)\n\n"
+            f"• <b>આવક (Revenue):</b> ₹{html.escape(str(rev.get('curr', '0')))} Cr ({html.escape(str(rev.get('growth', 'N/A')))} YoY)\n"
+            f"• <b>EBITDA:</b> ₹{html.escape(str(gp.get('curr', '0')))} Cr ({html.escape(str(gp.get('growth', 'N/A')))} YoY)\n"
+            f"• <b>ચોખ્ખો નફો (PAT):</b> ₹{html.escape(str(np_d.get('curr', '0')))} Cr (<b>{html.escape(str(np_d.get('growth', 'N/A')))} YoY</b>)\n\n"
         )
 
     msg_html = (
         f"{header_title}\n"
         f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"📅 <b>તારીખ:</b> {res_date} | 💰 <b>ભાવ:</b> {price_disp}\n\n"
+        f"📅 <b>તારીખ:</b> {res_date} | 💰 <b>ભાવ:</b> {price_disp}\n"
+        f"📊 <b>52W High/Low:</b> {high_52w} / {low_52w}\n\n"
         f"{dynamic_block_gu}"
         f"🔍 <b>Mkt Cap:</b> {mkt_cap} | <b>P/E:</b> {pe_ratio} | <b>ROE:</b> {roe}\n"
-        f"🏦 <b>Debt-to-Equity:</b> {de_ratio} ({total_debt})\n"
-        f"🎯 <b>અંદાજિત વેલ્યુએશન ટાર્ગેટ (2026):</b> <b>{est_return}</b>\n\n"
+        f"🏦 <b>Debt-to-Equity:</b> {de_ratio} ({total_debt})\n\n"
         f"📝 <b>સારાંશ:</b> {guj_summary}\n"
-        f"💡 <b>વ્યુ:</b> {guj_intraday}\n"
+        f"💡 <b>ફંડામેન્ટલ નોંધ:</b> {guj_view}\n"
     )
 
     if blog_url:
-        msg_html += f"\n🌐 <a href=\"{html.escape(blog_url, quote=True)}\"><b>ગુજરાતી, હિન્દી અને અંગ્રેજીમાં સંપૂર્ણ રિપોર્ટ બ્લોગ પર વાંચો</b></a>"
+        msg_html += f"\n🌐 <a href=\"{html.escape(blog_url, quote=True)}\"><b>ગુજરાતી, English અને હિન્દીમાં પૂરો રિપોર્ટ વાંચો</b></a>"
     if source_url:
         msg_html += f" | <a href=\"{html.escape(source_url, quote=True)}\"><b>BSE PDF</b></a>"
-    msg_html += "\n\n✅ <b>MarketMunafa</b>"
+    msg_html += "\n\n✅ <b>Market Munafa</b>"
 
     try:
         if chart_url and doc_type != "order":
@@ -1907,20 +1687,47 @@ def is_already_on_blog_or_db(item_id, comp_key, scrip_key, file_key, blog_state)
     return False, ""
 
 
-def blogger_publish(title, content_html, doc_type):
+def select_approved_labels(doc_type, screener_info):
+    if doc_type == "order":
+        labels = ["MARKET NEWS"]
+    else:
+        labels = ["STOCKS RESULT", "MARKET NEWS"]
+        if screener_info.get("debt_to_equity_num", 1.0) <= 0.25:
+            labels.append("DEBT FREE 10 STOCKS")
+    return [lb for lb in labels if lb in APPROVED_LABELS][:3]
+
+
+def blogger_publish(title, content_html, labels, meta_description):
     if not BLOG_ID:
         raise RuntimeError("BLOG_ID is missing")
     token = blogger_access_token()
-    clean_title = re.sub(r"[\r\n\t]+", " ", re.sub(r"<[^>]+>", "", str(title))).strip()[:140] or "Share Price Target & Q2 Results | MarketMunafa"
-    labels = ["MARKET NEWS", "SHARE ORDER"] if doc_type == "order" else ["MARKET NEWS", "STOCK RESULT"]
+    clean_title = re.sub(r"[\r\n\t]+", " ", re.sub(r"<[^>]+>", "", html.unescape(str(title)))).strip()[:140]
+    clean_meta = re.sub(r"\s+", " ", html.unescape(meta_description or "")).strip()
+    if len(clean_meta) > 152:
+        clean_meta = clean_meta[:149].rsplit(" ", 1)[0] + "..."
+
+    payload = {
+        "title": clean_title,
+        "content": content_html,
+        "labels": labels,
+        "customMetaData": clean_meta,
+    }
 
     for attempt in range(2):
         response = requests.post(
             f"https://www.googleapis.com/blogger/v3/blogs/{BLOG_ID}/posts/",
             headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
-            json={"title": clean_title, "content": content_html, "labels": labels},
+            json=payload,
             timeout=25,
         )
+        if response.status_code == 400 and "customMetaData" in response.text:
+            payload.pop("customMetaData", None)
+            response = requests.post(
+                f"https://www.googleapis.com/blogger/v3/blogs/{BLOG_ID}/posts/",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json=payload,
+                timeout=25,
+            )
         if response.status_code == 429:
             if attempt == 0:
                 time.sleep(25)
@@ -1932,44 +1739,45 @@ def blogger_publish(title, content_html, doc_type):
     return None
 
 
-def publish_item(item, doc_type, ai_data, screener_info, trending_kws, item_id, comp_key, scrip_key, file_key, scrip_code=""):
+def publish_item(item, doc_type, ai_data, screener_info, item_id, comp_key, scrip_key, file_key, scrip_code=""):
     source_url = item["link"]
     c_short = ai_data.get("company_short_name") or screener_info.get("screener_company_name") or item["title"]
-    raw_title = ai_data.get("seo_title") or f"{c_short} Share Price Target 2026, Q2 Results & Latest News"
-    blog_html, yoy_chart_url = build_post_html(
+    raw_title = ai_data.get("seo_title") or (
+        f"{c_short} Order Win Update & Financial Overview" if doc_type == "order" else f"{c_short} Quarterly Results & Fundamental Analysis"
+    )
+    blog_html, yoy_chart_url, meta_desc = build_post_html(
         ai_data,
         doc_type,
         screener_info,
         source_url,
-        trending_kws,
         comp_key=comp_key,
         scrip_key=scrip_key,
         file_key=file_key,
         scrip_code=scrip_code,
     )
+    labels = select_approved_labels(doc_type, screener_info)
 
     blog_url = ""
     blogger_quota_hit = False
     if POST_TO_BLOGGER:
-        res_url = blogger_publish(raw_title, blog_html, doc_type)
+        res_url = blogger_publish(raw_title, blog_html, labels, meta_desc)
         if res_url is None:
             blogger_quota_hit = True
         else:
             blog_url = res_url
             mark_posted(item_id, comp_key, scrip_key, file_key, item["title"], source_url)
-            log.info("✅ Published 5-Language Switcher + Text-First Post (%s): %s", doc_type, blog_url)
-            ping_search_engines()
+            log.info("✅ Published Clean Post (%s) | Labels: %s | URL: %s", doc_type, labels, blog_url)
 
     send_telegram_gujarati(ai_data, doc_type, screener_info, blog_url, source_url, yoy_chart_url)
     return not blogger_quota_hit
 
 
 # ==========================================
-# 11. MAIN RUNNER
+# 10. MAIN RUNNER
 # ==========================================
 def run():
     init_db()
-    log.info("Scanning existing posts on MarketMunafa blog...")
+    log.info("Scanning existing posts on Market Munafa blog...")
     blog_state = get_existing_blogger_posts()
 
     all_items = fetch_bse_json_announcements()
@@ -2008,7 +1816,7 @@ def run():
             continue
         seen_in_run.add(run_dedup_token)
 
-        is_dup, dup_reason = is_already_on_blog_or_db(item_id, comp_key, scrip_key, file_key, blog_state)
+        is_dup, _ = is_already_on_blog_or_db(item_id, comp_key, scrip_key, file_key, blog_state)
         if is_dup:
             continue
 
@@ -2031,11 +1839,8 @@ def run():
                 log.warning("Skipping %s because official BSE PDF could not be downloaded.", item["title"])
                 continue
 
-            c_search_name = screener_info.get("screener_company_name") or comp_basis
-            trending_kws = fetch_live_google_keywords(c_search_name)
-
             ai_data = analyze_with_gemini_json(
-                item["title"], scrip_code, doc_type, source_text, pdf_bytes, screener_info, trending_kws, pdf_text_len
+                item["title"], scrip_code, doc_type, source_text, pdf_bytes, screener_info, pdf_text_len
             )
 
             if not ai_data or ai_data.get("pdf_table_verified") is False or ai_data.get("skip_stock") is True:
@@ -2061,7 +1866,6 @@ def run():
                 doc_type,
                 ai_data,
                 screener_info,
-                trending_kws,
                 item_id,
                 final_comp_key,
                 scrip_key,
