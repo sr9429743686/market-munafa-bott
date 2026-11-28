@@ -102,10 +102,12 @@ REQUIRED_TOTAL_SCORE = 200    # 100 Python Hard Gate + 100 Chief Editor Audit = 
 MAX_AUDIT_FIX_ROUNDS = 3
 MIN_ENGLISH_WORDS = 460
 
-FEEDS = {
-    "result": "https://www.bseindia.com/Data/XML/FinancialResultsFeed.aspx",
-    "announcement": "https://www.bseindia.com/data/xml/announcements.aspx",
-}
+# સત્તાવાર BSE + NSE RSS ફીડ્સ
+FEEDS = [
+    ("result", "https://www.bseindia.com/Data/XML/FinancialResultsFeed.aspx"),
+    ("result", "https://nsearchives.nseindia.com/content/RSS/Financial_Results.xml"),
+    ("announcement", "https://www.bseindia.com/data/xml/announcements.aspx"),
+]
 
 DB_PATH = os.getenv("DB_PATH", "marketmunafa_seen.sqlite3")
 MAX_ITEMS_PER_FEED = int(os.getenv("MAX_ITEMS_PER_FEED", "100"))
@@ -116,7 +118,6 @@ REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "35"))
 POST_TO_BLOGGER = os.getenv("POST_TO_BLOGGER", "true").lower() == "true"
 SEND_TO_TELEGRAM = os.getenv("SEND_TO_TELEGRAM", "true").lower() == "true"
 
-# AI જેવા લાગતા રોબોટિક શબ્દો તથા AdSense/YMYL પ્રતિબંધિત શબ્દો
 BANNED_AI_AND_POLICY_PHRASES = [
     "delve into", "tapestry", "in conclusion", "game-changer", "testament to",
     "ever-evolving", "rollercoaster", "pivotal moment", "underscores the importance",
@@ -127,14 +128,12 @@ BANNED_AI_AND_POLICY_PHRASES = [
     "અંતમાં કહીએ તો", "એ નોંધવું મહત્વપૂર્ણ છે",
 ]
 
-# ભારતીય આંકડા (૦-૯, ०-९) ને ફરજિયાત અંગ્રેજી 0-9 માં ફેરવવા માટે
 INDIC_DIGIT_TRANS = str.maketrans({
     chr(base + d): str(d)
     for base in [0x0966, 0x0AE6]
     for d in range(10)
 })
 
-# દરેક પોસ્ટ માટે અલગ-અલગ 6 પ્રીમિયમ એડિટોરિયલ થમ્બનેલ થીમ
 THUMB_THEMES = [
     {"bg1": (10, 22, 46), "bg2": (24, 58, 108), "accent": (250, 204, 21), "accent_txt": (15, 23, 42), "badge": (16, 150, 72), "glow": (56, 189, 248), "chart": (34, 197, 94)},
     {"bg1": (8, 34, 34), "bg2": (16, 86, 80), "accent": (253, 224, 71), "accent_txt": (15, 23, 42), "badge": (234, 88, 12), "glow": (45, 212, 191), "chart": (74, 222, 128)},
@@ -381,16 +380,18 @@ def mark_posted(item_id, comp_key, scrip_key, file_key, title, source_url):
 
 
 def get_url(url, extra_headers=None):
+    """NSE અને BSE બંને સર્વર માટે યોગ્ય Referer/Origin હેડર્સ સાથે સુરક્ષિત ફેચ."""
     profiles = ["chrome120", "chrome110", "edge101", "chrome104"]
+    is_nse = "nseindia.com" in url.lower()
     last_err = None
     for attempt in range(3):
         try:
             profile = profiles[attempt % len(profiles)]
             headers = {
                 "Accept": "application/json, application/rss+xml, application/xml, text/xml, application/pdf, text/html, */*",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": "https://www.bseindia.com/",
-                "Origin": "https://www.bseindia.com",
+                "Accept-Language": "en-IN,en;q=0.9",
+                "Referer": "https://www.nseindia.com/" if is_nse else "https://www.bseindia.com/",
+                "Origin": "https://www.nseindia.com" if is_nse else "https://www.bseindia.com",
             }
             if extra_headers:
                 headers.update(extra_headers)
@@ -552,8 +553,7 @@ def draw_subtle_market_bg(canvas, th, seed_str):
     return Image.alpha_composite(canvas, overlay)
 
 
-def create_and_push_unique_thumbnail(comp_short, thumb_headline, badge_text, cap_label, price_disp, slug_id, theme_index=0):
-    """1280x720 દરેક પોસ્ટ માટે અલગ થીમ, ઓટો-ફિટ ટેક્સ્ટ અને તમારા ફોટા સાથેનું પ્રોફેશનલ થમ્બનેલ."""
+def create_and_push_unique_thumbnail(comp_short, thumb_headline, badge_text, cap_label, price_disp, slug_id, theme_index=0, exchange="BSE"):
     W, H = 1280, 720
     th = THUMB_THEMES[theme_index % len(THUMB_THEMES)]
 
@@ -568,7 +568,6 @@ def create_and_push_unique_thumbnail(comp_short, thumb_headline, badge_text, cap
 
     canvas = draw_subtle_market_bg(canvas, th, slug_id)
 
-    # સ્ટુડિયો લાઈટ ગ્લો અને ડાબી બાજુ રીડેબિલિટી વિગ્નેટ
     lights = Image.new("RGBA", (W, H), (0, 0, 0, 0))
     ldraw = ImageDraw.Draw(lights)
     ldraw.ellipse([710, 30, 1310, 650], fill=(*th["glow"], 95))
@@ -577,7 +576,6 @@ def create_and_push_unique_thumbnail(comp_short, thumb_headline, badge_text, cap
     lights = lights.filter(ImageFilter.GaussianBlur(radius=45))
     canvas = Image.alpha_composite(canvas, lights)
 
-    # જમણી બાજુ તમારો ફોટો + સ્ટુડિયો રિમ-લાઈટ
     author = load_author_photo()
     if author is not None:
         try:
@@ -625,7 +623,6 @@ def create_and_push_unique_thumbnail(comp_short, thumb_headline, badge_text, cap
     TEXT_X = 56
     MAX_W = 660
 
-    # 1) ટોપ બેજ + કેપ કેટેગરી
     clean_badge = re.sub(r"[^A-Za-z0-9\s\-&|]", "", f"{badge_text} | {cap_label}").strip().upper()[:30]
     f_badge = load_thumb_font(24, bold=True)
     tb = draw.textbbox((0, 0), clean_badge, font=f_badge)
@@ -633,7 +630,6 @@ def create_and_push_unique_thumbnail(comp_short, thumb_headline, badge_text, cap
     draw.rounded_rectangle([TEXT_X, 46, TEXT_X + bw, 98], radius=10, fill=(*th["badge"], 255))
     draw.text((TEXT_X + 28, 57), clean_badge, font=f_badge, fill=(255, 255, 255, 255))
 
-    # 2) કંપનીનું નામ (ગોલ્ડન હાઈલાઈટ બેનરમાં, ઓટો-ફિટ — ક્યારેય કપાશે નહીં)
     clean_comp = " ".join(re.sub(r"[^\x20-\x7E&]", "", str(comp_short)).split()).upper()[:26]
     f_comp, comp_lines = fit_text_box(draw, clean_comp, MAX_W - 28, start_sz=54, min_sz=34, max_lines=2)
     y_cur = 128
@@ -649,7 +645,6 @@ def create_and_push_unique_thumbnail(comp_short, thumb_headline, badge_text, cap
             draw.text((TEXT_X, y_cur), line, font=f_comp, fill=(255, 255, 255, 255))
             y_cur += lh + 22
 
-    # 3) મુખ્ય આંકડાકીય હેડલાઈન (ઓટો-ફિટ 3D શેડો સાથે)
     clean_hl = " ".join(re.sub(r"[^\x20-\x7E₹%+.-]", "", str(thumb_headline)).split()).upper()
     f_hl, hl_lines = fit_text_box(draw, clean_hl, MAX_W, start_sz=46, min_sz=30, max_lines=3)
     y_cur += 10
@@ -660,14 +655,12 @@ def create_and_push_unique_thumbnail(comp_short, thumb_headline, badge_text, cap
         draw.text((TEXT_X, y_cur), line, font=f_hl, fill=(255, 255, 255, 255), stroke_width=2, stroke_fill=(0, 0, 0, 220))
         y_cur += lh + 20
 
-    # 4) ભાવ અને BSE ટૅગ પિલ
     clean_price = re.sub(r"[^\x20-\x7E₹,.]", "", str(price_disp)).strip()
     if clean_price and "LIVE" not in clean_price.upper():
         f_sub = load_thumb_font(25, bold=True)
-        sub_txt = f"SHARE PRICE: {clean_price}   |   OFFICIAL BSE FILING"
+        sub_txt = f"SHARE PRICE: {clean_price}   |   OFFICIAL {exchange} FILING"
         draw.text((TEXT_X, min(H - 122, y_cur + 14)), sub_txt, font=f_sub, fill=(203, 213, 225, 255))
 
-    # 5) નીચે ફુલ-વિડ્થ ન્યૂઝ બ્રાન્ડ બાર
     bar_y = H - 72
     draw.rectangle([0, bar_y, W, H], fill=(10, 15, 28, 248))
     draw.rectangle([0, bar_y, W, bar_y + 4], fill=(*th["accent"], 255))
@@ -678,7 +671,7 @@ def create_and_push_unique_thumbnail(comp_short, thumb_headline, badge_text, cap
     draw.text((64, bar_y + 21), "MARKET MUNAFA", font=f_brand, fill=(15, 23, 42, 255))
 
     date_str = get_ist_now().strftime("%d %b %Y").upper()
-    draw.text((350, bar_y + 23), f"BSE EQUITY RESEARCH   •   {date_str}", font=f_meta, fill=(226, 232, 240, 255))
+    draw.text((350, bar_y + 23), f"{exchange} EQUITY RESEARCH   •   {date_str}", font=f_meta, fill=(226, 232, 240, 255))
 
     filename = f"thumb_{slug_id}.jpg"
     out_path = os.path.join(THUMBNAIL_DIR, filename)
@@ -758,8 +751,8 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
         queries.append(clean_name)
 
     info = {
-        "screener_company_name": "", "nse_bse_symbol": scrip_code or "BSE",
-        "price_str": "Live on BSE", "price_num": 0.0,
+        "screener_company_name": "", "nse_bse_symbol": scrip_code or "NSE/BSE", "bse_code": scrip_code or "",
+        "price_str": "Live on Exchange", "price_num": 0.0,
         "high_52w": "N/A", "high_52w_num": 0.0, "low_52w": "N/A", "low_52w_num": 0.0,
         "dist_from_high": "N/A", "dist_from_low": "N/A",
         "market_cap": "N/A", "market_cap_num": 0.0, "cap_label": "Small Cap", "is_eligible_stock": False,
@@ -800,6 +793,12 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
                 page_html = c_res.text
                 if scrip_code and not re.search(rf"\b{re.escape(str(scrip_code))}\b", page_html):
                     continue
+
+                # જો NSE આઇટમ માટે BSE scrip code ન હોય તો Screener પેજમાંથી મેળવી લો (PDF બેકઅપ માટે)
+                if not info["bse_code"]:
+                    m_bse = re.search(r"BSE:\s*(\d{6})", page_html, flags=re.I)
+                    if m_bse:
+                        info["bse_code"] = m_bse.group(1)
 
                 soup = BeautifulSoup(c_res.content, "html.parser")
                 q_extracted = _extract_quarters_from_soup(soup)
@@ -900,7 +899,7 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
 
 
 # ==========================================
-# 6. BSE API, SCRIP PDF RESOLVER & FEEDS
+# 6. BSE & NSE FEEDS, PDF RESOLVER
 # ==========================================
 def fetch_bse_pdf_url_by_scrip(scrip_code):
     if not scrip_code:
@@ -961,6 +960,7 @@ def fetch_bse_json_announcements():
                     item_kind = "result" if (kind == "result" or "result" in subcat.lower()) else "announcement"
                     output.append({
                         "kind": item_kind,
+                        "exchange": "BSE",
                         "title": html.unescape(re.sub(r"<[^>]+>", " ", title)).strip(),
                         "company_raw": comp,
                         "scrip_code": scrip,
@@ -984,6 +984,7 @@ def fetch_bse_json_announcements():
 def parse_feed(feed_url, feed_kind):
     response = get_url(feed_url)
     root = ET.fromstring(response.content)
+    exchange = "NSE" if "nseindia.com" in feed_url.lower() else "BSE"
     output = []
     for node in [n for n in root.iter() if local_name(n.tag) in ("item", "entry")]:
         title = child_text(node, {"title"})
@@ -1002,6 +1003,7 @@ def parse_feed(feed_url, feed_kind):
         clean_t = html.unescape(re.sub(r"<[^>]+>", " ", title)).strip()
         output.append({
             "kind": feed_kind,
+            "exchange": exchange,
             "title": clean_t,
             "company_raw": clean_t.split("(")[0].split("-")[0].split(":")[0].strip(),
             "scrip_code": str(scrip).strip(),
@@ -1011,6 +1013,7 @@ def parse_feed(feed_url, feed_kind):
         })
         if len(output) >= MAX_ITEMS_PER_FEED:
             break
+    log.info("%s RSS (%s): %d items fetched", exchange, feed_kind, len(output))
     return output
 
 
@@ -1024,7 +1027,8 @@ def get_document_payload(item, scrip_code=""):
     url = item.get("link") or ""
     attach_name = item.get("attachment_name") or ""
 
-    if not url or not urlparse(url).path.lower().endswith(".pdf"):
+    # જો સીધી PDF લિંક ન હોય (જેમ કે NSE XML/XBRL), તો BSE કોડ પરથી ઓફિશિયલ PDF મેળવવા ટ્રાય કરો
+    if (not url or not urlparse(url).path.lower().endswith(".pdf")) and scrip_code:
         resolved_url, resolved_attach = fetch_bse_pdf_url_by_scrip(scrip_code)
         if resolved_url:
             url = resolved_url
@@ -1043,17 +1047,18 @@ def get_document_payload(item, scrip_code=""):
                     item["link"] = url
                 else:
                     raise
-            pdf_bytes = response.content
-            text_parts = []
-            with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
-                tmp.write(pdf_bytes)
-                tmp.flush()
-                with open(tmp.name, "rb") as f:
-                    for page in PyPDF2.PdfReader(f).pages[:MAX_PDF_PAGES]:
-                        text_parts.append(page.extract_text() or "")
-            extracted_pdf_text = clean_text("\n".join(text_parts))[:MAX_TEXT_CHARS]
-            if extracted_pdf_text:
-                parts.append("EXTRACTED PDF TEXT:\n" + extracted_pdf_text)
+            if response.content[:4] == b"%PDF" or "pdf" in response.headers.get("Content-Type", "").lower():
+                pdf_bytes = response.content
+                text_parts = []
+                with tempfile.NamedTemporaryFile(suffix=".pdf") as tmp:
+                    tmp.write(pdf_bytes)
+                    tmp.flush()
+                    with open(tmp.name, "rb") as f:
+                        for page in PyPDF2.PdfReader(f).pages[:MAX_PDF_PAGES]:
+                            text_parts.append(page.extract_text() or "")
+                extracted_pdf_text = clean_text("\n".join(text_parts))[:MAX_TEXT_CHARS]
+                if extracted_pdf_text:
+                    parts.append("EXTRACTED PDF TEXT:\n" + extracted_pdf_text)
         except Exception as exc:
             log.warning("Attachment download warning for %s: %s", url, exc)
     return clean_text("\n\n".join(parts))[:MAX_TEXT_CHARS], pdf_bytes, len(extracted_pdf_text)
@@ -1276,11 +1281,9 @@ def flatten_lang_pack(pack):
 
 
 def run_hard_python_gate(bundle, doc_type, source_text):
-    """100 પોઈન્ટનો કડક Python ગેટ: એક પણ ભૂલ હશે તો 100/100 નહીં મળે."""
     failures = []
     packs = bundle.get("lang_packs") or {}
 
-    # 1) અંગ્રેજી પેક અને વર્ડ કાઉન્ટ ચેક (AdSense + Google News માટે)
     en_pack = packs.get("en") or {}
     en_flat = flatten_lang_pack(en_pack)
     en_words = len(re.findall(r"[A-Za-z0-9]+", en_flat))
@@ -1291,7 +1294,6 @@ def run_hard_python_gate(bundle, doc_type, source_text):
     if len(en_pack.get("faqs") or []) < 3:
         failures.append("English pack must have at least 3 FAQs.")
 
-    # 2) ગુજરાતી પેક — એક પણ બુલેટ કે સેક્શન અંગ્રેજીમાં લીક ન થવું જોઈએ
     gu_pack = packs.get("gu") or {}
     gu_lead_c, gu_lead_r = script_stats(gu_pack.get("lead", ""), r"\u0A80-\u0AFF")
     if gu_lead_c < 35 or gu_lead_r < 0.35:
@@ -1310,7 +1312,6 @@ def run_hard_python_gate(bundle, doc_type, source_text):
     if script_stats(bundle.get("gujarati_summary", ""), r"\u0A80-\u0AFF")[0] < 30:
         failures.append("gujarati_summary must be written in natural Gujarati script.")
 
-    # 3) હિન્દી પેક — એક પણ બુલેટ કે સેક્શન અંગ્રેજીમાં લીક ન થવું જોઈએ
     hi_pack = packs.get("hi") or {}
     hi_lead_c, hi_lead_r = script_stats(hi_pack.get("lead", ""), r"\u0900-\u097F")
     if hi_lead_c < 35 or hi_lead_r < 0.35:
@@ -1323,7 +1324,6 @@ def run_hard_python_gate(bundle, doc_type, source_text):
     if hi_all_c < 900 or hi_all_r < 0.48:
         failures.append(f"Hindi full article too short or too much English (hi_chars={hi_all_c}, ratio={hi_all_r:.2f}).")
 
-    # 4) Markdown લીક, રોબોટિક AI શબ્દો અને YMYL પોલિસી ચેક
     all_combined = " ".join([en_flat, flatten_lang_pack(gu_pack), flatten_lang_pack(hi_pack), str(bundle.get("seo_title", ""))])
     if "**" in all_combined or "##" in all_combined:
         failures.append("Raw markdown (** or ##) found in text. Remove all markdown symbols.")
@@ -1332,12 +1332,10 @@ def run_hard_python_gate(bundle, doc_type, source_text):
     if banned_hits:
         failures.append(f"Robotic AI or policy-violating phrases found: {banned_hits}. Rewrite naturally like a human financial journalist.")
 
-    # 5) 8-gram કોપીરાઇટ ચેક
     overlaps = find_copyright_overlaps(source_text, en_flat, ngram_size=8)
     if overlaps:
         failures.append(f"Copyright overlap (8+ words matched source): {overlaps[:3]}. Rewrite those sentences completely in fresh words.")
 
-    # 6) હેડલાઈન અને થમ્બનેલ ફિટ ચેક
     seo_t = str(bundle.get("seo_title", "")).strip()
     if len(seo_t) < 42 or len(seo_t) > 90:
         failures.append(f"seo_title length ({len(seo_t)}) should be 45-82 chars.")
@@ -1345,7 +1343,6 @@ def run_hard_python_gate(bundle, doc_type, source_text):
     if not th_hl or len(th_hl.split()) > 8:
         failures.append("thumb_headline must be a crisp 3-7 word English punchline for the thumbnail.")
 
-    # 7) ઓર્ડર/રિઝલ્ટ ડેટા ચેક
     if doc_type == "order":
         ord_d = bundle.get("order_details") or {}
         if not str(ord_d.get("order_value", "")).strip() or not str(ord_d.get("client_or_awarder", "")).strip():
@@ -1360,19 +1357,19 @@ def run_hard_python_gate(bundle, doc_type, source_text):
     return py_score, failures
 
 
-def step1_draft_organic_english(company_title, scrip_code, doc_type, source_text, pdf_bytes, screener_info, pdf_text_len):
+def step1_draft_organic_english(company_title, scrip_code, doc_type, source_text, pdf_bytes, screener_info, pdf_text_len, exchange="BSE"):
     c_clean = screener_info.get("screener_company_name") or re.sub(r"\(\d+\)", "", company_title).split("-")[0].strip()
     ist_today = get_ist_now().strftime("%B %d, %Y")
 
     prompt = f"""
 You are a senior Indian Chartered Accountant and business journalist (writing in the calm, authoritative, natural human voice of Mint or Business Standard) for 'Market Munafa'.
-Inspect EVERY PAGE of the attached official BSE PDF ({doc_type.upper()}) for {c_clean} (BSE: {scrip_code}).
+Inspect EVERY PAGE of the attached official {exchange} Corporate Filing PDF ({doc_type.upper()}) for {c_clean} ({exchange}{': ' + scrip_code if scrip_code else ''}).
 
 STRICT JOURNALISTIC, GOOGLE NEWS & ADSENSE RULES:
 1. HUMAN ORGANIC WRITING: Write like an experienced Mumbai financial reporter—direct, specific, natural prose. Zero hype, zero robotic clichés ('delve', 'tapestry', 'in conclusion', 'game-changer', 'ever-evolving', 'rollercoaster', 'it is worth noting'). Zero markdown (** or ##).
-2. ZERO FAKE TARGETS OR BUY/SELL TIPS: Never invent future price targets (2026-2030) or give buy/sell calls. Stick strictly to verified BSE PDF facts, Screener ratios, and 52-week positioning.
+2. ZERO FAKE TARGETS OR BUY/SELL TIPS: Never invent future price targets (2026-2030) or give buy/sell calls. Stick strictly to verified {exchange} PDF facts, Screener ratios, and 52-week positioning.
 3. EXACT PDF ARITHMETIC:
-   - Extract exact figures directly from the attached BSE PDF table (prefer Consolidated over Standalone).
+   - Extract exact figures directly from the attached {exchange} PDF table (prefer Consolidated over Standalone).
    - Pick the 3-Month Quarter Ended columns: latest quarter (`curr_period_label`, e.g., "Sep 2026") vs same quarter last year (`prev_period_label`, e.g., "Sep 2025").
    - Convert accurately into ₹ Crores (Lakhs ÷ 100, Millions ÷ 10, Thousands ÷ 10,000).
    - Extract `revenue` (Revenue from Operations), `gross_profit` (EBITDA = PBT before exceptional + Finance Cost + Depreciation), and `net_profit` (PAT).
@@ -1381,7 +1378,7 @@ STRICT JOURNALISTIC, GOOGLE NEWS & ADSENSE RULES:
    - Set `"skip_stock": false` ONLY IF the PDF shows strong, material performance (positive YoY PAT growth >= 5%, turnaround to profit, revenue growth >= 15%, or a genuinely material new order win). Otherwise set `"skip_stock": true`.
 5. ZERO COPYRIGHT OVERLAP: Never copy sentences verbatim from the PDF. Express every detail in fresh original reporting prose.
 
-Company: {c_clean} (BSE: {scrip_code}) | Category: {screener_info['cap_label']}
+Company: {c_clean} | Exchange: {exchange} | Category: {screener_info['cap_label']}
 Verified Screener Data:
 - Share Price: {screener_info['price_str']} | 52W High: {screener_info['high_52w']} ({screener_info['dist_from_high']}) | 52W Low: {screener_info['low_52w']} ({screener_info['dist_from_low']})
 - Market Cap: {screener_info['market_cap']} | Stock P/E: {screener_info['pe_ratio']} | Industry P/E: {screener_info['industry_pe']} | P/B: {screener_info['pb_ratio']}
@@ -1432,12 +1429,12 @@ Return ONLY valid JSON:
       "Crisp takeaway 4 comparing valuation with sector peers."
     ],
     "sections": [
-      {{"heading": "{c_clean} BSE Filing Breakdown: Core Numbers & Drivers", "body": "150-175 words of organic financial reporting explaining exact verified PDF numbers and operational performance."}},
+      {{"heading": "{c_clean} {exchange} Filing Breakdown: Core Numbers & Drivers", "body": "150-175 words of organic financial reporting explaining exact verified PDF numbers and operational performance."}},
       {{"heading": "Valuation Check, 52-Week Position & Balance Sheet", "body": "150-175 words objectively comparing Stock P/E ({screener_info['pe_ratio']}), Industry P/E ({screener_info['industry_pe']}), Book Value ({screener_info['book_value']}), ROE ({screener_info['roe']}), and Total Debt ({screener_info['total_debt']})."}},
       {{"heading": "What Shareholders Should Track Ahead", "body": "120-150 words on execution milestones, margin stability, and working capital discipline without buy/sell advice."}}
     ],
     "faqs": [
-      {{"q": "What did {c_clean} report in its latest BSE filing?", "a": "Direct 2-sentence factual answer with exact verified PDF numbers."}},
+      {{"q": "What did {c_clean} report in its latest {exchange} filing?", "a": "Direct 2-sentence factual answer with exact verified PDF numbers."}},
       {{"q": "What is the debt-to-equity ratio and total debt of {c_clean}?", "a": "Direct factual answer citing Total Debt ({screener_info['total_debt']}) and Debt-to-Equity ({screener_info['debt_to_equity']})."}},
       {{"q": "How is {c_clean} valued compared to its industry peers?", "a": "Direct factual answer comparing Stock P/E ({screener_info['pe_ratio']}), Industry P/E ({screener_info['industry_pe']}), and ROE ({screener_info['roe']})."}}
     ]
@@ -1458,7 +1455,6 @@ Supplementary Extracted Filing Text:
 
 
 def step2_write_native_indic_pack(en_pack, comp_name, lang_code, lang_name):
-    """Google Translate વગર સીધું અખબારી ગુજરાતી કે હિન્દીમાં લખે છે (અંક 0-9 અને શેર નામ અંગ્રેજીમાં જ)."""
     style = (
         "Divya Bhaskar Business / Gujarat Samachar Business (natural everyday Gujarati used by Gujarati investors today, never textbook or translated-sounding)"
         if lang_code == "gu"
@@ -1508,8 +1504,7 @@ Return ONLY valid JSON:
     return enforce_english_digits(parsed) if parsed else None
 
 
-def step3_chief_editor_audit_and_fix(bundle, doc_type, source_text, screener_info, py_failures):
-    """ચીફ એડિટર & CA ઓડિટ: Python એ પકડેલી બધી ભૂલો + ફેક્ટ/વ્યાકરણ/ઓર્ગેનિક ટોન સુધારી 100/100 એડિટર સ્કોર ચેક કરે છે."""
+def step3_chief_editor_audit_and_fix(bundle, doc_type, source_text, screener_info, py_failures, exchange="BSE"):
     alerts = (
         "CRITICAL HARD ERRORS FROM PYTHON GATE (MUST FIX 100% OF THESE):\n- " + "\n- ".join(py_failures)
         if py_failures else "Automated Python Gate passed 100/100! Perform final strict factual, arithmetic, grammar, and human-readability audit."
@@ -1517,7 +1512,7 @@ def step3_chief_editor_audit_and_fix(bundle, doc_type, source_text, screener_inf
 
     prompt = f"""
 You are the Ruthless Chief Editor, Chartered Accountant, and Google News SEO Auditor for 'Market Munafa'.
-Deeply inspect this complete trilingual financial report JSON against the Official BSE Filing Text and Verified Screener Ratios, and FIX EVERY SINGLE ISSUE.
+Deeply inspect this complete trilingual financial report JSON against the Official {exchange} Filing Text and Verified Screener Ratios, and FIX EVERY SINGLE ISSUE.
 
 {alerts}
 
@@ -1531,7 +1526,7 @@ MANDATORY 100-POINT AUDIT CHECKLIST:
 4. ZERO COPYRIGHT & ADSENSE SAFETY: Zero 8-word verbatim copies from PDF, zero buy/sell advice, zero fake future price targets, zero markdown (`**` or `##`).
 5. HONEST SCORING: Give `"editor_score": 100` ONLY IF every single criterion is genuinely 100% flawless AFTER your fixes. Otherwise give the honest lower score and list remaining `"issues_found"`.
 
-OFFICIAL BSE FILING EXCERPT:
+OFFICIAL {exchange} FILING EXCERPT:
 {source_text[:6500]}
 
 CURRENT REPORT BUNDLE TO AUDIT & FIX:
@@ -1544,10 +1539,9 @@ Return ONLY valid JSON containing ALL original keys of the bundle PLUS `"editor_
     return enforce_english_digits(parsed) if parsed else None
 
 
-def generate_and_verify_200_of_200(company_title, scrip_code, doc_type, source_text, pdf_bytes, screener_info, pdf_text_len):
-    """સીધી પોસ્ટ બંધ — 200/200 (100 Python + 100 Chief Editor) પાસ થાય તો જ રિટર્ન કરશે, નહીંતર None."""
-    log.info("Step 1/3: Reading official BSE PDF & drafting organic English report for %s...", company_title)
-    en_base = step1_draft_organic_english(company_title, scrip_code, doc_type, source_text, pdf_bytes, screener_info, pdf_text_len)
+def generate_and_verify_200_of_200(company_title, scrip_code, doc_type, source_text, pdf_bytes, screener_info, pdf_text_len, exchange="BSE"):
+    log.info("Step 1/3: Reading official %s PDF & drafting organic English report for %s...", exchange, company_title)
+    en_base = step1_draft_organic_english(company_title, scrip_code, doc_type, source_text, pdf_bytes, screener_info, pdf_text_len, exchange=exchange)
     if not en_base or en_base.get("pdf_table_verified") is False or en_base.get("skip_stock") is True:
         log.info("Skipping stock (weak result / unverified PDF table): %s", company_title)
         return None
@@ -1584,12 +1578,11 @@ def generate_and_verify_200_of_200(company_title, scrip_code, doc_type, source_t
     bundle["gujarati_balance_view"] = gu_res.get("gujarati_balance_view", "")
     bundle = enforce_english_digits(bundle)
 
-    # કડક 200/200 ઓડિટ અને સુધારા લૂપ (ભૂલ ન સુધરે ત્યાં સુધી પોસ્ટ નહીં થાય)
     for rnd in range(1, MAX_AUDIT_FIX_ROUNDS + 1):
         pre_py_score, pre_py_failures = run_hard_python_gate(bundle, doc_type, source_text)
         log.info("Audit Round %d/%d | Pre-Fix Python Gate: %d/100 | Failures: %d", rnd, MAX_AUDIT_FIX_ROUNDS, pre_py_score, len(pre_py_failures))
 
-        audited = step3_chief_editor_audit_and_fix(bundle, doc_type, source_text, screener_info, pre_py_failures)
+        audited = step3_chief_editor_audit_and_fix(bundle, doc_type, source_text, screener_info, pre_py_failures, exchange=exchange)
         if not audited:
             log.warning("Audit Round %d returned invalid JSON; retrying...", rnd)
             time.sleep(2)
@@ -1598,7 +1591,6 @@ def generate_and_verify_200_of_200(company_title, scrip_code, doc_type, source_t
         editor_score = int(audited.get("editor_score", 0))
         issues = audited.get("issues_found") or []
 
-        # ઓડિટ પછી ફરીથી Python હાર્ડ ચેક (AI ખોટો સ્કોર ન આપી શકે)
         post_py_score, post_py_failures = run_hard_python_gate(audited, doc_type, source_text)
         total_score = post_py_score + editor_score
         log.info("Round %d Score -> Python: %d/100 + Editor: %d/100 = %d/200", rnd, post_py_score, editor_score, total_score)
@@ -1725,7 +1717,7 @@ def _render_bottom_analysis_panel_html(lang_code, is_default, faq_label, section
     """
 
 
-def build_post_html(data, doc_type, screener_info, source_url, thumb_url, related_posts, comp_key="", scrip_key="", file_key="", scrip_code=""):
+def build_post_html(data, doc_type, screener_info, source_url, thumb_url, related_posts, comp_key="", scrip_key="", file_key="", scrip_code="", exchange="BSE"):
     comp_name_raw = html.unescape(str(data.get("company_short_name", "Company"))).strip()
     comp_name = html.escape(comp_name_raw)
     res_date = html.escape(str(data.get("result_date", get_ist_now().strftime("%B %d, %Y"))))
@@ -1758,19 +1750,19 @@ def build_post_html(data, doc_type, screener_info, source_url, thumb_url, relate
     fund_impact = html.escape(str(data.get("fundamental_impact_note", "")))
     market_pos = html.escape(str(data.get("market_position_note", "")))
 
-    uid = hashlib.md5((comp_name_raw + res_date + scrip_code).encode("utf-8")).hexdigest()[:8]
+    uid = hashlib.md5((comp_name_raw + res_date + scrip_code + exchange).encode("utf-8")).hexdigest()[:8]
     universal_data_blocks = []
 
     if doc_type == "order":
         ord_info = data.get("order_details", {}) or {}
         order_card = f"""
         <div style="background: #ffffff; border: 1px solid #cbd5e1; border-radius: 10px; padding: 18px; margin-bottom: 24px;">
-          <h2 style="margin: 0 0 12px 0; font-size: 18.5px; color: #0f172a; border-left:4px solid #0f766e; padding-left:10px;">{comp_name} Official Order &amp; Contract Details</h2>
+          <h2 style="margin: 0 0 12px 0; font-size: 18.5px; color: #0f172a; border-left:4px solid #0f766e; padding-left:10px;">{comp_name} Official {exchange} Order &amp; Contract Details</h2>
           <table style="width:100%; border-collapse:collapse; font-size:14px;">
             <tbody>
               <tr style="border-bottom:1px solid #e2e8f0;"><td style="padding:9px 8px; color:#475569; font-weight:600; width:40%;">Company</td><td style="padding:9px 8px; color:#0f172a; font-weight:700;">{comp_name} ({price_disp})</td></tr>
               <tr style="border-bottom:1px solid #e2e8f0; background:#f8fafc;"><td style="padding:9px 8px; color:#475569; font-weight:600;">Client / Awarding Entity</td><td style="padding:9px 8px; color:#0f172a;">{html.escape(str(ord_info.get("client_or_awarder", "Disclosed in Filing")))}</td></tr>
-              <tr style="border-bottom:1px solid #e2e8f0;"><td style="padding:9px 8px; color:#475569; font-weight:600;">Order Value</td><td style="padding:9px 8px; color:#0f766e; font-weight:700;">{html.escape(str(ord_info.get("order_value", "As per BSE Filing")))}</td></tr>
+              <tr style="border-bottom:1px solid #e2e8f0;"><td style="padding:9px 8px; color:#475569; font-weight:600;">Order Value</td><td style="padding:9px 8px; color:#0f766e; font-weight:700;">{html.escape(str(ord_info.get("order_value", f"As per {exchange} Filing")))}</td></tr>
               <tr style="border-bottom:1px solid #e2e8f0; background:#f8fafc;"><td style="padding:9px 8px; color:#475569; font-weight:600;">Order Size vs Market Cap</td><td style="padding:9px 8px; color:#0f172a;">{html.escape(str(ord_info.get("order_to_mcap_ratio", "Disclosed in Filing")))}</td></tr>
               <tr style="border-bottom:1px solid #e2e8f0;"><td style="padding:9px 8px; color:#475569; font-weight:600;">Scope of Work</td><td style="padding:9px 8px; color:#0f172a;">{html.escape(str(ord_info.get("scope_of_work", "Commercial execution contract")))}</td></tr>
               <tr style="background:#f8fafc;"><td style="padding:9px 8px; color:#475569; font-weight:600;">Execution Timeline</td><td style="padding:9px 8px; color:#0f172a;">{html.escape(str(ord_info.get("execution_timeline", "As per contract terms")))}</td></tr>
@@ -1799,7 +1791,7 @@ def build_post_html(data, doc_type, screener_info, source_url, thumb_url, relate
 
         result_card = f"""
         <div style="background: #ffffff; border: 1px solid #cbd5e1; border-radius: 10px; padding: 16px; margin-bottom: 24px; box-sizing: border-box;">
-          <h2 style="margin: 0 0 8px 0; font-size: 18px; color: #0f172a; border-left:4px solid #0f766e; padding-left:10px;">{comp_name} {qtr_lbl} Official BSE Results ({res_type})</h2>
+          <h2 style="margin: 0 0 8px 0; font-size: 18px; color: #0f172a; border-left:4px solid #0f766e; padding-left:10px;">{comp_name} {qtr_lbl} Official {exchange} Results ({res_type})</h2>
           <div style="display: flex; justify-content: space-between; align-items: center; color: #64748b; font-size: 12.5px; margin-bottom: 10px;">
             <span>{res_date} | Price: <strong style="color:#0f172a;">{price_disp}</strong></span>
             <span>Figures in ₹ Crore</span>
@@ -1918,7 +1910,7 @@ def build_post_html(data, doc_type, screener_info, source_url, thumb_url, relate
     """
 
     source_link_html = (
-        f'<p style="margin-top:14px; font-size:14px;"><strong>Official Reference:</strong> <a href="{html.escape(source_url, quote=True)}" target="_blank" rel="nofollow noopener" style="color:#1d4ed8; font-weight:600; text-decoration:none;">View Official BSE Exchange Filing PDF</a></p>'
+        f'<p style="margin-top:14px; font-size:14px;"><strong>Official Reference:</strong> <a href="{html.escape(source_url, quote=True)}" target="_blank" rel="nofollow noopener" style="color:#1d4ed8; font-weight:600; text-decoration:none;">View Official {exchange} Exchange Filing PDF</a></p>'
         if source_url else ""
     )
 
@@ -1960,10 +1952,11 @@ def build_post_html(data, doc_type, screener_info, source_url, thumb_url, relate
 
     thumb_block = ""
     if thumb_url:
+        ex_code = f"{exchange}: {html.escape(str(scrip_code))}" if scrip_code else f"{exchange} Listed"
         thumb_block = f"""
         <figure style="margin: 0 0 18px 0; text-align: center;">
           <img src="{thumb_url}" alt="{headline_clean}" title="{headline_clean}" width="1280" height="720" fetchpriority="high" style="width: 100%; height: auto; border-radius: 12px; box-shadow: 0 4px 16px rgba(15,23,42,0.12);" />
-          <figcaption style="font-size: 12.5px; color: #64748b; margin-top: 6px;">{comp_name} (BSE: {html.escape(str(scrip_code or 'Listed'))}) | {cap_label} | Market Munafa</figcaption>
+          <figcaption style="font-size: 12.5px; color: #64748b; margin-top: 6px;">{comp_name} ({ex_code}) | {cap_label} | Market Munafa</figcaption>
         </figure>
         """
 
@@ -2031,7 +2024,7 @@ def build_post_html(data, doc_type, screener_info, source_url, thumb_url, relate
 
       <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 22px 0;" />
       <p style="font-size: 12.5px; color: #64748b; line-height: 1.6;">
-        <strong>Disclaimer:</strong> This independent equity report on Market Munafa is prepared strictly from publicly disclosed BSE filings and financial ratios for informational and educational purposes only. It is not investment advice. Please consult a SEBI-registered financial advisor before making any investment decision.
+        <strong>Disclaimer:</strong> This independent equity report on Market Munafa is prepared strictly from publicly disclosed {exchange} filings and financial ratios for informational and educational purposes only. It is not investment advice. Please consult a SEBI-registered financial advisor before making any investment decision.
       </p>
     </article>
     """
@@ -2041,7 +2034,7 @@ def build_post_html(data, doc_type, screener_info, source_url, thumb_url, relate
 # ==========================================
 # 9. TELEGRAM & SAFE BLOGGER PUBLISHER
 # ==========================================
-def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, thumb_url, chart_url):
+def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, thumb_url, chart_url, exchange="BSE"):
     if not SEND_TO_TELEGRAM or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     comp_name = html.escape(str(data.get("company_short_name", "Company")))
@@ -2068,7 +2061,7 @@ def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, 
             f"({html.escape(str(ord_info.get('client_or_awarder', '-')))})\n\n"
         )
     else:
-        header_title = f"📊 <b>{comp_name} - {qtr_lbl} ઓફિશિયલ BSE PDF રિઝલ્ટ</b>"
+        header_title = f"📊 <b>{comp_name} - {qtr_lbl} ઓફિશિયલ {exchange} PDF રિઝલ્ટ</b>"
         rev = data.get("revenue", {"curr": "0", "prev": "0", "growth": "N/A"})
         gp = data.get("gross_profit", {"curr": "0", "prev": "0", "growth": "N/A"})
         np_d = data.get("net_profit", {"curr": "0", "prev": "0", "growth": "N/A"})
@@ -2094,7 +2087,7 @@ def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, 
     if blog_url:
         msg_html += f"\n🌐 <a href=\"{html.escape(blog_url, quote=True)}\"><b>ગુજરાતી, હિન્દી અને English માં પૂરો રિપોર્ટ વાંચો</b></a>"
     if source_url:
-        msg_html += f" | <a href=\"{html.escape(source_url, quote=True)}\"><b>BSE PDF</b></a>"
+        msg_html += f" | <a href=\"{html.escape(source_url, quote=True)}\"><b>{exchange} PDF</b></a>"
     msg_html += "\n\n✅ <b>Market Munafa</b>"
 
     try:
@@ -2281,6 +2274,7 @@ def blogger_publish(title, content_html, labels, meta_description):
 
 def publish_item(item, doc_type, ai_data, screener_info, blog_state, item_id, comp_key, scrip_key, file_key, scrip_code, theme_index):
     source_url = item["link"]
+    exchange = item.get("exchange", "BSE")
     c_short = ai_data.get("company_short_name") or screener_info.get("screener_company_name") or item["title"]
     raw_title = ai_data.get("seo_title") or (
         f"{c_short} Order Win Update & Financial Overview" if doc_type == "order" else f"{c_short} Quarterly Results & Fundamental Analysis"
@@ -2288,7 +2282,6 @@ def publish_item(item, doc_type, ai_data, screener_info, blog_state, item_id, co
     labels = select_approved_labels(doc_type, screener_info)
     related_posts = pick_related_posts(blog_state.get("recent_posts", []), labels, max_links=3)
 
-    # દરેક પોસ્ટ માટે અલગ યુનિક ઓટો-થમ્બનેલ બનાવી GitHub પર લાઈવ કરો
     slug_id = hashlib.md5(f"{c_short}|{scrip_code}|{item_id}".encode("utf-8")).hexdigest()[:10]
     thumb_badge = ai_data.get("thumb_badge") or ("ORDER WIN" if doc_type == "order" else "Q2 RESULTS")
     thumb_hl = ai_data.get("thumb_headline") or raw_title[:45]
@@ -2300,6 +2293,7 @@ def publish_item(item, doc_type, ai_data, screener_info, blog_state, item_id, co
         price_disp=ai_data.get("price_display", screener_info["price_str"]),
         slug_id=slug_id,
         theme_index=theme_index,
+        exchange=exchange,
     )
 
     blog_html, yoy_chart_url, meta_desc = build_post_html(
@@ -2313,6 +2307,7 @@ def publish_item(item, doc_type, ai_data, screener_info, blog_state, item_id, co
         scrip_key=scrip_key,
         file_key=file_key,
         scrip_code=scrip_code,
+        exchange=exchange,
     )
 
     blog_url = ""
@@ -2325,14 +2320,14 @@ def publish_item(item, doc_type, ai_data, screener_info, blog_state, item_id, co
             blog_url = res_url
             mark_posted(item_id, comp_key, scrip_key, file_key, item["title"], source_url)
             blog_state["recent_posts"].insert(0, {"title": raw_title, "url": blog_url, "labels": labels})
-            log.info("✅ Published 200/200 Verified Post (%s) | Labels: %s | URL: %s", doc_type, labels, blog_url)
+            log.info("✅ Published 200/200 Verified Post (%s | %s) | Labels: %s | URL: %s", exchange, doc_type, labels, blog_url)
 
-    send_telegram_gujarati(ai_data, doc_type, screener_info, blog_url, source_url, thumb_url, yoy_chart_url)
+    send_telegram_gujarati(ai_data, doc_type, screener_info, blog_url, source_url, thumb_url, yoy_chart_url, exchange=exchange)
     return not blogger_quota_hit
 
 
 # ==========================================
-# 10. MAIN RUNNER (UP TO 10 VERIFIED POSTS PER RUN)
+# 10. MAIN RUNNER (BSE + NSE FINANCIAL RESULTS)
 # ==========================================
 def run():
     init_db()
@@ -2340,12 +2335,12 @@ def run():
     blog_state = get_existing_blogger_posts()
 
     all_items = fetch_bse_json_announcements()
-    for kind, feed_url in FEEDS.items():
+    for kind, feed_url in FEEDS:
         try:
             items = parse_feed(feed_url, kind)
             all_items.extend(items)
-        except Exception:
-            pass
+        except Exception as exc:
+            log.warning("Feed fetch skipped (%s): %s", feed_url, exc)
 
     if not all_items:
         log.warning("No feed items retrieved.")
@@ -2363,6 +2358,7 @@ def run():
         if not doc_type:
             continue
 
+        exchange = item.get("exchange", "BSE")
         comp_basis = item.get("company_raw") or item["title"]
         comp_key = normalize_company_key(comp_basis, doc_type)
         scrip_code = item.get("scrip_code") or extract_scrip_code(item["title"])
@@ -2386,21 +2382,26 @@ def run():
                 log.info("Skipping Micro-Cap/Unlisted/Mismatched Stock (Mkt Cap: %s): %s", screener_info["market_cap"], item["title"])
                 continue
 
+            # NSE આઇટમમાં BSE કોડ ન હોય તો Screener પરથી મળેલો BSE કોડ PDF બેકઅપ અને ડુપ્લીકેટ ચેક માટે વાપરો
+            effective_scrip = scrip_code or screener_info.get("bse_code", "")
+            effective_scrip_key = f"{doc_type}_{effective_scrip}" if effective_scrip else scrip_key
+            if effective_scrip_key and effective_scrip_key in blog_state["scrip_keys"]:
+                continue
+
             if screener_info.get("screener_company_name"):
                 scr_comp_key = normalize_company_key(screener_info["screener_company_name"], doc_type)
                 if scr_comp_key and scr_comp_key in blog_state["comp_keys"]:
                     continue
 
-            source_text, pdf_bytes, pdf_text_len = get_document_payload(item, scrip_code=scrip_code)
+            source_text, pdf_bytes, pdf_text_len = get_document_payload(item, scrip_code=effective_scrip)
             file_key = extract_file_key(item["link"]) or file_key
 
             if not pdf_bytes:
-                log.warning("Skipping %s because official BSE PDF could not be downloaded.", item["title"])
+                log.warning("Skipping %s because official %s PDF could not be downloaded.", item["title"], exchange)
                 continue
 
-            # કડક 200/200 વેરિફિકેશન (સીધી પોસ્ટ બંધ — ભૂલ સુધરે પછી જ આગળ વધશે)
             ai_data = generate_and_verify_200_of_200(
-                item["title"], scrip_code, doc_type, source_text, pdf_bytes, screener_info, pdf_text_len
+                item["title"], effective_scrip, doc_type, source_text, pdf_bytes, screener_info, pdf_text_len, exchange=exchange
             )
             if not ai_data:
                 continue
@@ -2419,9 +2420,9 @@ def run():
                 blog_state=blog_state,
                 item_id=item_id,
                 comp_key=final_comp_key,
-                scrip_key=scrip_key,
+                scrip_key=effective_scrip_key,
                 file_key=file_key,
-                scrip_code=scrip_code,
+                scrip_code=effective_scrip,
                 theme_index=published_count,
             )
 
@@ -2429,8 +2430,8 @@ def run():
                 blog_state["comp_keys"].add(comp_key)
             if ai_comp_key:
                 blog_state["comp_keys"].add(ai_comp_key)
-            if scrip_key:
-                blog_state["scrip_keys"].add(scrip_key)
+            if effective_scrip_key:
+                blog_state["scrip_keys"].add(effective_scrip_key)
             if file_key:
                 blog_state["file_keys"].add(file_key)
 
