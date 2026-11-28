@@ -1,33 +1,73 @@
-name: MarketMunafa 30 Stocks Bot
+name: MarketMunafa BSE PDF Bot
 
 on:
   schedule:
-    - cron: '0 13 * * *'
+    # દર 2 કલાકે આપમેળે ચાલશે
+    - cron: "0 */2 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
+concurrency:
+  group: marketmunafa-bse-bot
+  cancel-in-progress: false
+
 jobs:
-  run-bot:
+  run-marketmunafa-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
+          python-version: "3.11"
 
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install curl_cffi requests PyPDF2 beautifulsoup4 google-generativeai openai google-api-python-client google-auth numpy Pillow
 
       - name: Run MarketMunafa Bot
         env:
           BLOG_ID: ${{ secrets.BLOG_ID }}
+          BLOG_BASE_URL: "https://marketmunafa.blogspot.com"
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
           CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
           REFRESH_TOKEN: ${{ secrets.REFRESH_TOKEN }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GOOGLE_REFRESH_TOKEN: ${{ secrets.GOOGLE_REFRESH_TOKEN }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+          GEMINI_API_KEY_1: ${{ secrets.GEMINI_API_KEY_1 }}
+          GEMINI_API_KEY_2: ${{ secrets.GEMINI_API_KEY_2 }}
+          GEMINI_MODEL: "gemini-3.5-flash-lite"
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GITHUB_REPO: ${{ github.repository }}
+          GITHUB_BRANCH: "main"
+          MIN_MARKET_CAP_CR: "500.0"
+          MAX_POSTS_PER_RUN: "10"
+          POST_TO_BLOGGER: "true"
+          SEND_TO_TELEGRAM: "true"
         run: python bse_pdf_bot.py
+
+      - name: Save Database & Thumbnails
+        if: always()
+        run: |
+          git config --local user.name "MarketMunafa Bot"
+          git config --local user.email "action@github.com"
+          git add marketmunafa_seen.sqlite3 thumbnails/ 2>/dev/null || true
+          if ! git diff --cached --quiet; then
+            git commit -m "Update seen DB and thumbnails"
+            git pull --rebase origin main || true
+            git push origin main
+          fi
