@@ -3,11 +3,13 @@ import time
 import re
 import json
 import html
+import random
 import hashlib
 import logging
 import sqlite3
 import tempfile
 import warnings
+import subprocess
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
@@ -19,6 +21,8 @@ import requests
 import xml.etree.ElementTree as ET
 import PyPDF2
 from bs4 import BeautifulSoup
+import numpy as np
+from PIL import Image, ImageDraw, ImageFont, ImageFilter, ImageEnhance
 import google.generativeai as genai
 
 try:
@@ -29,8 +33,15 @@ except ImportError:
 # ==========================================
 # 1. CONFIGURATION & CREDENTIALS (FROM ENV / GITHUB SECRETS)
 # ==========================================
+IST_TZ = timezone(timedelta(hours=5, minutes=30))
+
 BLOG_ID = os.getenv("BLOG_ID", "6996150531679127159").strip('"\' ')
 BLOG_BASE_URL = os.getenv("BLOG_BASE_URL", "https://marketmunafa.blogspot.com").strip('"\' ').rstrip("/")
+SITE_LOGO_URL = os.getenv(
+    "SITE_LOGO_URL",
+    "https://blogger.googleusercontent.com/img/b/R29vZ2xl/AVvXsEgXG-GojgyTIZWy4ftRRsgpLsDMxrAEKCRb_BnZsfVTKT0_T9IELdKQYKgACOQkhus69xfx_xg-iVyLvP2-RAki8voVBwja88Dfsg_tQRQR7JvgegMGFfEQfm73oO00WeTo1vPUHghTXmXd_by6k0C-m3Y_5JhoYEjUF8Y8V3KKTbGnUn53dUY-6AN32_A/s1254/1001173067.png",
+).strip('"\' ')
+
 GOOGLE_CLIENT_ID = (os.getenv("GOOGLE_CLIENT_ID") or os.getenv("CLIENT_ID") or "").strip('"\' ')
 GOOGLE_CLIENT_SECRET = (os.getenv("GOOGLE_CLIENT_SECRET") or os.getenv("CLIENT_SECRET") or "").strip('"\' ')
 GOOGLE_REFRESH_TOKEN = (os.getenv("GOOGLE_REFRESH_TOKEN") or os.getenv("REFRESH_TOKEN") or "").strip('"\' ')
@@ -38,21 +49,39 @@ GOOGLE_REFRESH_TOKEN = (os.getenv("GOOGLE_REFRESH_TOKEN") or os.getenv("REFRESH_
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip('"\' ')
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip('"\' ')
 
-GEMINI_API_KEYS = [
-    k.strip('"\' ') for k in re.split(r"[,\s]+", os.getenv("GEMINI_API_KEY", "")) if k.strip('"\' ')
-]
+RAW_GEMINI = " ".join([
+    os.getenv("GEMINI_API_KEY", ""),
+    os.getenv("GEMINI_API_KEYS", ""),
+    os.getenv("GEMINI_API_KEY_1", ""),
+    os.getenv("GEMINI_API_KEY_2", ""),
+])
+GEMINI_API_KEYS = list(dict.fromkeys([
+    k.strip('"\' ') for k in re.split(r"[,\s;]+", RAW_GEMINI) if len(k.strip('"\' ')) > 10
+]))
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.5-flash-lite").strip('"\' ')
 GEMINI_MAX_RPM = 12
 GEMINI_MAX_TPM = 240000
 GEMINI_MAX_RPD = 500
 
 OPENROUTER_KEYS = [
-    k.strip('"\' ') for k in re.split(r"[,\s]+", os.getenv("OPENROUTER_API_KEY", "")) if k.strip('"\' ')
+    k.strip('"\' ') for k in re.split(r"[,\s;]+", os.getenv("OPENROUTER_API_KEY", "")) if len(k.strip('"\' ')) > 10
 ]
 OPENROUTER_MAX_RPM = 5
 OPENROUTER_MAX_RPD = 20
-
 RATE_WINDOW_SECONDS = 60.0
+
+# GitHub & Thumbnail Settings
+GITHUB_REPO = (os.getenv("GITHUB_REPO") or os.getenv("GITHUB_REPOSITORY") or "").strip('"\' ')
+GITHUB_BRANCH = os.getenv("GITHUB_BRANCH", "main").strip('"\' ')
+THUMBNAIL_DIR = "thumbnails"
+os.makedirs(THUMBNAIL_DIR, exist_ok=True)
+AUTHOR_IMAGE_CANDIDATES = [
+    "1001185905_2.png",
+    "author.png",
+    "1001185905.png",
+    "author.jpg",
+    "author.jpeg",
+]
 
 # Strict 8 Approved Blog Categories
 APPROVED_LABELS = [
@@ -66,9 +95,12 @@ APPROVED_LABELS = [
     "SILVER",
 ]
 
-# Quality & Indexing Protection Filters
-MIN_MARKET_CAP_CR = float(os.getenv("MIN_MARKET_CAP_CR", "100.0"))
-MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "3"))
+# Quality, Safety & 200/200 Gate Settings
+MIN_MARKET_CAP_CR = float(os.getenv("MIN_MARKET_CAP_CR", "500.0"))
+MAX_POSTS_PER_RUN = int(os.getenv("MAX_POSTS_PER_RUN", "10"))
+REQUIRED_TOTAL_SCORE = 200    # 100 Python Hard Gate + 100 Chief Editor Audit = 200/200 ફરજિયાત
+MAX_AUDIT_FIX_ROUNDS = 3
+MIN_ENGLISH_WORDS = 460
 
 FEEDS = {
     "result": "https://www.bseindia.com/Data/XML/FinancialResultsFeed.aspx",
@@ -83,6 +115,34 @@ MAX_TEXT_CHARS = int(os.getenv("MAX_TEXT_CHARS", "20000"))
 REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "35"))
 POST_TO_BLOGGER = os.getenv("POST_TO_BLOGGER", "true").lower() == "true"
 SEND_TO_TELEGRAM = os.getenv("SEND_TO_TELEGRAM", "true").lower() == "true"
+
+# AI જેવા લાગતા રોબોટિક શબ્દો તથા AdSense/YMYL પ્રતિબંધિત શબ્દો
+BANNED_AI_AND_POLICY_PHRASES = [
+    "delve into", "tapestry", "in conclusion", "game-changer", "testament to",
+    "ever-evolving", "rollercoaster", "pivotal moment", "underscores the importance",
+    "double-edged sword", "landscape of", "in today's fast-paced", "it is worth noting",
+    "all eyes are on", "only time will tell", "guaranteed return", "sure shot multibagger",
+    "strong buy recommendation", "target price 2027", "target price 2028", "target price 2030",
+    "विकास ऑर्डर", "यह ध्यान देने योग्य है", "निष्कर्ष के तौर पर",
+    "અંતમાં કહીએ તો", "એ નોંધવું મહત્વપૂર્ણ છે",
+]
+
+# ભારતીય આંકડા (૦-૯, ०-९) ને ફરજિયાત અંગ્રેજી 0-9 માં ફેરવવા માટે
+INDIC_DIGIT_TRANS = str.maketrans({
+    chr(base + d): str(d)
+    for base in [0x0966, 0x0AE6]
+    for d in range(10)
+})
+
+# દરેક પોસ્ટ માટે અલગ-અલગ 6 પ્રીમિયમ એડિટોરિયલ થમ્બનેલ થીમ
+THUMB_THEMES = [
+    {"bg1": (10, 22, 46), "bg2": (24, 58, 108), "accent": (250, 204, 21), "accent_txt": (15, 23, 42), "badge": (16, 150, 72), "glow": (56, 189, 248), "chart": (34, 197, 94)},
+    {"bg1": (8, 34, 34), "bg2": (16, 86, 80), "accent": (253, 224, 71), "accent_txt": (15, 23, 42), "badge": (234, 88, 12), "glow": (45, 212, 191), "chart": (74, 222, 128)},
+    {"bg1": (26, 14, 48), "bg2": (68, 28, 118), "accent": (251, 191, 36), "accent_txt": (15, 23, 42), "badge": (225, 29, 72), "glow": (192, 132, 252), "chart": (56, 189, 248)},
+    {"bg1": (20, 24, 34), "bg2": (48, 58, 82), "accent": (56, 189, 248), "accent_txt": (15, 23, 42), "badge": (22, 163, 74), "glow": (250, 204, 21), "chart": (52, 211, 153)},
+    {"bg1": (36, 14, 20), "bg2": (98, 26, 40), "accent": (250, 204, 21), "accent_txt": (15, 23, 42), "badge": (14, 116, 144), "glow": (251, 146, 60), "chart": (250, 204, 21)},
+    {"bg1": (12, 32, 22), "bg2": (24, 78, 52), "accent": (253, 224, 71), "accent_txt": (15, 23, 42), "badge": (37, 99, 235), "glow": (74, 222, 128), "chart": (134, 239, 172)},
+]
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -178,79 +238,7 @@ OPENROUTER_ROTATOR = MultiKeyRotator("OpenRouter Backup", OPENROUTER_KEYS, OPENR
 
 
 # ==========================================
-# 3. CLEAN 3-LANGUAGE TRANSLATOR (GU, EN, HI)
-# ==========================================
-def translate_text_indic(text, target_lang):
-    if not text or not str(text).strip():
-        return ""
-    clean_txt = html.unescape(str(text)).strip()
-    try:
-        url = (
-            f"https://translate.googleapis.com/translate_a/single"
-            f"?client=gtx&sl=en&tl={target_lang}&dt=t&q={urllib.parse.quote(clean_txt)}"
-        )
-        res = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            translated = "".join([part[0] for part in data[0] if part and part[0]])
-            if translated:
-                return html.unescape(translated).strip()
-    except Exception:
-        pass
-    return clean_txt
-
-
-def build_multilang_pack(data):
-    lead_en = html.unescape(str(data.get("seo_lead_summary") or "")).strip()
-    hooks_en = data.get("web_story_hook") or []
-    if isinstance(hooks_en, str):
-        hooks_en = [hooks_en]
-    highlights_en = data.get("key_highlights") or []
-    sections_en = data.get("seo_article_sections") or []
-    faqs_en = data.get("faqs") or []
-
-    lang_packs = {
-        "en": {
-            "lead": lead_en,
-            "hooks": [html.unescape(str(h)).strip() for h in hooks_en[:4]],
-            "highlights": [html.unescape(str(k)).strip() for k in highlights_en[:4]],
-            "sections": [
-                {"heading": html.unescape(str(s.get("heading", ""))).strip(), "body": html.unescape(str(s.get("body", ""))).strip()}
-                for s in sections_en[:3]
-            ],
-            "faqs": [
-                {"q": html.unescape(str(f.get("q", ""))).strip(), "a": html.unescape(str(f.get("a", ""))).strip()}
-                for f in faqs_en[:4]
-            ],
-        }
-    }
-
-    for lang_code in ("gu", "hi"):
-        lang_packs[lang_code] = {
-            "lead": translate_text_indic(lead_en, lang_code),
-            "hooks": [translate_text_indic(h, lang_code) for h in hooks_en[:4]],
-            "highlights": [translate_text_indic(k, lang_code) for k in highlights_en[:4]],
-            "sections": [
-                {
-                    "heading": translate_text_indic(s.get("heading", ""), lang_code),
-                    "body": translate_text_indic(s.get("body", ""), lang_code),
-                }
-                for s in sections_en[:3]
-            ],
-            "faqs": [
-                {
-                    "q": translate_text_indic(f.get("q", ""), lang_code),
-                    "a": translate_text_indic(f.get("a", ""), lang_code),
-                }
-                for f in faqs_en[:4]
-            ],
-        }
-
-    return lang_packs
-
-
-# ==========================================
-# 4. DUPLICATE PROTECTION & HELPERS
+# 3. GENERAL & DEDUPLICATION HELPERS
 # ==========================================
 STOP_WORDS_REGEX = re.compile(
     r"\b(q1|q2|q3|q4|fy\d+|fy\d{2}-\d{2}|h1|h2|9m|results|result|order|orders|contract|contracts|"
@@ -264,6 +252,20 @@ STOP_WORDS_REGEX = re.compile(
     r"chemicals|chemical|steel|motors|motor|bank|holding|holdings|group|commercial|trading|exports)\b",
     flags=re.I,
 )
+
+
+def get_ist_now():
+    return datetime.now(IST_TZ)
+
+
+def enforce_english_digits(obj):
+    if isinstance(obj, str):
+        return obj.translate(INDIC_DIGIT_TRANS)
+    if isinstance(obj, list):
+        return [enforce_english_digits(x) for x in obj]
+    if isinstance(obj, dict):
+        return {k: enforce_english_digits(v) for k, v in obj.items()}
+    return obj
 
 
 def local_name(tag):
@@ -326,6 +328,16 @@ def extract_file_key(url):
     path = urlparse(url).path.lower()
     fname = path.rsplit("/", 1)[-1].strip()
     return fname if fname.endswith((".pdf", ".xml", ".xbrl")) else ""
+
+
+def classify_market_cap_label(mcap_cr):
+    if mcap_cr >= 20000:
+        return "Large Cap"
+    if mcap_cr >= 5000:
+        return "Mid Cap"
+    if mcap_cr >= 500:
+        return "Small Cap"
+    return "Micro Cap"
 
 
 def init_db():
@@ -437,19 +449,268 @@ def shorten_period_label(lbl):
 
 
 # ==========================================
+# 4. CUSTOM AUTO-THUMBNAIL GENERATOR (UNIQUE PER POST + AUTHOR PHOTO)
+# ==========================================
+def load_author_photo():
+    for fname in AUTHOR_IMAGE_CANDIDATES:
+        if os.path.exists(fname):
+            log.info("Loaded author photo for thumbnail: %s", fname)
+            return Image.open(fname).convert("RGBA")
+    for fname in sorted(os.listdir(".")):
+        if fname.lower().endswith((".png", ".jpg", ".jpeg", ".webp")) and not fname.startswith("thumb_"):
+            log.info("Auto-detected author photo: %s", fname)
+            return Image.open(fname).convert("RGBA")
+    log.warning("Author photo (1001185905_2.png / author.png) not found in repo root.")
+    return None
+
+
+def remove_white_bg_numpy(img_rgba, threshold=236):
+    data = np.array(img_rgba)
+    r, g, b, a = data[:, :, 0], data[:, :, 1], data[:, :, 2], data[:, :, 3]
+    white_mask = (r >= threshold) & (g >= threshold) & (b >= threshold)
+    data[white_mask, 3] = 0
+    near_white = (~white_mask) & (r >= threshold - 20) & (g >= threshold - 20) & (b >= threshold - 20) & (a > 0)
+    avg = ((r[near_white].astype(np.int32) + g[near_white].astype(np.int32) + b[near_white].astype(np.int32)) // 3)
+    data[near_white, 3] = np.clip((threshold - avg) * 12, 0, 255).astype(np.uint8)
+    return Image.fromarray(data)
+
+
+def load_thumb_font(size, bold=True):
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        "arialbd.ttf",
+        "arial.ttf",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            try:
+                return ImageFont.truetype(p, size)
+            except Exception:
+                pass
+    return ImageFont.load_default()
+
+
+def wrap_lines_to_px(draw, text, font, max_w):
+    words = text.split()
+    lines, cur = [], ""
+    for w in words:
+        test = f"{cur} {w}".strip()
+        bbox = draw.textbbox((0, 0), test, font=font)
+        if (bbox[2] - bbox[0]) <= max_w:
+            cur = test
+        else:
+            if cur:
+                lines.append(cur)
+            cur = w
+    if cur:
+        lines.append(cur)
+    return lines
+
+
+def fit_text_box(draw, text, max_w, start_sz=54, min_sz=28, max_lines=2):
+    for sz in range(start_sz, min_sz - 1, -2):
+        fnt = load_thumb_font(sz, bold=True)
+        lines = wrap_lines_to_px(draw, text, fnt, max_w)
+        if len(lines) <= max_lines and all((draw.textbbox((0, 0), l, font=fnt)[2] - draw.textbbox((0, 0), l, font=fnt)[0]) <= max_w for l in lines):
+            return fnt, lines
+    fnt = load_thumb_font(min_sz, bold=True)
+    return fnt, wrap_lines_to_px(draw, text, fnt, max_w)[:max_lines]
+
+
+def draw_subtle_market_bg(canvas, th, seed_str):
+    W, H = canvas.size
+    overlay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    odraw = ImageDraw.Draw(overlay)
+
+    for x in range(0, W, 64):
+        odraw.line([(x, 0), (x, H)], fill=(255, 255, 255, 13), width=1)
+    for y in range(0, H, 64):
+        odraw.line([(0, y), (W, y)], fill=(255, 255, 255, 13), width=1)
+
+    rng = random.Random(seed_str)
+    pts = []
+    base_y = 560
+    for i in range(18):
+        cx = 45 + i * 44
+        base_y = max(210, min(585, base_y + rng.randint(-36, 20)))
+        body_h = rng.randint(24, 68)
+        is_green = rng.random() > 0.32
+        col = (34, 197, 94, 46) if is_green else (239, 68, 68, 38)
+        odraw.line([(cx, max(150, base_y - body_h // 2 - 22)), (cx, min(635, base_y + body_h // 2 + 22))], fill=col, width=3)
+        odraw.rounded_rectangle([cx - 8, base_y - body_h // 2, cx + 8, base_y + body_h // 2], radius=3, fill=col)
+        pts.append((cx, base_y - 18))
+
+    if len(pts) >= 2:
+        glow = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+        ImageDraw.Draw(glow).line(pts, fill=(*th["chart"], 130), width=7)
+        glow = glow.filter(ImageFilter.GaussianBlur(radius=6))
+        overlay = Image.alpha_composite(overlay, glow)
+        ImageDraw.Draw(overlay).line(pts, fill=(*th["chart"], 195), width=3)
+
+    return Image.alpha_composite(canvas, overlay)
+
+
+def create_and_push_unique_thumbnail(comp_short, thumb_headline, badge_text, cap_label, price_disp, slug_id, theme_index=0):
+    """1280x720 દરેક પોસ્ટ માટે અલગ થીમ, ઓટો-ફિટ ટેક્સ્ટ અને તમારા ફોટા સાથેનું પ્રોફેશનલ થમ્બનેલ."""
+    W, H = 1280, 720
+    th = THUMB_THEMES[theme_index % len(THUMB_THEMES)]
+
+    canvas = Image.new("RGBA", (W, H), (*th["bg1"], 255))
+    draw = ImageDraw.Draw(canvas)
+    for y in range(H):
+        t = y / H
+        r = int(th["bg1"][0] + (th["bg2"][0] - th["bg1"][0]) * t)
+        g = int(th["bg1"][1] + (th["bg2"][1] - th["bg1"][1]) * t)
+        b = int(th["bg1"][2] + (th["bg2"][2] - th["bg1"][2]) * t)
+        draw.line([(0, y), (W, y)], fill=(r, g, b, 255))
+
+    canvas = draw_subtle_market_bg(canvas, th, slug_id)
+
+    # સ્ટુડિયો લાઈટ ગ્લો અને ડાબી બાજુ રીડેબિલિટી વિગ્નેટ
+    lights = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    ldraw = ImageDraw.Draw(lights)
+    ldraw.ellipse([710, 30, 1310, 650], fill=(*th["glow"], 95))
+    ldraw.ellipse([800, 110, 1220, 560], fill=(*th["accent"], 75))
+    ldraw.ellipse([-120, -80, 780, 740], fill=(4, 10, 22, 145))
+    lights = lights.filter(ImageFilter.GaussianBlur(radius=45))
+    canvas = Image.alpha_composite(canvas, lights)
+
+    # જમણી બાજુ તમારો ફોટો + સ્ટુડિયો રિમ-લાઈટ
+    author = load_author_photo()
+    if author is not None:
+        try:
+            w_a, h_a = author.size
+            corners = [author.getpixel((2, 2)), author.getpixel((w_a - 3, 2)), author.getpixel((2, h_a - 3)), author.getpixel((w_a - 3, h_a - 3))]
+            if sum(1 for r, g, b, a in corners if a > 220 and r > 230 and g > 230 and b > 230) >= 2:
+                author = remove_white_bg_numpy(author)
+            bbox = author.getbbox()
+            if bbox:
+                author = author.crop(bbox)
+
+            rgb_p = author.convert("RGB")
+            rgb_p = ImageEnhance.Contrast(rgb_p).enhance(1.07)
+            rgb_p = ImageEnhance.Color(rgb_p).enhance(1.06)
+            rgb_p = ImageEnhance.Sharpness(rgb_p).enhance(1.16)
+            author_enh = rgb_p.convert("RGBA")
+            author_enh.putalpha(author.getchannel("A"))
+            author = author_enh
+
+            target_h = 610
+            ratio = target_h / author.height
+            target_w = int(author.width * ratio)
+            if target_w > 540:
+                scale = 540 / target_w
+                target_w = 540
+                target_h = int(target_h * scale)
+
+            author = author.resize((target_w, target_h), Image.Resampling.LANCZOS)
+            paste_x = W - target_w - 16
+            paste_y = H - target_h - 44
+
+            rim_layer = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+            rim_fill = Image.new("RGBA", author.size, (*th["accent"], 210))
+            rim_fill.putalpha(author.getchannel("A"))
+            rim_layer.paste(rim_fill, (paste_x - 6, paste_y - 4))
+            rim_layer = rim_layer.filter(ImageFilter.GaussianBlur(radius=18))
+            canvas = Image.alpha_composite(canvas, rim_layer)
+            canvas.paste(author, (paste_x, paste_y), author)
+        except Exception as exc:
+            log.warning("Thumbnail author photo warning: %s", exc)
+
+    draw = ImageDraw.Draw(canvas)
+    draw.rectangle([0, 0, W, 9], fill=(*th["accent"], 255))
+
+    TEXT_X = 56
+    MAX_W = 660
+
+    # 1) ટોપ બેજ + કેપ કેટેગરી
+    clean_badge = re.sub(r"[^A-Za-z0-9\s\-&|]", "", f"{badge_text} | {cap_label}").strip().upper()[:30]
+    f_badge = load_thumb_font(24, bold=True)
+    tb = draw.textbbox((0, 0), clean_badge, font=f_badge)
+    bw = min(MAX_W, (tb[2] - tb[0]) + 56)
+    draw.rounded_rectangle([TEXT_X, 46, TEXT_X + bw, 98], radius=10, fill=(*th["badge"], 255))
+    draw.text((TEXT_X + 28, 57), clean_badge, font=f_badge, fill=(255, 255, 255, 255))
+
+    # 2) કંપનીનું નામ (ગોલ્ડન હાઈલાઈટ બેનરમાં, ઓટો-ફિટ — ક્યારેય કપાશે નહીં)
+    clean_comp = " ".join(re.sub(r"[^\x20-\x7E&]", "", str(comp_short)).split()).upper()[:26]
+    f_comp, comp_lines = fit_text_box(draw, clean_comp, MAX_W - 28, start_sz=54, min_sz=34, max_lines=2)
+    y_cur = 128
+    for idx, line in enumerate(comp_lines):
+        lb = draw.textbbox((0, 0), line, font=f_comp)
+        lw, lh = lb[2] - lb[0], lb[3] - lb[1]
+        if idx == 0:
+            draw.rounded_rectangle([TEXT_X - 6, y_cur - 6, TEXT_X + lw + 26, y_cur + lh + 18], radius=10, fill=(*th["accent"], 255))
+            draw.text((TEXT_X + 10, y_cur), line, font=f_comp, fill=(*th["accent_txt"], 255))
+            y_cur += lh + 32
+        else:
+            draw.text((TEXT_X + 4, y_cur + 4), line, font=f_comp, fill=(0, 0, 0, 220))
+            draw.text((TEXT_X, y_cur), line, font=f_comp, fill=(255, 255, 255, 255))
+            y_cur += lh + 22
+
+    # 3) મુખ્ય આંકડાકીય હેડલાઈન (ઓટો-ફિટ 3D શેડો સાથે)
+    clean_hl = " ".join(re.sub(r"[^\x20-\x7E₹%+.-]", "", str(thumb_headline)).split()).upper()
+    f_hl, hl_lines = fit_text_box(draw, clean_hl, MAX_W, start_sz=46, min_sz=30, max_lines=3)
+    y_cur += 10
+    for line in hl_lines:
+        lb = draw.textbbox((0, 0), line, font=f_hl)
+        lh = lb[3] - lb[1]
+        draw.text((TEXT_X + 4, y_cur + 4), line, font=f_hl, fill=(0, 0, 0, 230))
+        draw.text((TEXT_X, y_cur), line, font=f_hl, fill=(255, 255, 255, 255), stroke_width=2, stroke_fill=(0, 0, 0, 220))
+        y_cur += lh + 20
+
+    # 4) ભાવ અને BSE ટૅગ પિલ
+    clean_price = re.sub(r"[^\x20-\x7E₹,.]", "", str(price_disp)).strip()
+    if clean_price and "LIVE" not in clean_price.upper():
+        f_sub = load_thumb_font(25, bold=True)
+        sub_txt = f"SHARE PRICE: {clean_price}   |   OFFICIAL BSE FILING"
+        draw.text((TEXT_X, min(H - 122, y_cur + 14)), sub_txt, font=f_sub, fill=(203, 213, 225, 255))
+
+    # 5) નીચે ફુલ-વિડ્થ ન્યૂઝ બ્રાન્ડ બાર
+    bar_y = H - 72
+    draw.rectangle([0, bar_y, W, H], fill=(10, 15, 28, 248))
+    draw.rectangle([0, bar_y, W, bar_y + 4], fill=(*th["accent"], 255))
+
+    f_brand = load_thumb_font(27, bold=True)
+    f_meta = load_thumb_font(23, bold=False)
+    draw.rounded_rectangle([46, bar_y + 14, 326, H - 12], radius=7, fill=(*th["accent"], 255))
+    draw.text((64, bar_y + 21), "MARKET MUNAFA", font=f_brand, fill=(15, 23, 42, 255))
+
+    date_str = get_ist_now().strftime("%d %b %Y").upper()
+    draw.text((350, bar_y + 23), f"BSE EQUITY RESEARCH   •   {date_str}", font=f_meta, fill=(226, 232, 240, 255))
+
+    filename = f"thumb_{slug_id}.jpg"
+    out_path = os.path.join(THUMBNAIL_DIR, filename)
+    canvas.convert("RGB").save(out_path, "JPEG", quality=92, optimize=True)
+    log.info("Generated custom unique thumbnail: %s", out_path)
+
+    if GITHUB_REPO:
+        try:
+            subprocess.run(["git", "config", "--local", "user.email", "action@github.com"], check=False)
+            subprocess.run(["git", "config", "--local", "user.name", "MarketMunafa Bot"], check=False)
+            subprocess.run(["git", "add", out_path], check=True)
+            subprocess.run(["git", "commit", "-m", f"Add thumbnail {filename}"], check=False)
+            push_res = subprocess.run(["git", "push"], capture_output=True, text=True)
+            if push_res.returncode == 0:
+                log.info("Pushed thumbnail to GitHub: %s", filename)
+            else:
+                log.warning("Git push thumbnail warning: %s", push_res.stderr.strip())
+            time.sleep(2)
+        except Exception as exc:
+            log.warning("Thumbnail git push failed: %s", exc)
+        return f"https://raw.githubusercontent.com/{GITHUB_REPO}/{GITHUB_BRANCH}/{THUMBNAIL_DIR}/{filename}"
+
+    return ""
+
+
+# ==========================================
 # 5. SCREENER FUNDAMENTALS (CONSOLIDATED PRIORITY)
 # ==========================================
 def _extract_quarters_from_soup(soup):
     q_data = {
-        "quarters_text": "",
-        "q_all_labels": [],
-        "q_all_rev": [],
-        "q_all_gp": [],
-        "q_all_np": [],
-        "q_labels": [],
-        "q_rev": [],
-        "q_gp": [],
-        "q_np": [],
+        "quarters_text": "", "q_all_labels": [], "q_all_rev": [], "q_all_gp": [], "q_all_np": [],
+        "q_labels": [], "q_rev": [], "q_gp": [], "q_np": [],
     }
     q_sec = soup.find("section", id="quarters")
     if not q_sec:
@@ -497,42 +758,17 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
         queries.append(clean_name)
 
     info = {
-        "screener_company_name": "",
-        "nse_bse_symbol": scrip_code or "BSE",
-        "price_str": "Live on BSE",
-        "price_num": 0.0,
-        "high_52w": "N/A",
-        "high_52w_num": 0.0,
-        "low_52w": "N/A",
-        "low_52w_num": 0.0,
-        "dist_from_high": "N/A",
-        "dist_from_low": "N/A",
-        "market_cap": "N/A",
-        "market_cap_num": 0.0,
-        "is_eligible_stock": False,
-        "pe_ratio": "N/A",
-        "pb_ratio": "N/A",
-        "industry_pe": "N/A",
-        "roe": "N/A",
-        "roce": "N/A",
-        "eps": "N/A",
-        "div_yield": "N/A",
-        "book_value": "N/A",
-        "total_debt": "₹0 Cr",
-        "curr_debt_num": 0,
-        "prev_debt_num": 0,
-        "debt_to_equity": "0.00",
-        "debt_to_equity_num": 0.0,
-        "face_value": "N/A",
-        "quarters_text": "",
-        "q_all_labels": [],
-        "q_all_rev": [],
-        "q_all_gp": [],
-        "q_all_np": [],
-        "q_labels": [],
-        "q_rev": [],
-        "q_gp": [],
-        "q_np": [],
+        "screener_company_name": "", "nse_bse_symbol": scrip_code or "BSE",
+        "price_str": "Live on BSE", "price_num": 0.0,
+        "high_52w": "N/A", "high_52w_num": 0.0, "low_52w": "N/A", "low_52w_num": 0.0,
+        "dist_from_high": "N/A", "dist_from_low": "N/A",
+        "market_cap": "N/A", "market_cap_num": 0.0, "cap_label": "Small Cap", "is_eligible_stock": False,
+        "pe_ratio": "N/A", "pb_ratio": "N/A", "industry_pe": "N/A", "roe": "N/A", "roce": "N/A",
+        "eps": "N/A", "div_yield": "N/A", "book_value": "N/A",
+        "total_debt": "₹0 Cr", "curr_debt_num": 0, "prev_debt_num": 0,
+        "debt_to_equity": "0.00", "debt_to_equity_num": 0.0, "face_value": "N/A",
+        "quarters_text": "", "q_all_labels": [], "q_all_rev": [], "q_all_gp": [], "q_all_np": [],
+        "q_labels": [], "q_rev": [], "q_gp": [], "q_np": [],
     }
 
     seen_q = set()
@@ -563,7 +799,6 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
 
                 page_html = c_res.text
                 if scrip_code and not re.search(rf"\b{re.escape(str(scrip_code))}\b", page_html):
-                    log.info("Screener page %s does not match BSE Scrip Code %s. Skipping mismatch.", hit_name, scrip_code)
                     continue
 
                 soup = BeautifulSoup(c_res.content, "html.parser")
@@ -599,6 +834,7 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
                         elif "Market Cap" in t and num_txt:
                             info["market_cap"] = f"₹{num_txt} Cr"
                             info["market_cap_num"] = to_float(num_txt)
+                            info["cap_label"] = classify_market_cap_label(info["market_cap_num"])
                         elif ("Stock P/E" in t or t.startswith("P/E")) and num_txt:
                             info["pe_ratio"] = num_txt
                         elif "Book Value" in t and num_txt:
@@ -624,7 +860,6 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
                 if info["market_cap_num"] >= MIN_MARKET_CAP_CR:
                     info["is_eligible_stock"] = True
 
-                # Calculate factual 52-week positioning (NO fabricated future price targets)
                 if info["price_num"] > 0:
                     if info["high_52w_num"] > 0:
                         diff_h = ((info["price_num"] - info["high_52w_num"]) / info["high_52w_num"]) * 100
@@ -670,7 +905,7 @@ def get_screener_fundamentals(comp_title, scrip_code=""):
 def fetch_bse_pdf_url_by_scrip(scrip_code):
     if not scrip_code:
         return "", ""
-    ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    ist_now = get_ist_now()
     today_str = ist_now.strftime("%Y%m%d")
     prev_str = (ist_now - timedelta(days=5)).strftime("%Y%m%d")
 
@@ -692,7 +927,7 @@ def fetch_bse_pdf_url_by_scrip(scrip_code):
 
 
 def fetch_bse_json_announcements():
-    ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
+    ist_now = get_ist_now()
     today_str = ist_now.strftime("%Y%m%d")
     prev_str = (ist_now - timedelta(days=2)).strftime("%Y%m%d")
     output = []
@@ -796,7 +1031,6 @@ def get_document_payload(item, scrip_code=""):
             attach_name = resolved_attach
             item["link"] = resolved_url
             item["attachment_name"] = resolved_attach
-            log.info("Resolved official BSE PDF for %s (%s): %s", item["title"], scrip_code, attach_name)
 
     if url and urlparse(url).path.lower().endswith(".pdf"):
         try:
@@ -838,16 +1072,17 @@ def classify_item(item):
         "investor meet", "earning call", "earnings call", "conference call",
         "audio recording", "transcript of", "prior intimation", "newspaper publication",
         "trading window", "loss of share", "postal ballot", "scrutinizer report",
+        "regulation 74(5)", "independent director", "composition of board",
     )
     result_words = (
         "financial result", "unaudited financial", "audited financial",
         "quarterly result", "half year result", "annual result", "financial results",
         "standalone result", "consolidated result",
     )
-    if any(w in td for w in order_words):
-        return "order"
     if any(w in td for w in ignore_words):
         return ""
+    if any(w in td for w in order_words):
+        return "order"
     if item["kind"] == "result" or any(w in td for w in result_words):
         return "result"
     return ""
@@ -912,22 +1147,18 @@ def verify_and_normalize_pdf_result_numbers(ai_data, screener_info):
 
 
 # ==========================================
-# 7. AI API CALL (MULTIMODAL PDF READER)
+# 7. AI API CALLER & STRICT 200/200 VERIFICATION ENGINE
 # ==========================================
 class DummyResponse:
     def __init__(self, text):
         self.text = text
 
 
-def call_ai_api(prompt_text, pdf_bytes=None, require_pdf_vision=False):
+def call_ai_api(prompt_text, pdf_bytes=None, require_pdf_vision=False, temperature=0.25):
     est_tokens = max(3000, int(len(prompt_text) / 3.5) + (4000 if pdf_bytes else 0))
 
     if GEMINI_API_KEYS:
-        gemini_models = [GEMINI_MODEL, "gemini-2.5-flash", "gemini-2.0-flash"]
-        seen_m = []
-        for m in gemini_models:
-            if m and m not in seen_m:
-                seen_m.append(m)
+        gemini_models = list(dict.fromkeys([m for m in [GEMINI_MODEL, "gemini-3.5-flash-lite"] if m]))
 
         for attempt_round in range(2):
             for _ in range(len(GEMINI_ROTATOR.keys)):
@@ -940,15 +1171,17 @@ def call_ai_api(prompt_text, pdf_bytes=None, require_pdf_vision=False):
                     pass
 
                 key_error = False
-                for m_name in seen_m:
+                for m_name in gemini_models:
                     try:
-                        model = genai.GenerativeModel(m_name)
+                        model = genai.GenerativeModel(
+                            m_name,
+                            generation_config={"temperature": temperature, "response_mime_type": "application/json"},
+                        )
                         if pdf_bytes and len(pdf_bytes) < 19 * 1024 * 1024:
                             resp = model.generate_content([prompt_text, {"mime_type": "application/pdf", "data": pdf_bytes}])
                         else:
                             resp = model.generate_content(prompt_text)
                         if resp and getattr(resp, "text", None):
-                            log.info("Gemini PDF Vision success using model: %s", m_name)
                             return resp
                     except Exception as exc:
                         err_str = str(exc).lower()
@@ -959,10 +1192,10 @@ def call_ai_api(prompt_text, pdf_bytes=None, require_pdf_vision=False):
                 if not key_error:
                     break
             if attempt_round == 0:
-                time.sleep(20)
+                time.sleep(15)
 
     if not require_pdf_vision and OpenAI is not None and OPENROUTER_KEYS:
-        or_models = ["google/gemini-2.5-flash", "google/gemini-2.0-flash-lite-preview-02-05:free", "google/gemma-3-27b-it:free"]
+        or_models = ["google/gemini-2.5-flash", "google/gemma-3-27b-it:free"]
         for _ in range(len(OPENROUTER_ROTATOR.keys)):
             or_idx, or_key = OPENROUTER_ROTATOR.acquire_key(estimated_tokens=est_tokens)
             if or_key is None:
@@ -973,12 +1206,11 @@ def call_ai_api(prompt_text, pdf_bytes=None, require_pdf_vision=False):
                     completion = client.chat.completions.create(
                         model=or_model,
                         messages=[{"role": "user", "content": prompt_text}],
-                        temperature=0.2,
-                        max_tokens=3600,
+                        temperature=temperature,
+                        max_tokens=4096,
                     )
                     txt = completion.choices[0].message.content
                     if txt and "{" in txt:
-                        log.info("OpenRouter backup success using model: %s", or_model)
                         return DummyResponse(txt)
                 except Exception as exc:
                     err_s = str(exc).lower()
@@ -989,50 +1221,186 @@ def call_ai_api(prompt_text, pdf_bytes=None, require_pdf_vision=False):
     return None
 
 
-def analyze_with_gemini_json(company_title, scrip_code, doc_type, source_text, pdf_bytes, screener_info, pdf_text_len=0):
-    c_clean_name = screener_info.get("screener_company_name") or re.sub(r"\(\d+\)", "", company_title).split("-")[0].strip()
-    ist_today_str = (datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)).strftime("%B %d, %Y")
+def parse_json_safely(raw_text):
+    if not raw_text:
+        return None
+    s = re.sub(r"^```json\s*|\s*```$", "", raw_text.strip(), flags=re.I).strip()
+    m = re.search(r"\{.*\}", s, flags=re.DOTALL)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
+
+
+def script_stats(text, unicode_range):
+    plain = re.sub(r"<[^>]+>", " ", str(text or ""))
+    target_chars = len(re.findall(f"[{unicode_range}]", plain))
+    latin_chars = len(re.findall(r"[A-Za-z]", plain))
+    total = target_chars + latin_chars
+    return target_chars, (target_chars / total if total > 0 else 0.0)
+
+
+def find_copyright_overlaps(source_text, draft_text, ngram_size=8):
+    if not source_text or len(source_text) < 200:
+        return []
+    src_w = re.findall(r"[a-z0-9]+", source_text.lower())
+    drf_w = re.findall(r"[a-z0-9]+", draft_text.lower())
+    if len(src_w) < ngram_size or len(drf_w) < ngram_size:
+        return []
+    src_grams = {" ".join(src_w[i:i + ngram_size]) for i in range(len(src_w) - ngram_size + 1)}
+    matches = []
+    for i in range(len(drf_w) - ngram_size + 1):
+        gram = " ".join(drf_w[i:i + ngram_size])
+        if gram in src_grams and gram not in matches:
+            if any(legal in gram for legal in ("regulation 30", "sebi listing obligations", "disclosure requirements")):
+                continue
+            matches.append(gram)
+            if len(matches) >= 6:
+                break
+    return matches
+
+
+def flatten_lang_pack(pack):
+    parts = [str(pack.get("lead", ""))]
+    parts.extend(str(x) for x in (pack.get("highlights") or []))
+    parts.extend(str(x) for x in (pack.get("hooks") or []))
+    for sec in (pack.get("sections") or []):
+        parts.append(str(sec.get("heading", "")))
+        parts.append(str(sec.get("body", "")))
+    for fq in (pack.get("faqs") or []):
+        parts.append(str(fq.get("q", "")))
+        parts.append(str(fq.get("a", "")))
+    return " ".join(parts)
+
+
+def run_hard_python_gate(bundle, doc_type, source_text):
+    """100 પોઈન્ટનો કડક Python ગેટ: એક પણ ભૂલ હશે તો 100/100 નહીં મળે."""
+    failures = []
+    packs = bundle.get("lang_packs") or {}
+
+    # 1) અંગ્રેજી પેક અને વર્ડ કાઉન્ટ ચેક (AdSense + Google News માટે)
+    en_pack = packs.get("en") or {}
+    en_flat = flatten_lang_pack(en_pack)
+    en_words = len(re.findall(r"[A-Za-z0-9]+", en_flat))
+    if en_words < MIN_ENGLISH_WORDS:
+        failures.append(f"English article too short ({en_words} words; minimum {MIN_ENGLISH_WORDS} required for Google News & AdSense).")
+    if len(en_pack.get("sections") or []) < 3:
+        failures.append("English pack must have 3 complete analysis sections.")
+    if len(en_pack.get("faqs") or []) < 3:
+        failures.append("English pack must have at least 3 FAQs.")
+
+    # 2) ગુજરાતી પેક — એક પણ બુલેટ કે સેક્શન અંગ્રેજીમાં લીક ન થવું જોઈએ
+    gu_pack = packs.get("gu") or {}
+    gu_lead_c, gu_lead_r = script_stats(gu_pack.get("lead", ""), r"\u0A80-\u0AFF")
+    if gu_lead_c < 35 or gu_lead_r < 0.35:
+        failures.append(f"Gujarati lead is not in natural Gujarati script (gu_chars={gu_lead_c}, ratio={gu_lead_r:.2f}).")
+    for idx, item in enumerate((gu_pack.get("highlights") or [])[:4], 1):
+        c, r = script_stats(item, r"\u0A80-\u0AFF")
+        if c < 14 or r < 0.25:
+            failures.append(f"Gujarati highlight #{idx} leaked into English. Rewrite in natural Gujarati (English digits & stock name only).")
+    for idx, item in enumerate((gu_pack.get("hooks") or [])[:4], 1):
+        c, r = script_stats(item, r"\u0A80-\u0AFF")
+        if c < 14 or r < 0.25:
+            failures.append(f"Gujarati takeaway #{idx} leaked into English.")
+    gu_all_c, gu_all_r = script_stats(flatten_lang_pack(gu_pack), r"\u0A80-\u0AFF")
+    if gu_all_c < 900 or gu_all_r < 0.48:
+        failures.append(f"Gujarati full article too short or too much English (gu_chars={gu_all_c}, ratio={gu_all_r:.2f}).")
+    if script_stats(bundle.get("gujarati_summary", ""), r"\u0A80-\u0AFF")[0] < 30:
+        failures.append("gujarati_summary must be written in natural Gujarati script.")
+
+    # 3) હિન્દી પેક — એક પણ બુલેટ કે સેક્શન અંગ્રેજીમાં લીક ન થવું જોઈએ
+    hi_pack = packs.get("hi") or {}
+    hi_lead_c, hi_lead_r = script_stats(hi_pack.get("lead", ""), r"\u0900-\u097F")
+    if hi_lead_c < 35 or hi_lead_r < 0.35:
+        failures.append(f"Hindi lead is not in natural Devanagari Hindi script (hi_chars={hi_lead_c}, ratio={hi_lead_r:.2f}).")
+    for idx, item in enumerate((hi_pack.get("highlights") or [])[:4], 1):
+        c, r = script_stats(item, r"\u0900-\u097F")
+        if c < 14 or r < 0.25:
+            failures.append(f"Hindi highlight #{idx} leaked into English.")
+    hi_all_c, hi_all_r = script_stats(flatten_lang_pack(hi_pack), r"\u0900-\u097F")
+    if hi_all_c < 900 or hi_all_r < 0.48:
+        failures.append(f"Hindi full article too short or too much English (hi_chars={hi_all_c}, ratio={hi_all_r:.2f}).")
+
+    # 4) Markdown લીક, રોબોટિક AI શબ્દો અને YMYL પોલિસી ચેક
+    all_combined = " ".join([en_flat, flatten_lang_pack(gu_pack), flatten_lang_pack(hi_pack), str(bundle.get("seo_title", ""))])
+    if "**" in all_combined or "##" in all_combined:
+        failures.append("Raw markdown (** or ##) found in text. Remove all markdown symbols.")
+    low_combined = all_combined.lower()
+    banned_hits = [p for p in BANNED_AI_AND_POLICY_PHRASES if p in low_combined]
+    if banned_hits:
+        failures.append(f"Robotic AI or policy-violating phrases found: {banned_hits}. Rewrite naturally like a human financial journalist.")
+
+    # 5) 8-gram કોપીરાઇટ ચેક
+    overlaps = find_copyright_overlaps(source_text, en_flat, ngram_size=8)
+    if overlaps:
+        failures.append(f"Copyright overlap (8+ words matched source): {overlaps[:3]}. Rewrite those sentences completely in fresh words.")
+
+    # 6) હેડલાઈન અને થમ્બનેલ ફિટ ચેક
+    seo_t = str(bundle.get("seo_title", "")).strip()
+    if len(seo_t) < 42 or len(seo_t) > 90:
+        failures.append(f"seo_title length ({len(seo_t)}) should be 45-82 chars.")
+    th_hl = str(bundle.get("thumb_headline", "")).strip()
+    if not th_hl or len(th_hl.split()) > 8:
+        failures.append("thumb_headline must be a crisp 3-7 word English punchline for the thumbnail.")
+
+    # 7) ઓર્ડર/રિઝલ્ટ ડેટા ચેક
+    if doc_type == "order":
+        ord_d = bundle.get("order_details") or {}
+        if not str(ord_d.get("order_value", "")).strip() or not str(ord_d.get("client_or_awarder", "")).strip():
+            failures.append("order_details missing client_or_awarder or order_value.")
+    else:
+        r_c = to_float((bundle.get("revenue") or {}).get("curr"))
+        n_c = to_float((bundle.get("net_profit") or {}).get("curr"))
+        if r_c == 0 and n_c == 0:
+            failures.append("Result figures (Revenue and PAT) cannot both be zero.")
+
+    py_score = 100 if not failures else max(0, 100 - len(failures) * 15)
+    return py_score, failures
+
+
+def step1_draft_organic_english(company_title, scrip_code, doc_type, source_text, pdf_bytes, screener_info, pdf_text_len):
+    c_clean = screener_info.get("screener_company_name") or re.sub(r"\(\d+\)", "", company_title).split("-")[0].strip()
+    ist_today = get_ist_now().strftime("%B %d, %Y")
 
     prompt = f"""
-You are a SEBI-compliant Indian Chartered Accountant (CA) and factual financial journalist for 'Market Munafa' ({BLOG_BASE_URL}).
-Inspect EVERY PAGE of the attached BSE Corporate Filing PDF ({doc_type.upper()}) for {c_clean_name} (BSE: {scrip_code}).
+You are a senior Indian Chartered Accountant and business journalist (writing in the calm, authoritative, natural human voice of Mint or Business Standard) for 'Market Munafa'.
+Inspect EVERY PAGE of the attached official BSE PDF ({doc_type.upper()}) for {c_clean} (BSE: {scrip_code}).
 
-STRICT ACCURACY & YMYL COMPLIANCE RULES:
-1. NO FAKE PRICE TARGETS OR BUY/SELL RECOMMENDATIONS:
-   - NEVER invent future share price targets (like 2026/2027/2030 targets) or expected return percentages.
-   - Stick strictly to verified financial numbers, official BSE disclosures, 52-week range, and valuation ratios.
-2. EXACT ARITHMETIC CONSISTENCY:
-   - Double-check your YoY percentage math: ((curr - prev) / abs(prev)) * 100.
-   - NEVER confuse the Revenue amount in ₹ Cr with the YoY growth percentage!
-3. PDF IS THE SINGLE SOURCE OF TRUTH:
-   - Extract exact figures directly from the attached BSE PDF table (prefer Consolidated if both Consolidated and Standalone exist).
-   - Pick the 3-Month ("Quarter Ended") columns: latest quarter (`curr_period_label`, e.g., "Sep 2026") vs same quarter last year (`prev_period_label`, e.g., "Sep 2025").
-   - Convert accurately into ₹ Crores: Lakhs ÷ 100, Millions ÷ 10, Thousands ÷ 10,000.
-   - Extract: `revenue` (Revenue from Operations), `gross_profit` (EBITDA = PBT before exceptional + Finance Cost + Depreciation), and `net_profit` (PAT).
+STRICT JOURNALISTIC, GOOGLE NEWS & ADSENSE RULES:
+1. HUMAN ORGANIC WRITING: Write like an experienced Mumbai financial reporter—direct, specific, natural prose. Zero hype, zero robotic clichés ('delve', 'tapestry', 'in conclusion', 'game-changer', 'ever-evolving', 'rollercoaster', 'it is worth noting'). Zero markdown (** or ##).
+2. ZERO FAKE TARGETS OR BUY/SELL TIPS: Never invent future price targets (2026-2030) or give buy/sell calls. Stick strictly to verified BSE PDF facts, Screener ratios, and 52-week positioning.
+3. EXACT PDF ARITHMETIC:
+   - Extract exact figures directly from the attached BSE PDF table (prefer Consolidated over Standalone).
+   - Pick the 3-Month Quarter Ended columns: latest quarter (`curr_period_label`, e.g., "Sep 2026") vs same quarter last year (`prev_period_label`, e.g., "Sep 2025").
+   - Convert accurately into ₹ Crores (Lakhs ÷ 100, Millions ÷ 10, Thousands ÷ 10,000).
+   - Extract `revenue` (Revenue from Operations), `gross_profit` (EBITDA = PBT before exceptional + Finance Cost + Depreciation), and `net_profit` (PAT).
+   - Double-check YoY % math: ((curr - prev) / abs(prev)) * 100.
 4. QUALITY FILTER:
-   - Set `"skip_stock": false` ONLY IF the PDF shows strong performance (positive YoY PAT growth >= 5%, turnaround to profit, revenue growth >= 15%, or a material new order win). Otherwise set `"skip_stock": true`.
+   - Set `"skip_stock": false` ONLY IF the PDF shows strong, material performance (positive YoY PAT growth >= 5%, turnaround to profit, revenue growth >= 15%, or a genuinely material new order win). Otherwise set `"skip_stock": true`.
+5. ZERO COPYRIGHT OVERLAP: Never copy sentences verbatim from the PDF. Express every detail in fresh original reporting prose.
 
-Company: {c_clean_name} (BSE: {scrip_code})
-Screener Verified Data:
-- Current Price: {screener_info['price_str']} | 52W High: {screener_info['high_52w']} ({screener_info['dist_from_high']}) | 52W Low: {screener_info['low_52w']} ({screener_info['dist_from_low']})
-- Market Cap: {screener_info['market_cap']}
-- Stock P/E: {screener_info['pe_ratio']} | Industry P/E: {screener_info['industry_pe']} | P/B: {screener_info['pb_ratio']}
-- ROE: {screener_info['roe']} | ROCE: {screener_info['roce']} | EPS (TTM): {screener_info['eps']}
-- Total Debt: {screener_info['total_debt']} | Debt-to-Equity: {screener_info['debt_to_equity']}
-- Book Value: {screener_info['book_value']} | Div Yield: {screener_info['div_yield']} | Face Value: {screener_info['face_value']}
+Company: {c_clean} (BSE: {scrip_code}) | Category: {screener_info['cap_label']}
+Verified Screener Data:
+- Share Price: {screener_info['price_str']} | 52W High: {screener_info['high_52w']} ({screener_info['dist_from_high']}) | 52W Low: {screener_info['low_52w']} ({screener_info['dist_from_low']})
+- Market Cap: {screener_info['market_cap']} | Stock P/E: {screener_info['pe_ratio']} | Industry P/E: {screener_info['industry_pe']} | P/B: {screener_info['pb_ratio']}
+- ROE: {screener_info['roe']} | ROCE: {screener_info['roce']} | EPS (TTM): {screener_info['eps']} | Book Value: {screener_info['book_value']}
+- Total Debt: {screener_info['total_debt']} | Debt-to-Equity: {screener_info['debt_to_equity']} | Div Yield: {screener_info['div_yield']} | FV: {screener_info['face_value']}
 
-Return ONLY a valid JSON object:
+Return ONLY valid JSON:
 {{
   "pdf_table_verified": true,
   "pdf_original_unit": "Lakhs or Crores or Millions",
   "skip_stock": false,
-  "seo_title": "Clear 60-85 char factual news headline starting with '{c_clean_name}' (e.g., '{c_clean_name} Q2 Results: PAT Jumps XX% YoY, Revenue Rises to ₹XX Cr' or '{c_clean_name} Bags ₹XX Cr Order')",
-  "meta_description": "140-150 character crisp factual summary naming {c_clean_name}, exact PDF PAT/Revenue or Order value, and Debt-to-Equity.",
-  "seo_lead_summary": "55-70 word original, objective news lead summarizing exact PDF numbers (matching YoY % math), current share price ({screener_info['price_str']}), ROE ({screener_info['roe']}), and debt ratio.",
-  "company_short_name": "{c_clean_name}",
-  "result_date": "{ist_today_str}",
+  "seo_title": "Keyword-first 55-78 char natural English Google News headline starting with '{c_clean}' with exact key figure",
+  "meta_description": "140-152 char crisp English meta summary with exact PDF figure and debt ratio",
+  "company_short_name": "Clean short brand name <= 20 chars (e.g., '{c_clean[:20]}')",
+  "thumb_headline": "Punchy 3-6 word English headline for thumbnail (e.g., 'PAT JUMPS 42% YoY | REV ₹410 Cr' or 'BAGS ₹185 Cr ORDER WIN')",
+  "thumb_badge": "2-word badge e.g. 'Q2 RESULTS' or 'ORDER WIN'",
+  "result_date": "{ist_today}",
   "price_display": "{screener_info['price_str']}",
-  "quarter_label": "Q2 FY27 (Quarterly)",
+  "quarter_label": "Q2 FY27",
   "curr_period_label": "Sep 2026",
   "prev_period_label": "Sep 2025",
   "result_type": "Consolidated",
@@ -1047,77 +1415,213 @@ Return ONLY a valid JSON object:
     "scope_of_work": "Project scope from PDF",
     "execution_timeline": "Execution timeline from PDF"
   }},
-  "fundamental_impact_note": "1-2 factual sentences explaining the balance-sheet and earnings impact.",
-  "market_position_note": "1-2 factual sentences noting where the stock trades relative to its 52-week high ({screener_info['high_52w']}) and low ({screener_info['low_52w']}).",
-  "key_highlights": [
-    "Highlight 1: Exact PDF Revenue & PAT YoY figures (in ₹ Cr) or Order Value.",
-    "Highlight 2: 52-Week High ({screener_info['high_52w']}) & Low ({screener_info['low_52w']}) vs Current Price ({screener_info['price_str']}).",
-    "Highlight 3: Balance Sheet Check - Total Debt ({screener_info['total_debt']}) and Debt-to-Equity ({screener_info['debt_to_equity']}).",
-    "Highlight 4: Valuation Snapshot - Stock P/E ({screener_info['pe_ratio']}) vs Industry P/E ({screener_info['industry_pe']}) and ROE ({screener_info['roe']})."
-  ],
-  "web_story_hook": [
-    "Takeaway 1 with {c_clean_name}'s exact PDF revenue/profit change or order win.",
-    "Takeaway 2 noting EBITDA/operating margin performance.",
-    "Takeaway 3 covering Debt-to-Equity ({screener_info['debt_to_equity']}) and ROE ({screener_info['roe']}).",
-    "Takeaway 4 comparing Stock P/E ({screener_info['pe_ratio']}) with Sector P/E ({screener_info['industry_pe']})."
-  ],
-  "seo_article_sections": [
-    {{
-      "heading": "{c_clean_name} Quarterly Filing Breakdown: Revenue, EBITDA & PAT",
-      "body": "140-165 words of original financial journalism explaining exact PDF numbers, YoY percentage changes, and operational drivers."
-    }},
-    {{
-      "heading": "{c_clean_name} Valuation Ratios, 52-Week Range & Balance Sheet Health",
-      "body": "140-165 words objectively examining Stock P/E ({screener_info['pe_ratio']}) vs Industry P/E ({screener_info['industry_pe']}), Book Value ({screener_info['book_value']}), ROE ({screener_info['roe']}), and Total Debt ({screener_info['total_debt']})."
-    }},
-    {{
-      "heading": "Key Factors Investors Should Track Ahead",
-      "body": "110-140 words outlining execution milestones, margin sustainability, and working capital risks without giving buy/sell advice."
-    }}
-  ],
-  "faqs": [
-    {{
-      "q": "What did {c_clean_name} report in its latest BSE filing?",
-      "a": "Direct 2-sentence factual answer with exact verified Revenue, EBITDA, and Net Profit (or Order Value) from the PDF."
-    }},
-    {{
-      "q": "What is the debt-to-equity ratio and total debt of {c_clean_name}?",
-      "a": "Direct factual answer citing Total Debt of {screener_info['total_debt']} and Debt-to-Equity of {screener_info['debt_to_equity']}."
-    }},
-    {{
-      "q": "How does {c_clean_name}'s valuation compare with its industry peers?",
-      "a": "Direct factual answer comparing Stock P/E ({screener_info['pe_ratio']}), Industry P/E ({screener_info['industry_pe']}), and ROE ({screener_info['roe']})."
-    }}
-  ],
-  "gujarati_summary": "3-4 natural Gujarati sentences summarizing exact PDF YoY results or order details (keep company name and numbers in English).",
-  "gujarati_balance_view": "2 natural Gujarati sentences summarizing Debt-to-Equity, P/E, and ROE factually without target promises."
+  "fundamental_impact_note": "1-2 calm factual sentences on balance-sheet and earnings impact.",
+  "market_position_note": "1-2 factual sentences noting trading level relative to 52W High ({screener_info['high_52w']}) and Low ({screener_info['low_52w']}).",
+  "en_pack": {{
+    "lead": "60-75 word crisp news lead summarizing exact PDF numbers (matching YoY % math), share price ({screener_info['price_str']}), ROE ({screener_info['roe']}), and debt ratio.",
+    "highlights": [
+      "Exact verified Revenue & PAT YoY figures (in ₹ Cr) or Order Value.",
+      "52-Week range ({screener_info['high_52w']} / {screener_info['low_52w']}) vs Current Price ({screener_info['price_str']}).",
+      "Balance sheet: Total Debt ({screener_info['total_debt']}) and Debt-to-Equity ({screener_info['debt_to_equity']}).",
+      "Valuation: Stock P/E ({screener_info['pe_ratio']}) vs Industry P/E ({screener_info['industry_pe']}) and ROE ({screener_info['roe']})."
+    ],
+    "hooks": [
+      "Crisp takeaway 1 with exact PDF revenue/profit or order figure.",
+      "Crisp takeaway 2 on operating margin / EBITDA performance or execution scope.",
+      "Crisp takeaway 3 on Debt-to-Equity ({screener_info['debt_to_equity']}) and ROE ({screener_info['roe']}).",
+      "Crisp takeaway 4 comparing valuation with sector peers."
+    ],
+    "sections": [
+      {{"heading": "{c_clean} BSE Filing Breakdown: Core Numbers & Drivers", "body": "150-175 words of organic financial reporting explaining exact verified PDF numbers and operational performance."}},
+      {{"heading": "Valuation Check, 52-Week Position & Balance Sheet", "body": "150-175 words objectively comparing Stock P/E ({screener_info['pe_ratio']}), Industry P/E ({screener_info['industry_pe']}), Book Value ({screener_info['book_value']}), ROE ({screener_info['roe']}), and Total Debt ({screener_info['total_debt']})."}},
+      {{"heading": "What Shareholders Should Track Ahead", "body": "120-150 words on execution milestones, margin stability, and working capital discipline without buy/sell advice."}}
+    ],
+    "faqs": [
+      {{"q": "What did {c_clean} report in its latest BSE filing?", "a": "Direct 2-sentence factual answer with exact verified PDF numbers."}},
+      {{"q": "What is the debt-to-equity ratio and total debt of {c_clean}?", "a": "Direct factual answer citing Total Debt ({screener_info['total_debt']}) and Debt-to-Equity ({screener_info['debt_to_equity']})."}},
+      {{"q": "How is {c_clean} valued compared to its industry peers?", "a": "Direct factual answer comparing Stock P/E ({screener_info['pe_ratio']}), Industry P/E ({screener_info['industry_pe']}), and ROE ({screener_info['roe']})."}}
+    ]
+  }}
 }}
 
-Supplementary Extracted Text from Filing (if any):
+Supplementary Extracted Filing Text:
 {source_text[:MAX_TEXT_CHARS]}
 """
     require_vision = (pdf_bytes is not None and pdf_text_len < 400)
-    response = call_ai_api(prompt, pdf_bytes, require_pdf_vision=require_vision)
+    resp = call_ai_api(prompt, pdf_bytes=pdf_bytes, require_pdf_vision=require_vision, temperature=0.25)
+    parsed = parse_json_safely(getattr(resp, "text", ""))
+    if not parsed:
+        return None
+    if doc_type == "result":
+        parsed = verify_and_normalize_pdf_result_numbers(parsed, screener_info)
+    return parsed
 
-    if response and getattr(response, "text", None):
-        raw = response.text.strip()
-        match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
-        if match:
-            try:
-                parsed = json.loads(match.group(0))
-                if isinstance(parsed.get("web_story_hook"), str):
-                    parsed["web_story_hook"] = [parsed["web_story_hook"]]
-                if doc_type == "result":
-                    parsed = verify_and_normalize_pdf_result_numbers(parsed, screener_info)
-                return parsed
-            except Exception as exc:
-                log.warning("JSON parse error for %s: %s", company_title, exc)
 
+def step2_write_native_indic_pack(en_pack, comp_name, lang_code, lang_name):
+    """Google Translate વગર સીધું અખબારી ગુજરાતી કે હિન્દીમાં લખે છે (અંક 0-9 અને શેર નામ અંગ્રેજીમાં જ)."""
+    style = (
+        "Divya Bhaskar Business / Gujarat Samachar Business (natural everyday Gujarati used by Gujarati investors today, never textbook or translated-sounding)"
+        if lang_code == "gu"
+        else "Mint Hindi / Economic Times Hindi (natural contemporary Hindi used by Indian investors today, never robotic translations)"
+    )
+    extra_keys = (
+        ',\n  "gujarati_summary": "3 natural Gujarati sentences for Telegram alert summarizing exact PDF figures",\n  "gujarati_balance_view": "2 natural Gujarati sentences on Debt-to-Equity, P/E, and ROE factually"'
+        if lang_code == "gu"
+        else ""
+    )
+
+    prompt = f"""
+You are a veteran native {lang_name} stock market journalist writing in the crisp, human newspaper style of {style}.
+Rewrite the verified English equity report below into 100% authentic, natural, fluent {lang_name}.
+
+NON-NEGOTIABLE RULES:
+1. WRITE EVERY SINGLE SENTENCE IN {lang_name} SCRIPT: `lead`, EVERY item in `highlights` and `hooks`, EVERY section `heading` & `body`, and EVERY FAQ `q` & `a` MUST be in natural {lang_name} script — NEVER leave sentences in English!
+2. KEEP ENGLISH DIGITS (0-9) & COMPANY/STOCK NAMES ONLY:
+   - Keep ALL numbers in English Arabic digits (`0-9`, e.g., `₹450 Cr`, `+24.5%`, `Q2 FY27`, `52W`).
+   - Keep company/stock names and standard market acronyms in English (`{comp_name}`, `BSE`, `NSE`, `SEBI`, `PAT`, `EBITDA`, `ROE`, `P/E`, `EPS`, `YoY`).
+3. KEEP 100% OF FACTS & LENGTH: Do not shorten or skip any paragraph or number. Zero markdown (`**`, `##`).
+
+VERIFIED ENGLISH REPORT:
+{json.dumps(en_pack, ensure_ascii=False)}
+
+Return ONLY valid JSON:
+{{
+  "pack": {{
+    "lead": "Natural {lang_name} lead paragraph",
+    "highlights": ["Highlight 1", "Highlight 2", "Highlight 3", "Highlight 4"],
+    "hooks": ["Takeaway 1", "Takeaway 2", "Takeaway 3", "Takeaway 4"],
+    "sections": [
+      {{"heading": "Heading 1", "body": "Full natural {lang_name} paragraph"}},
+      {{"heading": "Heading 2", "body": "Full natural {lang_name} paragraph"}},
+      {{"heading": "Heading 3", "body": "Full natural {lang_name} paragraph"}}
+    ],
+    "faqs": [
+      {{"q": "Question 1?", "a": "Answer 1"}},
+      {{"q": "Question 2?", "a": "Answer 2"}},
+      {{"q": "Question 3?", "a": "Answer 3"}}
+    ]
+  }}{extra_keys}
+}}
+"""
+    resp = call_ai_api(prompt, pdf_bytes=None, require_pdf_vision=False, temperature=0.3)
+    parsed = parse_json_safely(getattr(resp, "text", ""))
+    return enforce_english_digits(parsed) if parsed else None
+
+
+def step3_chief_editor_audit_and_fix(bundle, doc_type, source_text, screener_info, py_failures):
+    """ચીફ એડિટર & CA ઓડિટ: Python એ પકડેલી બધી ભૂલો + ફેક્ટ/વ્યાકરણ/ઓર્ગેનિક ટોન સુધારી 100/100 એડિટર સ્કોર ચેક કરે છે."""
+    alerts = (
+        "CRITICAL HARD ERRORS FROM PYTHON GATE (MUST FIX 100% OF THESE):\n- " + "\n- ".join(py_failures)
+        if py_failures else "Automated Python Gate passed 100/100! Perform final strict factual, arithmetic, grammar, and human-readability audit."
+    )
+
+    prompt = f"""
+You are the Ruthless Chief Editor, Chartered Accountant, and Google News SEO Auditor for 'Market Munafa'.
+Deeply inspect this complete trilingual financial report JSON against the Official BSE Filing Text and Verified Screener Ratios, and FIX EVERY SINGLE ISSUE.
+
+{alerts}
+
+MANDATORY 100-POINT AUDIT CHECKLIST:
+1. FACT & ARITHMETIC ACCURACY: Verify every ₹ Cr figure, YoY % growth, Order Value, Client Name, Share Price ({screener_info['price_str']}), P/E ({screener_info['pe_ratio']}), ROE ({screener_info['roe']}), and Debt-to-Equity ({screener_info['debt_to_equity']}). Ensure zero contradiction between the numbers and text in EN, GU, and HI.
+2. NATURAL HUMAN JOURNALISM (ZERO BOT FEEL): Remove any stiff phrasing, AI clichés, or translated-sounding Gujarati/Hindi. Every language must read like an authentic human newspaper report.
+3. STRICT SCRIPT PURITY:
+   - `lang_packs.gu` + `gujarati_summary` + `gujarati_balance_view` MUST be 100% Gujarati script (only company/share names & 0-9 digits in English).
+   - `lang_packs.hi` MUST be 100% Devanagari Hindi script (only company/share names & 0-9 digits in English).
+   - `lang_packs.en` MUST be crisp Indian English (>= 460 words total).
+4. ZERO COPYRIGHT & ADSENSE SAFETY: Zero 8-word verbatim copies from PDF, zero buy/sell advice, zero fake future price targets, zero markdown (`**` or `##`).
+5. HONEST SCORING: Give `"editor_score": 100` ONLY IF every single criterion is genuinely 100% flawless AFTER your fixes. Otherwise give the honest lower score and list remaining `"issues_found"`.
+
+OFFICIAL BSE FILING EXCERPT:
+{source_text[:6500]}
+
+CURRENT REPORT BUNDLE TO AUDIT & FIX:
+{json.dumps(bundle, ensure_ascii=False)}
+
+Return ONLY valid JSON containing ALL original keys of the bundle PLUS `"editor_score"` (int 0-100) and `"issues_found"` (list of strings).
+"""
+    resp = call_ai_api(prompt, pdf_bytes=None, require_pdf_vision=False, temperature=0.1)
+    parsed = parse_json_safely(getattr(resp, "text", ""))
+    return enforce_english_digits(parsed) if parsed else None
+
+
+def generate_and_verify_200_of_200(company_title, scrip_code, doc_type, source_text, pdf_bytes, screener_info, pdf_text_len):
+    """સીધી પોસ્ટ બંધ — 200/200 (100 Python + 100 Chief Editor) પાસ થાય તો જ રિટર્ન કરશે, નહીંતર None."""
+    log.info("Step 1/3: Reading official BSE PDF & drafting organic English report for %s...", company_title)
+    en_base = step1_draft_organic_english(company_title, scrip_code, doc_type, source_text, pdf_bytes, screener_info, pdf_text_len)
+    if not en_base or en_base.get("pdf_table_verified") is False or en_base.get("skip_stock") is True:
+        log.info("Skipping stock (weak result / unverified PDF table): %s", company_title)
+        return None
+
+    if doc_type == "result":
+        r_curr = to_float((en_base.get("revenue") or {}).get("curr"))
+        np_curr = to_float((en_base.get("net_profit") or {}).get("curr"))
+        curr_p = str(en_base.get("curr_period_label", "")).lower()
+        if (r_curr == 0 and np_curr == 0) or any(old_q in curr_p for old_q in ("jun 2026", "mar 2026", "dec 2025")):
+            log.warning("Skipping result due to old period (%s) or zero figures: %s", curr_p, company_title)
+            return None
+
+    comp_name = str(en_base.get("company_short_name") or screener_info.get("screener_company_name") or company_title).strip()
+    en_pack = en_base.pop("en_pack", {})
+    time.sleep(2)
+
+    log.info("Step 2/3: Writing native Gujarati editorial report for %s...", comp_name)
+    gu_res = step2_write_native_indic_pack(en_pack, comp_name, "gu", "Gujarati")
+    if not gu_res or not gu_res.get("pack"):
+        log.warning("Native Gujarati generation failed for %s. Rejecting post.", comp_name)
+        return None
+    time.sleep(2)
+
+    log.info("Step 3/3: Writing native Hindi editorial report for %s...", comp_name)
+    hi_res = step2_write_native_indic_pack(en_pack, comp_name, "hi", "Hindi")
+    if not hi_res or not hi_res.get("pack"):
+        log.warning("Native Hindi generation failed for %s. Rejecting post.", comp_name)
+        return None
+    time.sleep(2)
+
+    bundle = dict(en_base)
+    bundle["lang_packs"] = {"gu": gu_res["pack"], "hi": hi_res["pack"], "en": en_pack}
+    bundle["gujarati_summary"] = gu_res.get("gujarati_summary", "")
+    bundle["gujarati_balance_view"] = gu_res.get("gujarati_balance_view", "")
+    bundle = enforce_english_digits(bundle)
+
+    # કડક 200/200 ઓડિટ અને સુધારા લૂપ (ભૂલ ન સુધરે ત્યાં સુધી પોસ્ટ નહીં થાય)
+    for rnd in range(1, MAX_AUDIT_FIX_ROUNDS + 1):
+        pre_py_score, pre_py_failures = run_hard_python_gate(bundle, doc_type, source_text)
+        log.info("Audit Round %d/%d | Pre-Fix Python Gate: %d/100 | Failures: %d", rnd, MAX_AUDIT_FIX_ROUNDS, pre_py_score, len(pre_py_failures))
+
+        audited = step3_chief_editor_audit_and_fix(bundle, doc_type, source_text, screener_info, pre_py_failures)
+        if not audited:
+            log.warning("Audit Round %d returned invalid JSON; retrying...", rnd)
+            time.sleep(2)
+            continue
+
+        editor_score = int(audited.get("editor_score", 0))
+        issues = audited.get("issues_found") or []
+
+        # ઓડિટ પછી ફરીથી Python હાર્ડ ચેક (AI ખોટો સ્કોર ન આપી શકે)
+        post_py_score, post_py_failures = run_hard_python_gate(audited, doc_type, source_text)
+        total_score = post_py_score + editor_score
+        log.info("Round %d Score -> Python: %d/100 + Editor: %d/100 = %d/200", rnd, post_py_score, editor_score, total_score)
+        if post_py_failures:
+            log.info("   Remaining Python Gate Errors: %s", post_py_failures[:3])
+        if issues:
+            log.info("   Editor Notes: %s", issues[:3])
+
+        if total_score >= REQUIRED_TOTAL_SCORE and post_py_score == 100 and editor_score == 100 and not post_py_failures:
+            log.info("✅ PASSED 200/200 ZERO-ERROR ORGANIC QUALITY GATE for %s!", comp_name)
+            if doc_type == "result":
+                audited = verify_and_normalize_pdf_result_numbers(audited, screener_info)
+            return audited
+
+        bundle = {k: v for k, v in audited.items() if k not in ("editor_score", "issues_found")}
+        time.sleep(3)
+
+    log.warning("❌ REJECTED '%s': Did not achieve strict 200/200 score after %d fix rounds.", comp_name, MAX_AUDIT_FIX_ROUNDS)
     return None
 
 
 # ==========================================
-# 8. CHARTS & THEME-SYNCED 3-LANGUAGE HTML BUILDER
+# 8. CHARTS & CLEAN NEWSPAPER-STYLE HTML BUILDER
 # ==========================================
 def build_quarterly_column_chart_url(comp_name, labels, rev_list, gp_list, np_list):
     datasets = [
@@ -1169,21 +1673,21 @@ def build_yoy_comparison_chart_url(comp_name, prev_lbl, curr_lbl, rev, gp, np_d,
 def _render_top_intro_panel_html(lang_code, is_default, summary_label, highlight_label, badge_title, lead_txt, high_list, hooks_list):
     disp = "block" if is_default else "none"
     hid = "" if is_default else ' hidden="hidden"'
-    high_li = "".join(f"<li style='margin-bottom:8px; color:#1e293b; line-height:1.65;'>{html.escape(str(k))}</li>" for k in high_list if k)
-    hook_li = "".join(f"<li style='margin-bottom:8px;'>{html.escape(str(h))}</li>" for h in hooks_list if h)
+    high_li = "".join(f"<li style='margin-bottom:8px; color:#1e293b; line-height:1.7;'>{html.escape(str(k))}</li>" for k in high_list if k)
+    hook_li = "".join(f"<li style='margin-bottom:8px; color:#1e293b; line-height:1.7;'>{html.escape(str(h))}</li>" for h in hooks_list if h)
 
     return f"""
-    <div class="mm-lang-sec" data-mm-lang="{lang_code}" lang="{lang_code}" style="display:{disp};"{hid}>
-      <p style="font-size: 15.5px; line-height: 1.75; color: #0f172a; background: #f8fafc; padding: 14px 16px; border-radius: 10px; border: 1px solid #cbd5e1; border-left: 5px solid #2563eb; margin-bottom: 16px;">
+    <div class="mm-lang-pane" data-lang="{lang_code}" lang="{lang_code}" style="display:{disp};"{hid}>
+      <p style="font-size: 16px; line-height: 1.85; color: #0f172a; background: #f8fafc; padding: 15px 18px; border-radius: 8px; border: 1px solid #e2e8f0; border-left: 4px solid #1d4ed8; margin-bottom: 18px;">
         <strong>{html.escape(summary_label)}:</strong> {html.escape(str(lead_txt))}
       </p>
-      <div style="background: #f8fafc; border: 1px solid #e2e8f0; border-left: 5px solid #16a34a; border-radius: 10px; padding: 14px 18px; margin-bottom: 18px;">
-        <h2 style="margin: 0 0 8px 0; font-size: 17.5px; color: #0f172a;">📌 {html.escape(highlight_label)}</h2>
-        <ul style="margin: 0; padding-left: 18px; font-size: 14.5px; font-weight: 500;">{high_li}</ul>
+      <div style="background: #ffffff; border: 1px solid #e2e8f0; border-left: 4px solid #0f766e; border-radius: 8px; padding: 15px 18px; margin-bottom: 18px;">
+        <h2 style="margin: 0 0 10px 0; font-size: 18px; color: #0f172a;">{html.escape(highlight_label)}</h2>
+        <ul style="margin: 0; padding-left: 20px; font-size: 15px;">{high_li}</ul>
       </div>
-      <div style="background: linear-gradient(135deg, #1e3a8a, #2563eb); color: white; border-radius: 14px; padding: 16px 18px; margin-bottom: 20px; box-shadow: 0 4px 12px rgba(37, 99, 235, 0.2);">
-        <h3 style="margin: 0 0 10px 0; font-size: 17px; border-bottom: 1px solid #93c5fd; padding-bottom: 6px; color: white;">⚡ {html.escape(badge_title)}</h3>
-        <ul style="margin: 0; padding-left: 18px; font-size: 14px; font-weight: 500; line-height: 1.65;">{hook_li}</ul>
+      <div style="background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; padding: 15px 18px; margin-bottom: 20px;">
+        <div style="margin: 0 0 10px 0; font-size: 16.5px; font-weight: 800; color: #0f172a; border-bottom: 1px solid #cbd5e1; padding-bottom: 6px;">{html.escape(badge_title)}</div>
+        <ul style="margin: 0; padding-left: 20px; font-size: 14.5px;">{hook_li}</ul>
       </div>
     </div>
     """
@@ -1196,37 +1700,37 @@ def _render_bottom_analysis_panel_html(lang_code, is_default, faq_label, section
     for s in sections_list:
         if s.get("body"):
             sec_html += (
-                f"<h2 style='font-size:18px; color:#0f172a; margin:20px 0 8px 0;'>📝 {html.escape(str(s.get('heading', '')))}</h2>"
-                f"<p style='color:#334155; font-size:15px; line-height:1.75; margin-bottom:14px;'>{html.escape(str(s.get('body', '')))}</p>"
+                f"<h2 style='font-size:19px; color:#0f172a; margin:24px 0 10px 0; border-left:4px solid #1d4ed8; padding-left:10px; line-height:1.4;'>{html.escape(str(s.get('heading', '')))}</h2>"
+                f"<p style='color:#1e293b; font-size:15.5px; line-height:1.85; margin-bottom:14px;'>{html.escape(str(s.get('body', '')))}</p>"
             )
 
     faq_html = ""
     for f_item in faqs_list:
         if f_item.get("q") and f_item.get("a"):
             faq_html += (
-                f"<details style='background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:12px 14px; margin-bottom:10px;'>"
-                f"<summary style='font-weight:600; color:#0f172a; cursor:pointer; font-size:14px;'>❓ {html.escape(str(f_item['q']))}</summary>"
-                f"<p style='margin:10px 0 0 0; color:#334155; font-size:14px; line-height:1.65;'>{html.escape(str(f_item['a']))}</p>"
-                f"</details>"
+                f"<div style='background:#f8fafc; border:1px solid #e2e8f0; border-radius:8px; padding:13px 15px; margin-bottom:11px;'>"
+                f"<h3 style='margin:0 0 6px 0; font-size:15.5px; font-weight:700; color:#0f172a;'>Q: {html.escape(str(f_item['q']))}</h3>"
+                f"<p style='margin:0; color:#334155; font-size:14.5px; line-height:1.7;'>{html.escape(str(f_item['a']))}</p>"
+                f"</div>"
             )
 
     return f"""
-    <div class="mm-lang-sec" data-mm-lang="{lang_code}" lang="{lang_code}" style="display:{disp};"{hid}>
+    <div class="mm-lang-pane" data-lang="{lang_code}" lang="{lang_code}" style="display:{disp};"{hid}>
       {sec_html}
-      <div style="margin: 22px 0;">
-        <h2 style="font-size: 18px; color: #0f172a; margin-bottom: 12px;">❓ {html.escape(faq_label)}</h2>
+      <div style="margin: 24px 0;">
+        <h2 style="font-size: 19px; color: #0f172a; margin-bottom: 12px; border-left:4px solid #0f766e; padding-left:10px;">{html.escape(faq_label)}</h2>
         {faq_html}
       </div>
     </div>
     """
 
 
-def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scrip_key="", file_key="", scrip_code=""):
+def build_post_html(data, doc_type, screener_info, source_url, thumb_url, related_posts, comp_key="", scrip_key="", file_key="", scrip_code=""):
     comp_name_raw = html.unescape(str(data.get("company_short_name", "Company"))).strip()
     comp_name = html.escape(comp_name_raw)
-    res_date = html.escape(str(data.get("result_date", datetime.now().strftime("%B %d, %Y"))))
-    ist_now = datetime.now(timezone.utc) + timedelta(hours=5, minutes=30)
-    ist_time_str = ist_now.strftime("%B %d, %Y | %I:%M %p IST")
+    res_date = html.escape(str(data.get("result_date", get_ist_now().strftime("%B %d, %Y"))))
+    ist_now = get_ist_now()
+    ist_time_str = ist_now.strftime("%B %d, %Y, %I:%M %p IST")
     iso_time = ist_now.strftime("%Y-%m-%dT%H:%M:%S+05:30")
 
     price_disp = html.escape(str(data.get("price_display", screener_info["price_str"])))
@@ -1236,6 +1740,7 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
     res_type = html.escape(str(data.get("result_type", "Consolidated")))
 
     mkt_cap = html.escape(str(screener_info["market_cap"]))
+    cap_label = html.escape(str(screener_info.get("cap_label", "Listed")))
     pe_ratio = html.escape(str(screener_info["pe_ratio"]))
     pb_ratio = html.escape(str(screener_info["pb_ratio"]))
     ind_pe = html.escape(str(screener_info["industry_pe"]))
@@ -1253,24 +1758,24 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
     fund_impact = html.escape(str(data.get("fundamental_impact_note", "")))
     market_pos = html.escape(str(data.get("market_position_note", "")))
 
-    seed_int = int(hashlib.md5((comp_name_raw + res_date).encode("utf-8")).hexdigest()[:6], 16)
-    uid = str(seed_int)[:6]
-    thumb_prompt = f"modern 3d financial stock market analytics chart clean corporate india {comp_name_raw}"
-    thumb_url = f"https://image.pollinations.ai/prompt/{urllib.parse.quote(thumb_prompt)}?width=1200&height=675&seed={seed_int}&nologo=true"
-
+    uid = hashlib.md5((comp_name_raw + res_date + scrip_code).encode("utf-8")).hexdigest()[:8]
     universal_data_blocks = []
 
     if doc_type == "order":
         ord_info = data.get("order_details", {}) or {}
         order_card = f"""
-        <div style="background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 16px; padding: 20px; margin-bottom: 24px;">
-          <h2 style="margin: 0 0 14px 0; font-size: 19px; color: #1e3a8a;">🏆 {comp_name} Official Order Win &amp; Contract Details</h2>
-          <p style="margin: 8px 0; font-size: 15px;"><strong>Company Name:</strong> {comp_name} ({price_disp})</p>
-          <p style="margin: 8px 0; font-size: 15px;"><strong>Client / Awarding Authority:</strong> {html.escape(str(ord_info.get("client_or_awarder", "Disclosed in Filing")))}</p>
-          <p style="margin: 8px 0; font-size: 15px;"><strong>Order / Contract Value:</strong> <span style="color:#16a34a; font-weight:700;">{html.escape(str(ord_info.get("order_value", "As per BSE Filing")))}</span></p>
-          <p style="margin: 8px 0; font-size: 15px;"><strong>Order Size vs Market Cap:</strong> {html.escape(str(ord_info.get("order_to_mcap_ratio", "Disclosed in Filing")))}</p>
-          <p style="margin: 8px 0; font-size: 15px;"><strong>Nature of Work / Scope:</strong> {html.escape(str(ord_info.get("scope_of_work", "Commercial execution contract")))}</p>
-          <p style="margin: 8px 0; font-size: 15px;"><strong>Execution Timeline:</strong> {html.escape(str(ord_info.get("execution_timeline", "As per contract terms")))}</p>
+        <div style="background: #ffffff; border: 1px solid #cbd5e1; border-radius: 10px; padding: 18px; margin-bottom: 24px;">
+          <h2 style="margin: 0 0 12px 0; font-size: 18.5px; color: #0f172a; border-left:4px solid #0f766e; padding-left:10px;">{comp_name} Official Order &amp; Contract Details</h2>
+          <table style="width:100%; border-collapse:collapse; font-size:14px;">
+            <tbody>
+              <tr style="border-bottom:1px solid #e2e8f0;"><td style="padding:9px 8px; color:#475569; font-weight:600; width:40%;">Company</td><td style="padding:9px 8px; color:#0f172a; font-weight:700;">{comp_name} ({price_disp})</td></tr>
+              <tr style="border-bottom:1px solid #e2e8f0; background:#f8fafc;"><td style="padding:9px 8px; color:#475569; font-weight:600;">Client / Awarding Entity</td><td style="padding:9px 8px; color:#0f172a;">{html.escape(str(ord_info.get("client_or_awarder", "Disclosed in Filing")))}</td></tr>
+              <tr style="border-bottom:1px solid #e2e8f0;"><td style="padding:9px 8px; color:#475569; font-weight:600;">Order Value</td><td style="padding:9px 8px; color:#0f766e; font-weight:700;">{html.escape(str(ord_info.get("order_value", "As per BSE Filing")))}</td></tr>
+              <tr style="border-bottom:1px solid #e2e8f0; background:#f8fafc;"><td style="padding:9px 8px; color:#475569; font-weight:600;">Order Size vs Market Cap</td><td style="padding:9px 8px; color:#0f172a;">{html.escape(str(ord_info.get("order_to_mcap_ratio", "Disclosed in Filing")))}</td></tr>
+              <tr style="border-bottom:1px solid #e2e8f0;"><td style="padding:9px 8px; color:#475569; font-weight:600;">Scope of Work</td><td style="padding:9px 8px; color:#0f172a;">{html.escape(str(ord_info.get("scope_of_work", "Commercial execution contract")))}</td></tr>
+              <tr style="background:#f8fafc;"><td style="padding:9px 8px; color:#475569; font-weight:600;">Execution Timeline</td><td style="padding:9px 8px; color:#0f172a;">{html.escape(str(ord_info.get("execution_timeline", "As per contract terms")))}</td></tr>
+            </tbody>
+          </table>
         </div>
         """
         universal_data_blocks.append(order_card)
@@ -1290,205 +1795,221 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
         yoy_chart_url = build_yoy_comparison_chart_url(comp_name_raw, prev_lbl, curr_lbl, rev, gp, np_d, debt_comp)
 
         def growth_color(growth_str):
-            return "#dc2626" if "-" in str(growth_str) else "#16a34a"
+            return "#b91c1c" if "-" in str(growth_str) else "#0f766e"
 
         result_card = f"""
-        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 14px; box-shadow: 0 4px 14px rgba(0,0,0,0.05); margin-bottom: 24px; box-sizing: border-box;">
-          <h2 style="margin: 0 0 8px 0; font-size: 18px; color: #0f172a; line-height: 1.35;">📊 {comp_name} {qtr_lbl} Official BSE PDF Results ({res_type})</h2>
-          <div style="display: flex; justify-content: space-between; align-items: center; color: #64748b; font-size: 12px; margin-bottom: 10px;">
+        <div style="background: #ffffff; border: 1px solid #cbd5e1; border-radius: 10px; padding: 16px; margin-bottom: 24px; box-sizing: border-box;">
+          <h2 style="margin: 0 0 8px 0; font-size: 18px; color: #0f172a; border-left:4px solid #0f766e; padding-left:10px;">{comp_name} {qtr_lbl} Official BSE Results ({res_type})</h2>
+          <div style="display: flex; justify-content: space-between; align-items: center; color: #64748b; font-size: 12.5px; margin-bottom: 10px;">
             <span>{res_date} | Price: <strong style="color:#0f172a;">{price_disp}</strong></span>
-            <span>Figures in ₹ Cr</span>
+            <span>Figures in ₹ Crore</span>
           </div>
           <div style="width: 100%; overflow-x: auto;">
-            <table style="width: 100%; border-collapse: collapse; font-size: 12.5px; text-align: right;">
+            <table style="width: 100%; border-collapse: collapse; font-size: 13px; text-align: right;">
               <thead>
-                <tr style="border-top: 1px solid #e2e8f0; border-bottom: 1px solid #e2e8f0; color: #475569; font-weight: 700; background: #f8fafc;">
-                  <th style="text-align: left; padding: 8px 4px; white-space: nowrap;">Metric</th>
-                  <th style="padding: 8px 4px; white-space: nowrap;">{curr_lbl}</th>
-                  <th style="padding: 8px 4px; white-space: nowrap;">{prev_lbl}</th>
-                  <th style="padding: 8px 4px; white-space: nowrap;">Change</th>
-                  <th style="padding: 8px 4px; white-space: nowrap;">YoY %</th>
+                <tr style="border-top: 1px solid #cbd5e1; border-bottom: 1px solid #cbd5e1; color: #0f172a; font-weight: 700; background: #f8fafc;">
+                  <th style="text-align: left; padding: 9px 6px; white-space: nowrap;">Metric</th>
+                  <th style="padding: 9px 6px; white-space: nowrap;">{curr_lbl}</th>
+                  <th style="padding: 9px 6px; white-space: nowrap;">{prev_lbl}</th>
+                  <th style="padding: 9px 6px; white-space: nowrap;">Change</th>
+                  <th style="padding: 9px 6px; white-space: nowrap;">YoY %</th>
                 </tr>
               </thead>
               <tbody>
-                <tr style="border-bottom: 1px solid #f1f5f9;">
-                  <td style="text-align: left; padding: 10px 4px; color: #1e293b; font-weight: 600; white-space: nowrap;">Revenue</td>
-                  <td style="padding: 10px 4px; font-weight: 600; white-space: nowrap;">₹{html.escape(str(rev.get('curr', '0')))}</td>
-                  <td style="padding: 10px 4px; color: #64748b; white-space: nowrap;">₹{html.escape(str(rev.get('prev', '0')))}</td>
-                  <td style="padding: 10px 4px; font-weight: 600; white-space: nowrap;">{html.escape(str(rev.get('difference', '0')))}</td>
-                  <td style="padding: 10px 4px; font-weight: 700; white-space: nowrap; color: {growth_color(rev.get('growth', ''))};">{html.escape(str(rev.get('growth', 'N/A')))}</td>
+                <tr style="border-bottom: 1px solid #e2e8f0;">
+                  <td style="text-align: left; padding: 10px 6px; color: #1e293b; font-weight: 600; white-space: nowrap;">Revenue</td>
+                  <td style="padding: 10px 6px; font-weight: 600; white-space: nowrap;">₹{html.escape(str(rev.get('curr', '0')))}</td>
+                  <td style="padding: 10px 6px; color: #64748b; white-space: nowrap;">₹{html.escape(str(rev.get('prev', '0')))}</td>
+                  <td style="padding: 10px 6px; font-weight: 600; white-space: nowrap;">{html.escape(str(rev.get('difference', '0')))}</td>
+                  <td style="padding: 10px 6px; font-weight: 700; white-space: nowrap; color: {growth_color(rev.get('growth', ''))};">{html.escape(str(rev.get('growth', 'N/A')))}</td>
                 </tr>
-                <tr style="border-bottom: 1px solid #f1f5f9;">
-                  <td style="text-align: left; padding: 10px 4px; color: #1e293b; font-weight: 600; white-space: nowrap;">EBITDA</td>
-                  <td style="padding: 10px 4px; font-weight: 600; white-space: nowrap;">₹{html.escape(str(gp.get('curr', '0')))}</td>
-                  <td style="padding: 10px 4px; color: #64748b; white-space: nowrap;">₹{html.escape(str(gp.get('prev', '0')))}</td>
-                  <td style="padding: 10px 4px; font-weight: 600; white-space: nowrap;">{html.escape(str(gp.get('difference', '0')))}</td>
-                  <td style="padding: 10px 4px; font-weight: 700; white-space: nowrap; color: {growth_color(gp.get('growth', ''))};">{html.escape(str(gp.get('growth', 'N/A')))}</td>
+                <tr style="border-bottom: 1px solid #e2e8f0; background:#f8fafc;">
+                  <td style="text-align: left; padding: 10px 6px; color: #1e293b; font-weight: 600; white-space: nowrap;">EBITDA</td>
+                  <td style="padding: 10px 6px; font-weight: 600; white-space: nowrap;">₹{html.escape(str(gp.get('curr', '0')))}</td>
+                  <td style="padding: 10px 6px; color: #64748b; white-space: nowrap;">₹{html.escape(str(gp.get('prev', '0')))}</td>
+                  <td style="padding: 10px 6px; font-weight: 600; white-space: nowrap;">{html.escape(str(gp.get('difference', '0')))}</td>
+                  <td style="padding: 10px 6px; font-weight: 700; white-space: nowrap; color: {growth_color(gp.get('growth', ''))};">{html.escape(str(gp.get('growth', 'N/A')))}</td>
                 </tr>
                 <tr>
-                  <td style="text-align: left; padding: 10px 4px; color: #1e293b; font-weight: 600; white-space: nowrap;">Net Profit (PAT)</td>
-                  <td style="padding: 10px 4px; font-weight: 600; white-space: nowrap;">₹{html.escape(str(np_d.get('curr', '0')))}</td>
-                  <td style="padding: 10px 4px; color: #64748b; white-space: nowrap;">₹{html.escape(str(np_d.get('prev', '0')))}</td>
-                  <td style="padding: 10px 4px; font-weight: 600; white-space: nowrap;">{html.escape(str(np_d.get('difference', '0')))}</td>
-                  <td style="padding: 10px 4px; font-weight: 700; white-space: nowrap; color: {growth_color(np_d.get('growth', ''))};">{html.escape(str(np_d.get('growth', 'N/A')))}</td>
+                  <td style="text-align: left; padding: 10px 6px; color: #1e293b; font-weight: 600; white-space: nowrap;">Net Profit (PAT)</td>
+                  <td style="padding: 10px 6px; font-weight: 600; white-space: nowrap;">₹{html.escape(str(np_d.get('curr', '0')))}</td>
+                  <td style="padding: 10px 6px; color: #64748b; white-space: nowrap;">₹{html.escape(str(np_d.get('prev', '0')))}</td>
+                  <td style="padding: 10px 6px; font-weight: 600; white-space: nowrap;">{html.escape(str(np_d.get('difference', '0')))}</td>
+                  <td style="padding: 10px 6px; font-weight: 700; white-space: nowrap; color: {growth_color(np_d.get('growth', ''))};">{html.escape(str(np_d.get('growth', 'N/A')))}</td>
                 </tr>
               </tbody>
             </table>
           </div>
         </div>
 
-        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 16px; margin-bottom: 24px; text-align: center;">
-          <h3 style="margin: 0 0 12px 0; font-size: 17px; color: #0f172a;">📈 {comp_name} YoY Revenue, PAT &amp; Debt Chart</h3>
+        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 16px; margin-bottom: 22px; text-align: center;">
+          <h3 style="margin: 0 0 12px 0; font-size: 16.5px; color: #0f172a;">{comp_name} YoY Revenue, PAT &amp; Debt Comparison</h3>
           <img src="{yoy_chart_url}" alt="{comp_name} Quarterly Results YoY Chart" width="750" height="420" loading="lazy" style="max-width: 100%; height: auto; border-radius: 8px;" />
         </div>
-        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 16px; margin-bottom: 24px; text-align: center;">
-          <h3 style="margin: 0 0 12px 0; font-size: 17px; color: #0f172a;">📊 {comp_name} Multi-Quarter Earnings Trend</h3>
+        <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px; padding: 16px; margin-bottom: 22px; text-align: center;">
+          <h3 style="margin: 0 0 12px 0; font-size: 16.5px; color: #0f172a;">{comp_name} Multi-Quarter Earnings Trend</h3>
           <img src="{quarter_chart_url}" alt="{comp_name} Multi-Quarter Profit Trend" width="750" height="420" loading="lazy" style="max-width: 100%; height: auto; border-radius: 8px;" />
         </div>
         """
         universal_data_blocks.append(result_card)
 
-    # Factual Valuation & 52-Week Positioning Card (No fabricated 2026-2030 targets)
     fundamentals_card = f"""
-    <div style="background: #ffffff; border: 1px solid #e2e8f0; border-radius: 16px; padding: 16px; box-shadow: 0 4px 14px rgba(0,0,0,0.05); margin-bottom: 24px; box-sizing: border-box;">
-      <h2 style="margin: 0 0 14px 0; font-size: 18px; color: #0f172a;">🔍 {comp_name} Valuation Ratios &amp; 52-Week Range</h2>
-      <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+    <div style="background: #ffffff; border: 1px solid #cbd5e1; border-radius: 10px; padding: 16px; margin-bottom: 24px; box-sizing: border-box;">
+      <h2 style="margin: 0 0 12px 0; font-size: 18px; color: #0f172a; border-left:4px solid #1d4ed8; padding-left:10px;">{comp_name} Valuation Ratios &amp; 52-Week Range</h2>
+      <table style="width: 100%; border-collapse: collapse; font-size: 13.5px;">
         <tbody>
-          <tr style="border-bottom: 1px solid #f1f5f9;">
-            <td style="padding: 8px 4px; color: #64748b;">Share Price</td><td style="padding: 8px 4px; text-align: right; font-weight: 700; color: #0f172a;">{price_disp}</td>
-            <td style="padding: 8px 4px; color: #64748b; border-left: 1px solid #f1f5f9;">52W High / Low</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{high_52w} / {low_52w}</td>
+          <tr style="border-bottom: 1px solid #e2e8f0;">
+            <td style="padding: 8px 6px; color: #64748b;">Share Price</td><td style="padding: 8px 6px; text-align: right; font-weight: 700; color: #0f172a;">{price_disp}</td>
+            <td style="padding: 8px 6px; color: #64748b; border-left: 1px solid #e2e8f0;">52W High / Low</td><td style="padding: 8px 6px; text-align: right; font-weight: 600; color: #0f172a;">{high_52w} / {low_52w}</td>
           </tr>
-          <tr style="border-bottom: 1px solid #f1f5f9;">
-            <td style="padding: 8px 4px; color: #64748b;">52W Position</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{dist_high}</td>
-            <td style="padding: 8px 4px; color: #64748b; border-left: 1px solid #f1f5f9;">Recovery from Low</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #16a34a;">{dist_low}</td>
+          <tr style="border-bottom: 1px solid #e2e8f0; background:#f8fafc;">
+            <td style="padding: 8px 6px; color: #64748b;">52W Position</td><td style="padding: 8px 6px; text-align: right; font-weight: 600; color: #0f172a;">{dist_high}</td>
+            <td style="padding: 8px 6px; color: #64748b; border-left: 1px solid #e2e8f0;">From 52W Low</td><td style="padding: 8px 6px; text-align: right; font-weight: 600; color: #0f766e;">{dist_low}</td>
           </tr>
-          <tr style="border-bottom: 1px solid #f1f5f9;">
-            <td style="padding: 8px 4px; color: #64748b;">Market Cap</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{mkt_cap}</td>
-            <td style="padding: 8px 4px; color: #64748b; border-left: 1px solid #f1f5f9;">ROE</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{roe}</td>
+          <tr style="border-bottom: 1px solid #e2e8f0;">
+            <td style="padding: 8px 6px; color: #64748b;">Market Cap</td><td style="padding: 8px 6px; text-align: right; font-weight: 600; color: #0f172a;">{mkt_cap} ({cap_label})</td>
+            <td style="padding: 8px 6px; color: #64748b; border-left: 1px solid #e2e8f0;">ROE</td><td style="padding: 8px 6px; text-align: right; font-weight: 600; color: #0f172a;">{roe}</td>
           </tr>
-          <tr style="border-bottom: 1px solid #f1f5f9;">
-            <td style="padding: 8px 4px; color: #64748b;">Stock P/E</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{pe_ratio}</td>
-            <td style="padding: 8px 4px; color: #64748b; border-left: 1px solid #f1f5f9;">Industry P/E</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{ind_pe}</td>
+          <tr style="border-bottom: 1px solid #e2e8f0; background:#f8fafc;">
+            <td style="padding: 8px 6px; color: #64748b;">Stock P/E</td><td style="padding: 8px 6px; text-align: right; font-weight: 600; color: #0f172a;">{pe_ratio}</td>
+            <td style="padding: 8px 6px; color: #64748b; border-left: 1px solid #e2e8f0;">Industry P/E</td><td style="padding: 8px 6px; text-align: right; font-weight: 600; color: #0f172a;">{ind_pe}</td>
           </tr>
-          <tr style="border-bottom: 1px solid #f1f5f9;">
-            <td style="padding: 8px 4px; color: #64748b;">EPS (TTM)</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{eps}</td>
-            <td style="padding: 8px 4px; color: #64748b; border-left: 1px solid #f1f5f9;">Book Value</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{book_value} ({pb_ratio}x)</td>
+          <tr style="border-bottom: 1px solid #e2e8f0;">
+            <td style="padding: 8px 6px; color: #64748b;">EPS (TTM)</td><td style="padding: 8px 6px; text-align: right; font-weight: 600; color: #0f172a;">{eps}</td>
+            <td style="padding: 8px 6px; color: #64748b; border-left: 1px solid #e2e8f0;">Book Value</td><td style="padding: 8px 6px; text-align: right; font-weight: 600; color: #0f172a;">{book_value} ({pb_ratio}x)</td>
           </tr>
-          <tr>
-            <td style="padding: 8px 4px; color: #64748b;">Debt / Equity</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{de_ratio} ({total_debt})</td>
-            <td style="padding: 8px 4px; color: #64748b; border-left: 1px solid #f1f5f9;">Div Yield / FV</td><td style="padding: 8px 4px; text-align: right; font-weight: 600; color: #0f172a;">{div_yield} (₹{face_val})</td>
+          <tr style="background:#f8fafc;">
+            <td style="padding: 8px 6px; color: #64748b;">Debt / Equity</td><td style="padding: 8px 6px; text-align: right; font-weight: 600; color: #0f172a;">{de_ratio} ({total_debt})</td>
+            <td style="padding: 8px 6px; color: #64748b; border-left: 1px solid #e2e8f0;">Div Yield / FV</td><td style="padding: 8px 6px; text-align: right; font-weight: 600; color: #0f172a;">{div_yield} (₹{face_val})</td>
           </tr>
         </tbody>
       </table>
-      <p style="margin: 10px 0 0 0; font-size: 13.5px; color: #334155;"><strong>Fundamental Overview:</strong> {market_pos} {fund_impact}</p>
+      <p style="margin: 11px 0 0 0; font-size: 14px; color: #334155; line-height:1.65;"><strong>Fundamental Overview:</strong> {market_pos} {fund_impact}</p>
     </div>
     """
     universal_data_blocks.append(fundamentals_card)
 
-    # 3-Language Packs (GU, EN, HI)
-    lang_packs = build_multilang_pack(data)
+    lang_packs = data.get("lang_packs") or {}
+    gu_p = lang_packs.get("gu") or {}
+    hi_p = lang_packs.get("hi") or {}
+    en_p = lang_packs.get("en") or {}
 
-    top_gu = _render_top_intro_panel_html("gu", True, "સારાંશ (Executive Summary)", "રોકાણકારો માટે મુખ્ય નાણાકીય હાઇલાઇટ્સ", f"{comp_name_raw} ક્વિક હાઇલાઇટ્સ", lang_packs["gu"]["lead"], lang_packs["gu"]["highlights"], lang_packs["gu"]["hooks"])
-    top_en = _render_top_intro_panel_html("en", False, "Executive Summary", "Key Financial Highlights for Investors", f"{comp_name_raw} Quick Highlights", lang_packs["en"]["lead"], lang_packs["en"]["highlights"], lang_packs["en"]["hooks"])
-    top_hi = _render_top_intro_panel_html("hi", False, "सारांश (Executive Summary)", "निवेशकों के लिए प्रमुख वित्तीय हाइलाइट्स", f"{comp_name_raw} मुख्य हाइलाइट्स", lang_packs["hi"]["lead"], lang_packs["hi"]["highlights"], lang_packs["hi"]["hooks"])
+    top_gu = _render_top_intro_panel_html("gu", True, "મુખ્ય સારાંશ", "રોકાણકારો માટે મહત્વના મુદ્દા", f"{comp_name_raw} એક નજરમાં", gu_p.get("lead", ""), gu_p.get("highlights", []), gu_p.get("hooks", []))
+    top_hi = _render_top_intro_panel_html("hi", False, "मुख्य सारांश", "निवेशकों के लिए प्रमुख बिंदु", f"{comp_name_raw} एक नज़र में", hi_p.get("lead", ""), hi_p.get("highlights", []), hi_p.get("hooks", []))
+    top_en = _render_top_intro_panel_html("en", False, "Executive Summary", "Key Financial Highlights", f"{comp_name_raw} at a Glance", en_p.get("lead", ""), en_p.get("highlights", []), en_p.get("hooks", []))
 
-    bot_gu = _render_bottom_analysis_panel_html("gu", True, f"{comp_name_raw} શેર વિશે વારંવાર પૂછાતા પ્રશ્નો (FAQs)", lang_packs["gu"]["sections"], lang_packs["gu"]["faqs"])
-    bot_en = _render_bottom_analysis_panel_html("en", False, f"Frequently Asked Questions ({comp_name_raw} FAQs)", lang_packs["en"]["sections"], lang_packs["en"]["faqs"])
-    bot_hi = _render_bottom_analysis_panel_html("hi", False, f"{comp_name_raw} शेयर से जुड़े प्रश्न (FAQs)", lang_packs["hi"]["sections"], lang_packs["hi"]["faqs"])
+    bot_gu = _render_bottom_analysis_panel_html("gu", True, f"{comp_name_raw} શેર વિશે વારંવાર પૂછાતા પ્રશ્નો (FAQs)", gu_p.get("sections", []), gu_p.get("faqs", []))
+    bot_hi = _render_bottom_analysis_panel_html("hi", False, f"{comp_name_raw} शेयर से जुड़े मुख्य प्रश्न (FAQs)", hi_p.get("sections", []), hi_p.get("faqs", []))
+    bot_en = _render_bottom_analysis_panel_html("en", False, f"Frequently Asked Questions ({comp_name_raw})", en_p.get("sections", []), en_p.get("faqs", []))
 
+    related_li = "".join(
+        f"<li style='margin-bottom:7px;'><a href='{html.escape(rp['url'], quote=True)}' style='color:#1d4ed8; font-weight:600; text-decoration:none;'>{html.escape(rp['title'])}</a></li>"
+        for rp in (related_posts or [])[:3]
+    )
     internal_links_html = f"""
-    <div style="background: #eff6ff; border: 1px dashed #60a5fa; border-radius: 10px; padding: 14px 16px; margin: 22px 0; font-size: 14px; color: #1e3a8a;">
-      <strong>🔗 Explore More on Market Munafa:</strong>
-      <ul style="margin: 8px 0 0 0; padding-left: 18px; line-height: 1.8;">
-        <li><a href="{BLOG_BASE_URL}/search/label/STOCKS%20RESULT" style="color:#1d4ed8; font-weight:600; text-decoration:none;">📊 Latest Quarterly Stocks Results &amp; Analysis</a></li>
-        <li><a href="{BLOG_BASE_URL}/search/label/DEBT%20FREE%2010%20STOCKS" style="color:#1d4ed8; font-weight:600; text-decoration:none;">💎 Debt-Free &amp; Low-Debt Stocks in India</a></li>
-        <li><a href="{BLOG_BASE_URL}/search/label/TOP%2010%20STOCKS" style="color:#1d4ed8; font-weight:600; text-decoration:none;">🏆 Top 10 Stocks to Watch</a></li>
-        <li><a href="{BLOG_BASE_URL}/search/label/MARKET%20NEWS" style="color:#1d4ed8; font-weight:600; text-decoration:none;">📰 Daily Indian Stock Market News</a></li>
+    <div style="background: #f8fafc; border: 1px solid #cbd5e1; border-radius: 8px; padding: 15px 18px; margin: 22px 0; font-size: 14.5px; color: #0f172a;">
+      <strong>Also Read on Market Munafa</strong>
+      <ul style="margin: 8px 0 0 0; padding-left: 20px; line-height: 1.75;">
+        {related_li}
+        <li style="margin-bottom:6px;"><a href="{BLOG_BASE_URL}/search/label/STOCKS%20RESULT" style="color:#1d4ed8; font-weight:600; text-decoration:none;">Latest Quarterly Stocks Results &amp; Analysis</a></li>
+        <li><a href="{BLOG_BASE_URL}/search/label/DEBT%20FREE%2010%20STOCKS" style="color:#1d4ed8; font-weight:600; text-decoration:none;">Debt-Free &amp; Low-Debt Stocks in India</a></li>
       </ul>
     </div>
     """
 
-    source_link_html = f'<p style="margin-top:16px;"><a href="{html.escape(source_url, quote=True)}" target="_blank" rel="nofollow noopener" style="color:#2563eb; font-weight:600; text-decoration:none;">📄 Verify Official BSE Exchange Filing PDF</a></p>' if source_url else ""
+    source_link_html = (
+        f'<p style="margin-top:14px; font-size:14px;"><strong>Official Reference:</strong> <a href="{html.escape(source_url, quote=True)}" target="_blank" rel="nofollow noopener" style="color:#1d4ed8; font-weight:600; text-decoration:none;">View Official BSE Exchange Filing PDF</a></p>'
+        if source_url else ""
+    )
 
-    meta_desc_clean = html.unescape(str(data.get("meta_description") or data.get("seo_lead_summary") or "")).strip()[:155]
+    meta_desc_clean = html.unescape(str(data.get("meta_description") or en_p.get("lead") or "")).strip()[:155]
     headline_clean = html.unescape(str(data.get("seo_title") or f"{comp_name_raw} Quarterly Results & Fundamental Analysis")).strip()[:110]
 
-    faq_schema_entities = []
-    for f_item in (data.get("faqs") or []):
-        if isinstance(f_item, dict) and f_item.get("q") and f_item.get("a"):
-            faq_schema_entities.append({
-                "@type": "Question",
-                "name": html.unescape(str(f_item["q"])).strip(),
-                "acceptedAnswer": {"@type": "Answer", "text": html.unescape(str(f_item["a"])).strip()},
-            })
+    faq_schema_entities = [
+        {
+            "@type": "Question",
+            "name": html.unescape(str(f_item["q"])).strip(),
+            "acceptedAnswer": {"@type": "Answer", "text": html.unescape(str(f_item["a"])).strip()},
+        }
+        for f_item in (en_p.get("faqs") or [])
+        if isinstance(f_item, dict) and f_item.get("q") and f_item.get("a")
+    ]
 
+    final_img = thumb_url or yoy_chart_url or SITE_LOGO_URL
     schema_bundle = [
         {
             "@context": "https://schema.org",
             "@type": "NewsArticle",
             "headline": headline_clean,
             "description": meta_desc_clean,
+            "articleSection": "Indian Stock Market",
             "datePublished": iso_time,
             "dateModified": iso_time,
-            "image": [thumb_url],
-            "author": {"@type": "Organization", "name": "Market Munafa", "url": BLOG_BASE_URL},
-            "publisher": {"@type": "Organization", "name": "Market Munafa", "url": BLOG_BASE_URL},
+            "image": [final_img],
+            "author": {"@type": "Organization", "name": "Market Munafa Editorial Desk", "url": BLOG_BASE_URL},
+            "publisher": {
+                "@type": "Organization",
+                "name": "Market Munafa",
+                "url": BLOG_BASE_URL,
+                "logo": {"@type": "ImageObject", "url": SITE_LOGO_URL},
+            },
         }
     ]
     if faq_schema_entities:
         schema_bundle.append({"@context": "https://schema.org", "@type": "FAQPage", "mainEntity": faq_schema_entities})
 
+    thumb_block = ""
+    if thumb_url:
+        thumb_block = f"""
+        <figure style="margin: 0 0 18px 0; text-align: center;">
+          <img src="{thumb_url}" alt="{headline_clean}" title="{headline_clean}" width="1280" height="720" fetchpriority="high" style="width: 100%; height: auto; border-radius: 12px; box-shadow: 0 4px 16px rgba(15,23,42,0.12);" />
+          <figcaption style="font-size: 12.5px; color: #64748b; margin-top: 6px;">{comp_name} (BSE: {html.escape(str(scrip_code or 'Listed'))}) | {cap_label} | Market Munafa</figcaption>
+        </figure>
+        """
+
     meta_comment = f"<!-- MM_META:type={doc_type}|comp_key={comp_key}|scrip={scrip_key}|file={file_key}|comp_name={comp_name} -->"
 
     html_body = f"""
     {meta_comment}
-    <article id="mm-post-{uid}" style="font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 760px; margin: 0 auto; color: #1e293b; box-sizing: border-box;">
+    <article id="mm-post-{uid}" style="font-family: 'Noto Sans Gujarati', 'Noto Sans Devanagari', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif; max-width: 800px; margin: 0 auto; color: #1e293b; box-sizing: border-box;">
       <style>
         #mm-post-{uid} .mm-langbar {{
-          display: flex; flex-wrap: wrap; gap: 7px; align-items: center;
-          background: #eff6ff; padding: 10px 12px; border-radius: 10px;
-          border: 1px solid #bfdbfe; margin-bottom: 16px;
+          display: flex; flex-wrap: wrap; gap: 8px; align-items: center; justify-content: center;
+          background: #f8fafc; padding: 10px 12px; border-radius: 8px;
+          border: 1px solid #e2e8f0; margin-bottom: 18px;
         }}
         #mm-post-{uid} .mm-lbtn {{
-          cursor: pointer; padding: 6px 14px; border-radius: 20px; font-size: 13.5px; font-weight: 700;
-          background: #ffffff; color: #1e3a8a; border: 1px solid #93c5fd; transition: 0.2s;
+          cursor: pointer; padding: 8px 20px; border-radius: 6px; font-size: 14px; font-weight: 700;
+          background: #ffffff; color: #0f172a; border: 1px solid #cbd5e1; transition: 0.2s;
         }}
         #mm-post-{uid} .mm-lbtn.active, #mm-post-{uid} .mm-lbtn:hover {{
-          background: #1d4ed8; color: #ffffff; border-color: #1e40af;
+          background: #0f172a; color: #ffffff; border-color: #0f172a;
         }}
       </style>
 
-      <div style="font-size: 12.5px; color: #64748b; margin-bottom: 12px; font-weight: 500;">
-        📅 Published on: <time datetime="{iso_time}">{ist_time_str}</time> | By Market Munafa Equity Research Desk
+      {thumb_block}
+
+      <div style="font-size: 13px; color: #64748b; text-align: center; margin-bottom: 14px;">
+        Published: <time datetime="{iso_time}">{ist_time_str}</time> &nbsp;|&nbsp; Market Munafa Equity Research Desk
       </div>
 
       <div class="mm-langbar">
-        <span style="font-size: 13px; font-weight: 700; color: #1e3a8a; margin-right: 4px;">🌐 ભાષા / Language:</span>
         <button type="button" class="mm-lbtn active" onclick="mmSwitchBseLang('{uid}','gu',this)">ગુજરાતી</button>
-        <button type="button" class="mm-lbtn" onclick="mmSwitchBseLang('{uid}','en',this)">English</button>
         <button type="button" class="mm-lbtn" onclick="mmSwitchBseLang('{uid}','hi',this)">हिन्दी</button>
+        <button type="button" class="mm-lbtn" onclick="mmSwitchBseLang('{uid}','en',this)">English</button>
       </div>
 
-      <!-- STEP 1: INTRO SUMMARY & HIGHLIGHTS -->
       {top_gu}
-      {top_en}
       {top_hi}
+      {top_en}
 
       <!--more-->
 
-      <!-- STEP 2: FEATURE IMAGE -->
-      <figure style="margin: 0 0 22px 0; text-align: center;">
-        <img src="{thumb_url}" alt="{comp_name} {qtr_lbl} Financial Analysis" width="1200" height="675" fetchpriority="high" style="width: 100%; height: auto; aspect-ratio: 16/9; object-fit: cover; border-radius: 12px;" />
-        <figcaption style="font-size: 12px; color: #64748b; margin-top: 6px;">{comp_name} (BSE: {html.escape(str(scrip_code or 'Listed'))}) | Market Munafa</figcaption>
-      </figure>
-
-      <!-- STEP 3: OFFICIAL BSE PDF RESULTS TABLE, CHARTS & VALUATION RATIOS -->
       {"".join(universal_data_blocks)}
 
-      <!-- STEP 4: DETAILED ANALYSIS & FAQs -->
       {bot_gu}
-      {bot_en}
       {bot_hi}
+      {bot_en}
 
       {internal_links_html}
       {source_link_html}
@@ -1498,8 +2019,8 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
         function mmSwitchBseLang(uid, code, btn) {{
           var root = document.getElementById("mm-post-" + uid);
           if (!root) return;
-          root.querySelectorAll(".mm-lang-sec").forEach(function(sec) {{
-            var match = sec.getAttribute("data-mm-lang") === code;
+          root.querySelectorAll(".mm-lang-pane").forEach(function(sec) {{
+            var match = sec.getAttribute("data-lang") === code;
             sec.style.display = match ? "block" : "none";
             sec.hidden = !match;
           }});
@@ -1509,8 +2030,8 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
       </script>
 
       <hr style="border: none; border-top: 1px solid #e2e8f0; margin: 22px 0;" />
-      <p style="font-size: 12px; color: #64748b; line-height: 1.55;">
-        <strong>Disclaimer:</strong> This independent equity research report on Market Munafa is prepared using publicly disclosed BSE corporate filings and fundamental ratios for educational purposes only. We are not SEBI-registered investment advisors. Please consult a certified financial planner before making any investment decision.
+      <p style="font-size: 12.5px; color: #64748b; line-height: 1.6;">
+        <strong>Disclaimer:</strong> This independent equity report on Market Munafa is prepared strictly from publicly disclosed BSE filings and financial ratios for informational and educational purposes only. It is not investment advice. Please consult a SEBI-registered financial advisor before making any investment decision.
       </p>
     </article>
     """
@@ -1520,7 +2041,7 @@ def build_post_html(data, doc_type, screener_info, source_url, comp_key="", scri
 # ==========================================
 # 9. TELEGRAM & SAFE BLOGGER PUBLISHER
 # ==========================================
-def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, chart_url):
+def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, thumb_url, chart_url):
     if not SEND_TO_TELEGRAM or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     comp_name = html.escape(str(data.get("company_short_name", "Company")))
@@ -1571,16 +2092,17 @@ def send_telegram_gujarati(data, doc_type, screener_info, blog_url, source_url, 
     )
 
     if blog_url:
-        msg_html += f"\n🌐 <a href=\"{html.escape(blog_url, quote=True)}\"><b>ગુજરાતી, English અને હિન્દીમાં પૂરો રિપોર્ટ વાંચો</b></a>"
+        msg_html += f"\n🌐 <a href=\"{html.escape(blog_url, quote=True)}\"><b>ગુજરાતી, હિન્દી અને English માં પૂરો રિપોર્ટ વાંચો</b></a>"
     if source_url:
         msg_html += f" | <a href=\"{html.escape(source_url, quote=True)}\"><b>BSE PDF</b></a>"
     msg_html += "\n\n✅ <b>Market Munafa</b>"
 
     try:
-        if chart_url and doc_type != "order":
+        photo_to_send = thumb_url or chart_url
+        if photo_to_send:
             requests.post(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto",
-                data={"chat_id": TELEGRAM_CHAT_ID, "photo": chart_url, "caption": f"📊 {comp_name} - YoY Growth Chart"},
+                data={"chat_id": TELEGRAM_CHAT_ID, "photo": photo_to_send, "caption": f"📊 {comp_name} - Market Munafa Report"},
                 timeout=15,
             )
         requests.post(
@@ -1636,7 +2158,7 @@ def _parse_single_blog_post_for_dedup(title_str, content_html, labels_list, stat
 
 
 def get_existing_blogger_posts():
-    state = {"comp_keys": set(), "scrip_keys": set(), "file_keys": set()}
+    state = {"comp_keys": set(), "scrip_keys": set(), "file_keys": set(), "recent_posts": []}
     if not BLOG_ID:
         return state
     total_scanned = 0
@@ -1666,6 +2188,12 @@ def get_existing_blogger_posts():
                     post.get("labels", []),
                     state,
                 )
+                if len(state["recent_posts"]) < 30 and post.get("title") and post.get("url"):
+                    state["recent_posts"].append({
+                        "title": post.get("title", ""),
+                        "url": post.get("url", ""),
+                        "labels": post.get("labels", []),
+                    })
                 total_scanned += 1
             page_token = data.get("nextPageToken")
             if not page_token:
@@ -1695,6 +2223,18 @@ def select_approved_labels(doc_type, screener_info):
         if screener_info.get("debt_to_equity_num", 1.0) <= 0.25:
             labels.append("DEBT FREE 10 STOCKS")
     return [lb for lb in labels if lb in APPROVED_LABELS][:3]
+
+
+def pick_related_posts(recent_posts, labels, max_links=3):
+    if not recent_posts:
+        return []
+    lset = {str(l).lower() for l in labels}
+    scored = []
+    for rp in recent_posts:
+        rset = {str(x).lower() for x in (rp.get("labels") or [])}
+        scored.append((len(lset & rset), rp))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [p for _, p in scored[:max_links]]
 
 
 def blogger_publish(title, content_html, labels, meta_description):
@@ -1739,23 +2279,41 @@ def blogger_publish(title, content_html, labels, meta_description):
     return None
 
 
-def publish_item(item, doc_type, ai_data, screener_info, item_id, comp_key, scrip_key, file_key, scrip_code=""):
+def publish_item(item, doc_type, ai_data, screener_info, blog_state, item_id, comp_key, scrip_key, file_key, scrip_code, theme_index):
     source_url = item["link"]
     c_short = ai_data.get("company_short_name") or screener_info.get("screener_company_name") or item["title"]
     raw_title = ai_data.get("seo_title") or (
         f"{c_short} Order Win Update & Financial Overview" if doc_type == "order" else f"{c_short} Quarterly Results & Fundamental Analysis"
     )
+    labels = select_approved_labels(doc_type, screener_info)
+    related_posts = pick_related_posts(blog_state.get("recent_posts", []), labels, max_links=3)
+
+    # દરેક પોસ્ટ માટે અલગ યુનિક ઓટો-થમ્બનેલ બનાવી GitHub પર લાઈવ કરો
+    slug_id = hashlib.md5(f"{c_short}|{scrip_code}|{item_id}".encode("utf-8")).hexdigest()[:10]
+    thumb_badge = ai_data.get("thumb_badge") or ("ORDER WIN" if doc_type == "order" else "Q2 RESULTS")
+    thumb_hl = ai_data.get("thumb_headline") or raw_title[:45]
+    thumb_url = create_and_push_unique_thumbnail(
+        comp_short=c_short,
+        thumb_headline=thumb_hl,
+        badge_text=thumb_badge,
+        cap_label=screener_info.get("cap_label", "Listed"),
+        price_disp=ai_data.get("price_display", screener_info["price_str"]),
+        slug_id=slug_id,
+        theme_index=theme_index,
+    )
+
     blog_html, yoy_chart_url, meta_desc = build_post_html(
         ai_data,
         doc_type,
         screener_info,
         source_url,
+        thumb_url=thumb_url,
+        related_posts=related_posts,
         comp_key=comp_key,
         scrip_key=scrip_key,
         file_key=file_key,
         scrip_code=scrip_code,
     )
-    labels = select_approved_labels(doc_type, screener_info)
 
     blog_url = ""
     blogger_quota_hit = False
@@ -1766,14 +2324,15 @@ def publish_item(item, doc_type, ai_data, screener_info, item_id, comp_key, scri
         else:
             blog_url = res_url
             mark_posted(item_id, comp_key, scrip_key, file_key, item["title"], source_url)
-            log.info("✅ Published Clean Post (%s) | Labels: %s | URL: %s", doc_type, labels, blog_url)
+            blog_state["recent_posts"].insert(0, {"title": raw_title, "url": blog_url, "labels": labels})
+            log.info("✅ Published 200/200 Verified Post (%s) | Labels: %s | URL: %s", doc_type, labels, blog_url)
 
-    send_telegram_gujarati(ai_data, doc_type, screener_info, blog_url, source_url, yoy_chart_url)
+    send_telegram_gujarati(ai_data, doc_type, screener_info, blog_url, source_url, thumb_url, yoy_chart_url)
     return not blogger_quota_hit
 
 
 # ==========================================
-# 10. MAIN RUNNER
+# 10. MAIN RUNNER (UP TO 10 VERIFIED POSTS PER RUN)
 # ==========================================
 def run():
     init_db()
@@ -1824,7 +2383,7 @@ def run():
             screener_info = get_screener_fundamentals(item["title"], scrip_code=scrip_code)
 
             if not screener_info["is_eligible_stock"]:
-                log.info("Skipping Penny/Unlisted/Mismatched Stock (Mkt Cap: %s): %s", screener_info["market_cap"], item["title"])
+                log.info("Skipping Micro-Cap/Unlisted/Mismatched Stock (Mkt Cap: %s): %s", screener_info["market_cap"], item["title"])
                 continue
 
             if screener_info.get("screener_company_name"):
@@ -1839,21 +2398,12 @@ def run():
                 log.warning("Skipping %s because official BSE PDF could not be downloaded.", item["title"])
                 continue
 
-            ai_data = analyze_with_gemini_json(
+            # કડક 200/200 વેરિફિકેશન (સીધી પોસ્ટ બંધ — ભૂલ સુધરે પછી જ આગળ વધશે)
+            ai_data = generate_and_verify_200_of_200(
                 item["title"], scrip_code, doc_type, source_text, pdf_bytes, screener_info, pdf_text_len
             )
-
-            if not ai_data or ai_data.get("pdf_table_verified") is False or ai_data.get("skip_stock") is True:
-                log.info("Skipping stock (weak result or unverified PDF table): %s", item["title"])
+            if not ai_data:
                 continue
-
-            if doc_type == "result":
-                r_curr = to_float(ai_data.get("revenue", {}).get("curr"))
-                np_curr = to_float(ai_data.get("net_profit", {}).get("curr"))
-                curr_p = str(ai_data.get("curr_period_label", "")).lower()
-                if (r_curr == 0 and np_curr == 0) or any(old_q in curr_p for old_q in ("jun 2026", "mar 2026", "dec 2025")):
-                    log.warning("Skipping result post due to old period (%s) or zero figures: %s", curr_p, item["title"])
-                    continue
 
             ai_comp_name = str(ai_data.get("company_short_name") or "").strip()
             ai_comp_key = normalize_company_key(ai_comp_name, doc_type) if ai_comp_name else ""
@@ -1862,15 +2412,17 @@ def run():
 
             final_comp_key = ai_comp_key or comp_key
             blogger_ok = publish_item(
-                item,
-                doc_type,
-                ai_data,
-                screener_info,
-                item_id,
-                final_comp_key,
-                scrip_key,
-                file_key,
+                item=item,
+                doc_type=doc_type,
+                ai_data=ai_data,
+                screener_info=screener_info,
+                blog_state=blog_state,
+                item_id=item_id,
+                comp_key=final_comp_key,
+                scrip_key=scrip_key,
+                file_key=file_key,
                 scrip_code=scrip_code,
+                theme_index=published_count,
             )
 
             if comp_key:
@@ -1889,6 +2441,8 @@ def run():
             time.sleep(15)
         except Exception:
             log.exception("Item processing failed: %s", item["title"])
+
+    log.info("Run finished cleanly. Total 200/200 verified posts published: %d", published_count)
 
 
 if __name__ == "__main__":
